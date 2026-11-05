@@ -244,6 +244,9 @@ class _Context:
         # How deep the translation is among values Postgres gives one type
         # (see `_real_integer`).
         self.unified = 0
+        # Inside a list one of whose members rounds the others (off the diff
+        # path), so no comparison in it is read exactly.
+        self.kin_rounded = 0
         # A column's last name → how it is spelled (see `_column_key`).
         self.spellings: dict[str, tuple[str, ...]] = {}
         # Phase 3 — opaque expressions (function calls,
@@ -512,6 +515,20 @@ def _has_lossy_cast(node: Any) -> bool:
     """Whether `node` holds a cast that may change a value anywhere in it
     (`(SELECT 0::real)`, `0::real * 1::real` give its value that type)."""
     return any(isinstance(n, TypeCast) and not _exact_cast(n.typeName)
+               for n in _ast_nodes(node))
+
+
+def _rounds_its_kin(node: Any, ctx: _Context) -> bool:
+    """Whether `node`, beside others given its type (a `COALESCE`, an `IN`
+    list, an array), may round them: a value-changing cast to a number type
+    (`0::real`, `1::numeric(3,1)`). In a diff, any value-changing cast — the
+    text does not say what it does to its kin; off it, a cast to `uuid`, an
+    enum or `date` keeps the literal's value and its kin's (`pg_get_expr`
+    writes `ARRAY['draft'::post_status, …]`)."""
+    if ctx.any_session:
+        return _has_lossy_cast(node)
+    return any(isinstance(n, TypeCast) and not _exact_cast(n.typeName)
+               and _typename_last_segment(n.typeName) in _NUMBER_TYPES
                for n in _ast_nodes(node))
 
 
@@ -1853,7 +1870,7 @@ def _anon_coalesce(
         # COALESCE the type of either (a float column's), rounding the
         # other, which the text does not show.
         return None
-    if any(_has_lossy_cast(a) for a in args):
+    if any(_rounds_its_kin(a, ctx) for a in args):
         # Postgres gives every argument the float type a cast gives one,
         # rounding a column's value too (`COALESCE(id, 0::real)`).
         return None
@@ -2029,8 +2046,9 @@ def _anon_any_array(
         return None
     if not elements:
         return None
-    if any(_has_lossy_cast(e) for e in elements) or (
-            node.kind == A_Expr_Kind.AEXPR_IN and _has_lossy_cast(node.lexpr)) or (
+    rounded = any(_rounds_its_kin(e, ctx) for e in elements) or (
+            node.kind == A_Expr_Kind.AEXPR_IN and _rounds_its_kin(node.lexpr, ctx))
+    if (rounded and ctx.any_session) or (
             # An array takes one type from its elements, a column's too
             # (`ARRAY[a + 0, 1]` is a float8[] for a float `a`), rounding
             # the left side; an `IN` list compares one with each.
@@ -2038,7 +2056,8 @@ def _anon_any_array(
             and any(isinstance(n, ColumnRef) for e in elements for n in _ast_nodes(e))):
         # The list takes the float type a cast gives one element (or, for
         # `IN`, its left side), rounding the others: `IN (16777217, 1::real)`
-        # is a `real[]`.
+        # is a `real[]`. Off the diff path each comparison is then a truth
+        # of its own (`_anon_binop`), as a float meeting a column is.
         return None
     acc: _TV | None = None
     for elem in elements:
@@ -2052,7 +2071,11 @@ def _anon_any_array(
         # one with a non-constant element.
         with ctx.unifying(node.kind == A_Expr_Kind.AEXPR_IN or not all(
                 _is_constant(e) for e in elements)):
-            tv = _anon_binop(cmp_node, ctx, auth_funcs, assertions)
+            ctx.kin_rounded += rounded
+            try:
+                tv = _anon_binop(cmp_node, ctx, auth_funcs, assertions)
+            finally:
+                ctx.kin_rounded -= rounded
         # `=` yields a _TV; anything else (None, or a _Val) → abstain whole.
         if not isinstance(tv, _TV):
             return None
@@ -2099,8 +2122,16 @@ def _anon_binop(
         _record_tenant_pair(ctx, left, right)
 
     cast_meets = ctx.any_session and _cast_value_meets_column(node.lexpr, node.rexpr)
-    if _unlike_sql(op, left.value, right.value, any_session=ctx.any_session) or _floats_meet(
-            node.lexpr, node.rexpr) or cast_meets:
+    unlike = _unlike_sql(op, left.value, right.value, any_session=ctx.any_session)
+    if comparison_fn is None and not ctx.any_session and not unlike and _floats_meet(
+            node.lexpr, node.rexpr):
+        # Off the diff path, float arithmetic (`score * (2)::double precision`)
+        # is a fresh value of its own, as other real arithmetic is below.
+        floats_meet = False
+    else:
+        floats_meet = _floats_meet(node.lexpr, node.rexpr) or (
+            comparison_fn is not None and ctx.kin_rounded > 0)
+    if unlike or floats_meet or cast_meets:
         if comparison_fn is None or (ctx.any_session and (not cast_meets or ctx.unified)):
             # In an `IN` list or array the value takes the list's type, not
             # the column's: `x IN (v::int, 1)` rounds `v` to a `real` `x`'s
@@ -2149,7 +2180,8 @@ def _anon_binop(
         # (a value, or one marked unset) is right for both, so abstain.
         return None
     sorts = {left.value.sort(), right.value.sort()}
-    if arithmetic_fn is not None and (sorts != {z3.IntSort()} or op in ("/", "%")):
+    if arithmetic_fn is not None and (sorts != {z3.IntSort()} or op in ("/", "%") or _floats_meet(
+            node.lexpr, node.rexpr)):
         # Off the diff path too, a result Z3 does not compute as Postgres
         # does — on reals (no NaN / ±Infinity, no rounding), `/` and `%`
         # (Postgres truncates) — is a fresh value of its own each time (not
@@ -2159,7 +2191,8 @@ def _anon_binop(
         # whose order is not text's — abstains, as the diff path did above.
         if not sorts <= {z3.IntSort(), z3.RealSort()}:
             return None
-        sort = z3.RealSort() if z3.RealSort() in sorts else z3.IntSort()
+        floaty = z3.RealSort() in sorts or _floats_meet(node.lexpr, node.rexpr)
+        sort = z3.RealSort() if floaty else z3.IntSort()
         return _Val(
             value=ctx.opaque(f"arithmetic#{len(ctx._opaque_vars)}", sort),
             is_null=z3.Or(left.is_null, right.is_null),
@@ -3160,11 +3193,16 @@ def cross_tenant_session_identity(
         if auth_functions is not None
         else set(_DEFAULT_AUTH_FUNCTIONS)
     )
-    ctx = _Context()
-    ctx.session_mode = True
-    assertions: list[Any] = []
-    tv = _lift_to_tv(_anon_3vl(using_node, ctx, auth, assertions), assertions)
-    if tv is None:
+    for integers in (False, True):
+        # A leak may come from the integer pass alone (`_integers_agree`).
+        ctx = _Context()
+        ctx.session_mode = True
+        ctx.integers = integers
+        assertions: list[Any] = []
+        tv = _lift_to_tv(_anon_3vl(using_node, ctx, auth, assertions), assertions)
+        if tv is not None:
+            break
+    else:
         return None
     pairs = _distinct_tenant_pairs(ctx.tenant_pairs)
     if len(pairs) != 1:

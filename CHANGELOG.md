@@ -98,7 +98,12 @@ breaking changes — they will be called out in this file.
   two columns (one may be a float column, whose type the other then
   takes), an array with a column in it, and a comparison of a column with
   a float (`a = 1::float8` or `a = pi()` reads a `numeric` `a` through a
-  double): off the diff path that comparison is a truth of its own. In a
+  double): off the diff path that comparison is a truth of its own, and so
+  is each comparison in such a list (a leak resting on one is LEAK with no
+  row, which may be a false alarm), float arithmetic a value of its own,
+  and only a number cast rounds its kin there (a `uuid`, enum or `date`
+  literal in a list or `COALESCE`, which `pg_get_expr` writes with a cast,
+  keeps the verdict, as on `main`). In a
   diff, an expression holding a column (`amount`, `COALESCE(amount, 0)`)
   compared with a value cast to a number type that is not a literal
   (`current_setting('app.v')::numeric`) is read as an order of its own

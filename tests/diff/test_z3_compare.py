@@ -382,6 +382,35 @@ def test_arithmetic_on_a_column_of_unknown_type_decides_nothing():
     assert _classify("col + 1 > 0", "col + 5 > 0") == "semantic_loosened"
 
 
+def test_a_non_number_cast_in_a_list_keeps_the_provers_verdict():
+    # `pg_get_expr` casts every uuid / enum literal in a list; only a number
+    # cast that may round its kin abstains (off the diff path).
+    from pgrls.diff._z3_compare import (
+        cross_tenant_session_identity, prove_anon_isolation, prove_cross_tenant_isolation,
+    )
+    inverted = ("auth.uid() IS NULL OR (tenant_id = auth.uid() AND status = ANY "
+                "(ARRAY['draft'::post_status, 'published'::post_status]))")
+    assert prove_anon_isolation(parse_expr(inverted))[0] == "leak"
+    scoped = ("tenant_id = (SELECT auth.uid()) AND project_id = ANY (ARRAY["
+              "'11111111-1111-1111-1111-111111111111'::uuid, "
+              "'22222222-2222-2222-2222-222222222222'::uuid])")
+    assert prove_anon_isolation(parse_expr(scoped))[0] == "isolated"
+    assert prove_cross_tenant_isolation(parse_expr(scoped))[0] == "isolated"
+    assert prove_anon_isolation(parse_expr(
+        "tenant_id = COALESCE(auth.uid(), '00000000-0000-0000-0000-000000000000'::uuid)"
+    ))[0] == "leak"
+    # Float arithmetic is a value of its own off the diff path.
+    assert prove_anon_isolation(parse_expr(
+        "tenant_id = (SELECT auth.uid()) AND score * (100)::double precision >= 50"
+    ))[0] == "isolated"
+    assert prove_anon_isolation(parse_expr(
+        "tenant_id = (SELECT auth.uid()) OR score * (2)::double precision > 1"
+    ))[0] == "leak"
+    # A leak only the integer pass finds still names its tenant axis.
+    assert cross_tenant_session_identity(parse_expr(
+        "tenant_id = auth.uid() OR org_id = 1234567890123456789")) == ("tenant_id", "auth.uid()")
+
+
 def test_an_integer_literal_does_not_make_its_column_an_integer():
     # `score >= 1` and `score > 0` are one over the integers, not over a
     # `numeric` (0.5): an offline snapshot's text does not say which.
@@ -434,8 +463,10 @@ def test_an_integer_literal_does_not_make_its_column_an_integer():
         "tenant_id = (SELECT auth.uid()) OR org_id IN (100000001, 100000002)"))[0] == "leak"
     # ... and the integer check does not read an integer a float element
     # of the list rounds (`IN (16777217, 1::real)` is a `real[]`).
-    assert prove_anon_isolation(parse_expr("id IN (16777217, 1::real) AND id = 16777217"))[0] \
-        == "unverified"
+    # (Each comparison in the list is then a truth of its own: a `bigint`
+    # `id` 16777217 is in it, so no proof, and no row is claimed.)
+    assert prove_anon_isolation(parse_expr("id IN (16777217, 1::real) AND id = 16777217")) \
+        == ("leak", None)
     assert _classify("g::int IN (16777217, 1::real)",
                      "g::int IN (16777216, 16777217, 1::real)") is None
     assert _classify("g IN (9007199254740993, 1::float8)",
