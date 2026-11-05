@@ -559,6 +559,15 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     # still attaches. Two passes keep that order-independent.
     tables: dict[tuple[str, str], _TableBuilder] = {}
 
+    # Where each table is dropped, so a CREATE … IF NOT EXISTS of one still
+    # there is told from a re-create.
+    drops: dict[tuple[str, str], list[int]] = {}
+    for index, raw in enumerate(statements):
+        if isinstance(raw.stmt, _pgast.DropStmt) and raw.stmt.removeType == ObjectType.OBJECT_TABLE:
+            for namelist in raw.stmt.objects or ():
+                if parts := _drop_name_parts(namelist):
+                    drops.setdefault(_drop_table_key(parts, default_schema), []).append(index)
+
     # Pass 1: CREATE TABLE (plus the two data-derived forms).
     for index, raw in enumerate(statements):
         stmt = raw.stmt
@@ -594,6 +603,11 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             # to this statement so the drop gate sees the LAST create. That
             # makes existence correct for every ordering: `CREATE; DROP;
             # CREATE` keeps the table, `CREATE; CREATE; DROP` removes it.
+            # One `IF NOT EXISTS` skips while the table is there (with no
+            # DROP since), so an ATTACH / DETACH before it still applies.
+            if stmt.if_not_exists and not any(
+                    tables[key].created_at < d < index for d in drops.get(key, ())):
+                continue
             tables[key].created_at = index
             continue
         builder = _TableBuilder(schema=key[0], name=key[1], created_at=index)

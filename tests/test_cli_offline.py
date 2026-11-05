@@ -1675,6 +1675,25 @@ def test_pg_dump_attaches_partitions_with_alter_table():
     assert parents == {"ev": None, "ev_2025": ("public", "ev"), "ev_old": None}
 
 
+def test_a_create_if_not_exists_of_a_table_there_does_not_undo_a_detach():
+    from pgrls.schema_sources import schema_from_sql
+
+    # An idempotent migration run twice: the IF NOT EXISTS skips.
+    base = ("CREATE TABLE public.p (k int) PARTITION BY LIST (k);\n"
+            "CREATE TABLE IF NOT EXISTS public.c PARTITION OF public.p FOR VALUES IN (1);\n")
+    for after in ("CREATE TABLE IF NOT EXISTS public.c (k int);\n",
+                  "CREATE TABLE IF NOT EXISTS public.p (k int) PARTITION BY LIST (k);\n"):
+        sql = base + "ALTER TABLE public.p DETACH PARTITION public.c;\n" + after
+        parents = {t.name: t.partition_of for t in schema_from_sql(sql).tables}
+        assert parents["c"] is None, after
+    # ... nor an ATTACH.
+    sql = ("CREATE TABLE public.p (k int) PARTITION BY LIST (k);\nCREATE TABLE public.c (k int);\n"
+           "ALTER TABLE public.p ATTACH PARTITION public.c FOR VALUES IN (1);\n"
+           "CREATE TABLE IF NOT EXISTS public.c (k int);\n")
+    parents = {t.name: t.partition_of for t in schema_from_sql(sql).tables}
+    assert parents["c"] == ("public", "p")
+
+
 def test_an_attach_reaches_only_the_child_as_it_stood():
     from pgrls.schema_sources import schema_from_sql
 
