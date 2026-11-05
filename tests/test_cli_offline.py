@@ -1620,6 +1620,10 @@ def test_a_harmless_psql_command_psql_rejects_is_refused(line):
     ("CREATE SCHEMA app AUTHORIZATION r1; SET ROLE r1; REASSIGN OWNED BY CURRENT_USER TO s1;"
      " RESET ROLE; DROP OWNED BY s1; SET search_path = app, public; CREATE TABLE t (id int);"
      " ALTER TABLE t ENABLE ROW LEVEL SECURITY;", "public.t"),
+    # A CREATE after a DROP OWNED that may have dropped app makes it anew.
+    ("CREATE SCHEMA app AUTHORIZATION u1; DROP OWNED BY CURRENT_USER;"
+     " CREATE SCHEMA app AUTHORIZATION r1; DROP OWNED BY r1; SET search_path = app, public;"
+     " CREATE TABLE t (id int); ALTER TABLE t ENABLE ROW LEVEL SECURITY;", "public.t"),
     ("CREATE SCHEMA app AUTHORIZATION r1; CREATE SCHEMA IF NOT EXISTS app AUTHORIZATION s1;"
      " DROP OWNED BY r1; SET search_path = app, public; CREATE TABLE t (id int);"
      " ALTER TABLE t ENABLE ROW LEVEL SECURITY;", "public.t"),
@@ -1641,6 +1645,11 @@ def test_relations_postgres_removes_or_keeps_are_followed(sql, expected):
     # REASSIGN OWNED BY CURRENT_USER under a SET ROLE: app may not pass.
     "CREATE SCHEMA app; SET ROLE r2; REASSIGN OWNED BY CURRENT_USER TO s1; RESET ROLE;"
     " DROP OWNED BY s1; SET search_path = app; CREATE TABLE t (id int);",
+    # A database that sets `role`: CURRENT_USER is that role or the session
+    # user by turns, so REASSIGN OWNED BY it may or may not pass app on.
+    "CREATE DATABASE d;\nALTER DATABASE d SET role = 'r1';\n\\connect d\nCREATE SCHEMA app;\n"
+    "SET ROLE NONE;\nREASSIGN OWNED BY CURRENT_USER TO s1;\nDROP OWNED BY r1;\n"
+    "SET search_path = app, public;\nCREATE TABLE u (id int);\n",
     # A schema there before the SQL, whose owner it does not know.
     "CREATE TABLE app.x (id int); DROP OWNED BY r1; SET search_path = app, public;"
     " CREATE TABLE t (id int);",

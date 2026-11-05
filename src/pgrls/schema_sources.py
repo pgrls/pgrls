@@ -786,7 +786,8 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
         stmt = raw.stmt
         if isinstance(stmt, _pgast.CreateSchemaStmt):
             schema = _schema_created(stmt)
-            if schema not in resolver.schemas:  # IF NOT EXISTS of one there: no-op
+            if schema not in resolver.schemas or schema in resolver.unsure:
+                # (An IF NOT EXISTS of one certainly there is a no-op.)
                 # Its creator is the role it runs as, unless AUTHORIZATION
                 # names one; IF NOT EXISTS of one the SQL never made may find
                 # it there, owned by someone pgrls does not know.
@@ -873,8 +874,9 @@ def _rolled_back(statements: Any) -> frozenset[int]:
     return frozenset(void)
 
 
-# A schema owner pgrls cannot name (the connecting role's, after a
-# REASSIGN OWNED that may have named it).
+# A role pgrls cannot name: a schema's owner it does not know (one there
+# before the SQL, or one a REASSIGN OWNED may have passed on), or the role
+# CURRENT_USER is when a \connect'ed database or role sets `role`.
 _SOME_ROLE = "\0some role"
 
 
@@ -882,7 +884,7 @@ def _may_be(owner: str | None, roles: AbstractSet[str | None]) -> bool:
     """Whether `owner` may be one of `roles` though not named so: the
     connecting role (None) may be any named one, and one pgrls cannot name
     any at all."""
-    if owner == _SOME_ROLE:
+    if owner == _SOME_ROLE or _SOME_ROLE in roles:
         return True
     return (owner is None and any(r is not None for r in roles)) or (
         owner is not None and None in roles)
@@ -1064,6 +1066,9 @@ class _Resolver:
             role = self._get("auth")
         else:
             role = getattr(spec, "rolename", None)
+        if role is None and self.inherited_role:
+            # The connecting role or the one its settings set, by turns.
+            return _SOME_ROLE
         return role
 
     def exists(self, schema: str) -> bool:
@@ -1072,8 +1077,8 @@ class _Resolver:
             raise SchemaSourceError(
                 "bad_sql",
                 f"the SQL resolves a name on search_path schema {schema!r} after a "
-                f"DROP OWNED that may have dropped it (pgrls does not know the role "
-                f"psql connects as); qualify the names.",
+                f"DROP OWNED that may have dropped it (pgrls does not know its owner, "
+                f"or the role psql connects as); qualify the names.",
             )
         if schema in self.schemas:
             return True
@@ -1235,7 +1240,7 @@ class _Resolver:
             from_roles = {self.role_of(r) for r in stmt.roles or ()}
             to_role = self.role_of(stmt.newrole)
             for schema, owner in list(self.owners.items()):
-                if owner in from_roles:
+                if owner in from_roles and owner != _SOME_ROLE:
                     self.owners[schema] = to_role
                 elif _may_be(owner, from_roles):
                     self.owners[schema] = _SOME_ROLE
