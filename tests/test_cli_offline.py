@@ -1765,6 +1765,12 @@ def test_pg_dumpall_output_is_refused(tmp_path):
     ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nSET client_encoding = 'UTF8';\n"
      "CREATE TABLE public.t (id int);\nALTER TABLE public.t ENABLE ROW LEVEL SECURITY /* \u0100 */;\n",
      "encoding other than UTF8"),
+    # ... even ASCII text (a `U&` escape it cannot hold), and SQL_ASCII,
+    # single-byte, cuts names by byte and folds them by its locale.
+    ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nCREATE TABLE t (id int, c text);\n",
+     "encoding other than UTF8"),
+    ("CREATE DATABASE d ENCODING 'SQL_ASCII';\n\\connect d\nCREATE TABLE t (id int);\n",
+     "encoding other than UTF8"),
     # The template's objects are copied into the database.
     ("CREATE DATABASE d TEMPLATE base;\n\\connect d\nCREATE TABLE t (id int);\n", "template"),
     # pglast stops reading at a NUL; psql drops only the rest of its line.
@@ -1909,10 +1915,10 @@ def test_harmless_psql_commands_are_skipped():
     sql = ('CREATE DATABASE "my-app";\n\\encoding SQL_ASCII\n'
            '\\connect -reuse-previous=on "dbname=\'my-app\'"\nCREATE TABLE t (id int);\n')
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
-    # A database in another encoding is read when the text after is ASCII.
-    sql = ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nSET client_encoding = 'UTF8';\n"
-           "CREATE TABLE t (id int);\n")
-    assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+    # A UTF8 database reads the text as pgrls does.
+    sql = ("CREATE DATABASE d ENCODING 'UTF8';\n\\connect d\n"
+           'CREATE TABLE "\u00e9" (id int);\n')
+    assert [t.name for t in schema_from_sql(sql).tables] == ["\u00e9"]
     # pg_dump --create connects again after the database's own settings.
     sql = ("CREATE DATABASE d;\n\\connect d\nALTER DATABASE d SET work_mem = '4MB';\n"
            "ALTER ROLE app IN DATABASE d SET work_mem = '4MB';\n\\connect d\n"

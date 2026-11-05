@@ -371,7 +371,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     a psql meta-command other than the harmless ones, a setting that changes
     how Postgres reads the text, objects or a transaction before the last
     `\\connect`, or a `\\connect` to a database it creates from a template
-    other than template0 or, before non-ASCII text, in another encoding.
+    other than template0 or in an encoding other than UTF8.
 
     What IS modeled:
 
@@ -441,22 +441,23 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         # Where the statement ends: its start can include the gap before it.
         return (raw.stmt_location or 0) + raw.stmt_len if raw.stmt_len else len(sql)
 
-    if connect is not None and not sql[connect:].isascii() and any(
+    if connect is not None and any(
         isinstance(raw.stmt, _pgast.CreatedbStmt) and any(
             opt.defname == "encoding" and str(
                 getattr(opt.arg, "sval", None) or getattr(opt.arg, "ival", "")
-            ).lower().replace("_", "").replace("-", "") not in {*_UTF8_ENCODINGS, "6", "0"}
+            ).lower().replace("_", "").replace("-", "") not in ("utf8", "unicode", "6")
             for opt in raw.stmt.options or ())
         for raw in statements
     ):
         # psql reads what follows in the new database's encoding; set back to
         # UTF8, Postgres still converts it to that one (failing on what it
-        # cannot hold) and folds unquoted names by its locale.
+        # cannot hold, a `U&'\\0101'` escape too) and, single-byte even as
+        # SQL_ASCII, cuts names by byte and folds them by its locale.
         raise SchemaSourceError(
             "bad_sql",
             "the SQL connects to a database it creates with an encoding other "
-            "than UTF8 and holds non-ASCII text, which Postgres reads as other "
-            "characters there.",
+            "than UTF8, where Postgres reads the SQL differently from how pgrls "
+            "reads it.",
         )
     if connect is not None and any(
         isinstance(raw.stmt, _pgast.CreatedbStmt) and any(
@@ -964,7 +965,8 @@ _UNSAFE_CLIENT_ENCODINGS = frozenset({
     "gb18030", "uhc", "win949", "windows949", "cp949", "johab",
 })
 # Client encodings under which Postgres reads the UTF-8 text pgrls reads as
-# pgrls does (SQL_ASCII converts nothing). Under any other, a non-ASCII
+# pgrls does, against a UTF8 database (as a client encoding, SQL_ASCII
+# converts nothing). Under any other, a non-ASCII
 # character is read as other characters (`é` as `Ã©` under LATIN1).
 _UTF8_ENCODINGS = frozenset({"utf8", "unicode", "sqlascii"})
 _WRITES = (_pgast.InsertStmt, _pgast.UpdateStmt, _pgast.DeleteStmt, _pgast.MergeStmt)
