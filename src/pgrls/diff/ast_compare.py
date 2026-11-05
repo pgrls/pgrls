@@ -22,6 +22,7 @@ the extra it returns None and the comparator falls through to
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from pglast.ast import BoolExpr
@@ -74,6 +75,7 @@ def compare_predicates(
     *,
     location: str | None = None,
     clause: str | None = None,
+    column_types: Mapping[str, str] | None = None,
 ) -> Literal[
     "unchanged",
     "tightened_and",
@@ -102,6 +104,12 @@ def compare_predicates(
     clause:
         Optional clause label (e.g. ``"USING"`` or ``"WITH CHECK"``).
         Forwarded to ``parse_expr`` alongside ``location``.
+    column_types:
+        Optional ``{column: data_type}`` of the policy's table. Z3 reads a
+        string compared with a column by the column's type: a ``text`` one
+        alike in every spelling, a ``citext`` or ``char(n)`` one not at all.
+        Without it, a column compared with anything but a bare literal
+        decides nothing.
 
     Returns
     -------
@@ -183,7 +191,7 @@ def compare_predicates(
     # ``requires_review`` — the historical behavior.
     from pgrls.diff._z3_compare import classify_via_z3
 
-    z3_result = classify_via_z3(base_node, head_node)
+    z3_result = classify_via_z3(base_node, head_node, column_types=column_types)
     if z3_result is not None:
         return z3_result
 
@@ -196,6 +204,7 @@ def counterexample_for(
     *,
     location: str | None = None,
     clause: str | None = None,
+    column_types: Mapping[str, str] | None = None,
 ) -> dict[str, object] | None:
     """Leaking-row counterexample for a loosened predicate change, or None.
 
@@ -221,4 +230,4 @@ def counterexample_for(
         return None
     from pgrls.diff._z3_compare import counterexample
 
-    return counterexample(base_node, head_node)
+    return counterexample(base_node, head_node, column_types=column_types)

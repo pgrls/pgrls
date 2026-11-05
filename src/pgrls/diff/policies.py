@@ -93,6 +93,21 @@ _CLASSIFICATION_RANK: dict[Classification, int] = {
 }
 
 
+def _column_types(base_table: Table, head_table: Table) -> dict[str, str] | None:
+    """Each column's type, for the Z3 comparison (`compare_predicates`): a
+    `citext` or `char(n)` column reads a string otherwise than `text`. A
+    type that changed is neither; None when a snapshot has no column types."""
+    if not base_table.column_details and not head_table.column_details:
+        return None
+    types: dict[str, str] = {}
+    for table in (base_table, head_table):
+        for column in table.column_details:
+            seen = types.setdefault(column.name, column.data_type)
+            if seen != column.data_type:
+                types[column.name] = "<changed>"
+    return types
+
+
 def _grade_rename(using_result: str, check_result: str) -> Classification:
     """Worst-of Classification for a relaxed-mode rename whose predicate changed.
 
@@ -162,13 +177,14 @@ def _detect_policy_renames(
         base_pol, head_pol = b_list[0], h_list[0]
         location = f"{qname}.{head_pol.name}"
 
+        types = _column_types(base_table, head_table)
         using_result = compare_predicates(
             base_pol.using_sql, head_pol.using_sql,
-            location=location, clause="USING",
+            location=location, clause="USING", column_types=types,
         )
         check_result = compare_predicates(
             base_pol.with_check_sql, head_pol.with_check_sql,
-            location=location, clause="WITH CHECK",
+            location=location, clause="WITH CHECK", column_types=types,
         )
         pure = (
             using_result in _EQUAL_RESULTS and check_result in _EQUAL_RESULTS
@@ -541,6 +557,7 @@ def _diff_policy_shapes(base_table: Table, head_table: Table) -> list[Change]:
                 head_sql,
                 location=location,
                 clause=clause_label,
+                column_types=_column_types(base_table, head_table),
             )
             if result in ("unchanged", "semantic_equivalent"):
                 # "semantic_equivalent" is Z3's verdict that the two
@@ -561,7 +578,8 @@ def _diff_policy_shapes(base_table: Table, head_table: Table) -> list[Change]:
             # leaking-row feature strictly tied to the verifier path.
             cx = (
                 counterexample_for(
-                    base_sql, head_sql, location=location, clause=clause_label
+                    base_sql, head_sql, location=location, clause=clause_label,
+                    column_types=_column_types(base_table, head_table),
                 )
                 if result == "semantic_loosened"
                 else None

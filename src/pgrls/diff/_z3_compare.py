@@ -252,7 +252,7 @@ class _Context:
         # string read the string bare (False) or typed (True); see
         # `_note_string_read`.
         self.string_reads: dict[str, set[bool]] = {}
-        self.string_scope = 0
+        self.list_members: set[int] = set()
         # A column's last name → how it is spelled (see `_column_key`).
         self.spellings: dict[str, tuple[str, ...]] = {}
         # Phase 3 — opaque expressions (function calls,
@@ -547,16 +547,19 @@ def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any]) -> None:
     result), where a `citext` or `char(n)` column compares as text. The text
     may not show the column's type, so a column read both ways decides
     nothing (`_diff_truths`)."""
-    if not ctx.any_session or ctx.string_scope:
+    if not ctx.any_session:
         return
-    sides = [_string_operand(left), *(_string_operand(r) for r in rights)]
-    if not any(kind == "bare" for _, kind in sides) and not any(
-            kind == "typed" for _, kind in sides):
-        return  # column against column, or no string at all
+    operands = [left, *rights]
+    nodes = [n for operand in operands for n in _ast_nodes(operand)]
+    if not any((isinstance(n, A_Const) and isinstance(getattr(n, "val", None), String))
+               or (isinstance(n, TypeCast) and _typename_last_segment(n.typeName) in _STRING_TYPES)
+               for n in nodes):
+        return  # no string in it
+    sides = [_string_operand(operand) for operand in operands]
     typed = any(kind == "typed" for _, kind in sides)
-    for columns, _ in sides:
-        for column in columns:
-            ctx.string_reads.setdefault(column, set()).add(typed)
+    for n in nodes:
+        if isinstance(n, ColumnRef) and n.fields and isinstance(n.fields[-1], String):
+            ctx.string_reads.setdefault(n.fields[-1].sval, set()).add(typed)
 
 
 def _string_operand(node: Any) -> tuple[frozenset[str], str]:
@@ -580,7 +583,9 @@ def _string_operand(node: Any) -> tuple[frozenset[str], str]:
     elif isinstance(node, CaseExpr):
         arms = [w.result for w in node.args or ()] + [node.defresult]
     if arms is not None:
-        # Its arms take one type: a typed arm's, else a column's, else text.
+        # Its arms take one common type, which a typed arm may decide (the
+        # text may not show which); of a column and bare literals, the
+        # column's; of bare literals only, text.
         parts = [_string_operand(arm) for arm in arms if arm is not None]
         columns = frozenset().union(*(c for c, _ in parts))
         kinds = {k for _, k in parts}
@@ -878,7 +883,8 @@ def _write_bare(nodes: list[Any]) -> list[tuple[Any, Any]]:
 
 
 @_bare_columns("base_node", "head_node")
-def _diff_truths(base_node: Any, head_node: Any, *, integers: bool = False
+def _diff_truths(base_node: Any, head_node: Any, *, integers: bool = False,
+                 column_types: Mapping[str, str] | None = None,
                  ) -> tuple[_Context, list[Any], _TV, _TV] | None:
     """Both predicates as Kleene truths over one context (so a column or an
     opaque expression is the same variable in both), with the assertions
@@ -894,9 +900,43 @@ def _diff_truths(base_node: Any, head_node: Any, *, integers: bool = False
     assertions: list[Any] = []
     base = _lift_to_tv(_anon_3vl(base_node, ctx, set(), assertions), assertions)
     head = _lift_to_tv(_anon_3vl(head_node, ctx, set(), assertions), assertions)
-    if base is None or head is None or any(len(reads) > 1 for reads in ctx.string_reads.values()):
+    if base is None or head is None or any(
+            not _reads_strings_alike(column, typed, column_types)
+            for column, typed in ctx.string_reads.items()):
         return None
     return ctx, assertions, base, head
+
+
+def _reads_strings_alike(column: str, typed: set[bool],
+                         column_types: Mapping[str, str] | None) -> bool:
+    """Whether Z3's one reading of a string compared with `column` is
+    Postgres's in every spelling: a `text` column (or a number, `uuid`, a
+    time, which no string is compared with as text) reads `'A'`, `'A'::text`,
+    `(SELECT 'A')` and an `IN` list alike; any other known one (a `citext`
+    or `char(n)` one, which reads a bare literal as itself and a typed one
+    as text, and lists otherwise again) is read only against bare literals,
+    where it reads them as `main` does. Without column types (a snapshot
+    from before they were captured) a column is not read against both."""
+    if column_types is None:
+        return len(typed) == 1
+    return _reads_alike(column_types.get(column)) or True not in typed
+
+
+def _reads_alike(data_type: str | None) -> bool:
+    if data_type is None:
+        return False
+    name = re.sub(r"\(.*\)", "", data_type.lower()).strip()
+    return name.split(".")[-1].strip('"').strip() in _ALIKE_TYPES
+
+
+_ALIKE_TYPES = frozenset({
+    "text", "varchar", "character varying", "uuid", "smallint", "integer", "bigint",
+    "int", "int2", "int4", "int8", "numeric", "decimal", "real", "double precision",
+    "float4", "float8", "boolean", "bool", "date", "timestamp", "timestamptz",
+    "timestamp without time zone", "timestamp with time zone", "time", "timetz",
+    "time without time zone", "time with time zone", "interval", "serial", "bigserial",
+    "smallserial", "oid",
+})
 
 
 
@@ -922,7 +962,8 @@ def _abstains_when_too_deep(result: Any) -> Callable[[_F], _F]:
 
 
 @_abstains_when_too_deep(None)
-def classify_via_z3(base_node: Any, head_node: Any) -> _Z3Result | None:
+def classify_via_z3(base_node: Any, head_node: Any, *,
+                    column_types: Mapping[str, str] | None = None) -> _Z3Result | None:
     """Classify a base/head predicate pair using Z3 implication.
 
     Returns:
@@ -942,12 +983,12 @@ def classify_via_z3(base_node: Any, head_node: Any) -> _Z3Result | None:
     """
     if not Z3_AVAILABLE:
         return None
-    verdict = _classify(base_node, head_node, integers=False)
+    verdict = _classify(base_node, head_node, integers=False, column_types=column_types)
     if verdict in ("semantic_loosened", _UNTRANSLATED):
         # Loosened only where a column is not an integer one, which the
         # text does not say, is no verdict; one the reals cannot read (an
         # integer a float4 rounds) is loosened if an integer row leaks.
-        again = _classify(base_node, head_node, integers=True)
+        again = _classify(base_node, head_node, integers=True, column_types=column_types)
         return "semantic_loosened" if again == "semantic_loosened" else None
     return cast("_Z3Result | None", verdict)
 
@@ -956,8 +997,9 @@ def classify_via_z3(base_node: Any, head_node: Any) -> _Z3Result | None:
 _UNTRANSLATED = "untranslated"
 
 
-def _classify(base_node: Any, head_node: Any, *, integers: bool) -> Any:
-    truths = _diff_truths(base_node, head_node, integers=integers)
+def _classify(base_node: Any, head_node: Any, *, integers: bool,
+              column_types: Mapping[str, str] | None = None) -> Any:
+    truths = _diff_truths(base_node, head_node, integers=integers, column_types=column_types)
     if truths is None:
         return _UNTRANSLATED
     _, assertions, base, head = truths
@@ -1051,7 +1093,8 @@ def _py_value_sort(val: object) -> Any:
 
 
 @_abstains_when_too_deep(None)
-def counterexample(base_node: Any, head_node: Any) -> dict[str, object] | None:
+def counterexample(base_node: Any, head_node: Any, *,
+                   column_types: Mapping[str, str] | None = None) -> dict[str, object] | None:
     """Return a concrete leaking row for a loosened predicate change, or None.
 
     The returned dict maps real column keys → decoded Python values. By
@@ -1084,7 +1127,7 @@ def counterexample(base_node: Any, head_node: Any) -> dict[str, object] | None:
     if not Z3_AVAILABLE:
         return None
     # An integer row leaks whatever numeric type a column is.
-    truths = _diff_truths(base_node, head_node, integers=True)
+    truths = _diff_truths(base_node, head_node, integers=True, column_types=column_types)
     if truths is None:
         return None
     ctx, assertions, base, head = truths
@@ -2145,7 +2188,8 @@ def _anon_any_array(
         # is a `real[]`. Off the diff path each comparison is then a truth
         # of its own (`_anon_binop`), as a float meeting a column is.
         return None
-    # The list is read as a whole: a typed member types the bare ones too.
+    # The list is read as a whole: its members take one common type, which
+    # a typed member may decide.
     _note_string_read(ctx, node.lexpr, elements)
     acc: _TV | None = None
     for elem in elements:
@@ -2160,12 +2204,12 @@ def _anon_any_array(
         with ctx.unifying(node.kind == A_Expr_Kind.AEXPR_IN or not all(
                 _is_constant(e) for e in elements)):
             ctx.kin_rounded += rounded
-            ctx.string_scope += 1
+            ctx.list_members.add(id(cmp_node))  # noted with the list above
             try:
                 tv = _anon_binop(cmp_node, ctx, auth_funcs, assertions)
             finally:
                 ctx.kin_rounded -= rounded
-                ctx.string_scope -= 1
+                ctx.list_members.discard(id(cmp_node))
         # `=` yields a _TV; anything else (None, or a _Val) → abstain whole.
         if not isinstance(tv, _TV):
             return None
@@ -2203,7 +2247,7 @@ def _anon_binop(
     )
     if left is None or right is None:
         return None
-    if comparison_fn is not None:
+    if comparison_fn is not None and id(node) not in ctx.list_members:
         _note_string_read(ctx, node.lexpr, [node.rexpr])
 
     # Cross-tenant verifier: capture a `<column> = <session symbol>`

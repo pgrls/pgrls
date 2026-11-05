@@ -385,6 +385,32 @@ def test_arithmetic_on_a_column_of_unknown_type_decides_nothing():
     assert _classify("col + 1 > 0", "col + 5 > 0") == "semantic_loosened"
 
 
+def test_a_string_compared_with_a_column_reads_by_the_columns_type():
+    from pgrls.diff.ast_compare import compare_predicates
+
+    def diff(base, head, **types):
+        return compare_predicates(base, head, column_types=types)
+
+    # A `text` column reads every spelling of a string alike ...
+    assert diff("email = ANY (ARRAY['A'::text])", "email = 'A'", email="text") == (
+        "semantic_equivalent")
+    # ... a `citext` or `char(n)` one compares a typed string as text, a bare
+    # one as itself, and a list's members in their common type.
+    for base, head in (("email = ANY (ARRAY['A'::text])", "email = 'A'"),
+                       ("b IN (email = 'A'::text)", "b IN (email = 'A')"),
+                       ("COALESCE(email, 'a'::text) = x", "COALESCE(email, 'a') = x"),
+                       ("email = ANY (ARRAY['a '::text, 'b'::text])",
+                        "email IN ('a '::text, 'b'::text)")):
+        for kind in ("citext", "char(4)"):
+            assert diff(base, head, email=kind, x=kind, b="boolean") == "requires_review", (
+                base, kind)
+    # The canonical tenant clause shared by both sides still cancels.
+    tenant = "tenant_id = current_setting('app.tenant_id')::uuid"
+    assert diff(f"{tenant} AND status = 'active'",
+                f"(tenant_id = '00000000-0000-0000-0000-000000000000' OR {tenant})"
+                " AND status = 'active'", tenant_id="uuid", status="text") == "semantic_loosened"
+
+
 def test_a_non_number_cast_in_a_list_keeps_the_provers_verdict():
     # `pg_get_expr` casts every uuid / enum literal in a list; only a number
     # cast that may round its kin abstains (off the diff path).
