@@ -456,6 +456,14 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             "which pgrls does not model; lint a dump of the schema after the "
             "move, or the live database.",
         )
+    if any(_type_named(raw.stmt) in _LITERAL_CASTS for raw in statements):
+        # A cast to it would then be to that type, which may change the
+        # literal (`'appx'::text` under a domain over varchar(3)).
+        raise SchemaSourceError(
+            "bad_sql",
+            "the SQL creates a type named like a built-in one (text, bool, varchar, "
+            "boolean) that pgrls reads a cast to as keeping its literal.",
+        )
     if any(isinstance(raw.stmt, _pgast.RenameStmt)
            and raw.stmt.renameType == ObjectType.OBJECT_SCHEMA for raw in statements):
         # Every table in it moves, and names resolve in the new one.
@@ -1151,10 +1159,29 @@ def _uncast(node: Any) -> Any:
 
 
 def _keeps_literal(typename: Any) -> bool:
+    # The built-in type: a user type of the name is refused (`_type_named`).
     names = [getattr(n, "sval", None) for n in typename.names or ()]
     return (len(names) in (1, 2) and names[0] in ("pg_catalog", names[-1])
-            and names[-1] in ("text", "bool", "boolean", "varchar")
+            and names[-1] in _LITERAL_CASTS
             and not typename.typmods and not typename.arrayBounds)
+
+
+_LITERAL_CASTS = frozenset({"text", "bool", "boolean", "varchar"})
+
+
+def _type_named(stmt: Any) -> str | None:
+    """The name of the type or domain `stmt` creates, else None."""
+    if isinstance(stmt, (_pgast.CreateDomainStmt,)):
+        names = stmt.domainname
+    elif isinstance(stmt, (_pgast.CreateEnumStmt, _pgast.CreateRangeStmt)):
+        names = stmt.typeName
+    elif isinstance(stmt, _pgast.DefineStmt) and stmt.kind == ObjectType.OBJECT_TYPE:
+        names = stmt.defnames
+    elif isinstance(stmt, _pgast.CompositeTypeStmt):
+        return str(stmt.typevar.relname)
+    else:
+        return None
+    return str(getattr((names or (None,))[-1], "sval", "")) or None
 
 
 def _drops_on_commit(stmt: Any) -> bool:
@@ -1174,6 +1201,8 @@ def _only_defines(stmt: Any) -> bool:
     if isinstance(stmt, _pgast.AlterTableStmt):
         return all(getattr(cmd, "subtype", None) == AlterTableType.AT_ColumnDefault
                    for cmd in stmt.cmds or ())
+    if isinstance(stmt, _pgast.CreateStmt) and stmt.partbound is not None:
+        return False  # a partition bound is evaluated as the table is made
     return isinstance(stmt, (
         _pgast.ViewStmt, _pgast.CreateStmt, _pgast.CreatePolicyStmt, _pgast.AlterPolicyStmt,
         _pgast.RuleStmt, _pgast.CreateTrigStmt, _pgast.CreateDomainStmt,

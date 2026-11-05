@@ -1895,6 +1895,13 @@ def test_a_temporary_table_still_there_still_hides_the_name(kept):
      "USING set_config('search_path', 'app', false);\n", "set_config"),
     ("PREPARE p AS SELECT set_config('search_path', 'app', false);\nEXECUTE p;\n",
      "set_config"),
+    # A partition bound runs as the table is made.
+    ("CREATE TABLE public.p (k int) PARTITION BY LIST (k);\n"
+     "CREATE TABLE public.p1 PARTITION OF public.p FOR VALUES IN "
+     "(length(set_config('search_path', 'app', false)));\n", "set_config"),
+    # A cast to a type named `text` the SQL creates may change the literal.
+    ("CREATE SCHEMA text;\nCREATE DOMAIN text.text AS varchar(3);\n"
+     "SELECT set_config('search_path', 'appx'::text.text, false);\n", "built-in"),
     # The database a `\\connect` reaches may set it.
     ("CREATE DATABASE d;\nALTER DATABASE d SET search_path TO app;\n\\connect d\n"
      "CREATE TABLE x (id int);\n", "connects to a database"),

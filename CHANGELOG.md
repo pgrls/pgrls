@@ -126,10 +126,11 @@ breaking changes — they will be called out in this file.
   cannot follow is refused: one a `\connect`ed database or role may set,
   `pg_temp` on it, a `set_config()` of the path or the role anywhere but a
   plain `SELECT` of literals (a cursor, `PREPARE`, `ALTER … USING`, `ADD
-  COLUMN … DEFAULT`; a definition — a view, a new table's DEFAULT, a policy,
-  a rule, a trigger, a function — runs it when used and is not seen), a
-  literal under a cast that may change it (`::varchar(11)`; `::text` is
-  read, as pg_dump writes it), a CREATE
+  COLUMN … DEFAULT`, a partition bound; a definition — a view, a new table's
+  DEFAULT, a policy, a rule, a trigger, a function — runs it when used and is
+  not seen), a literal under a cast that may change it (`::varchar(11)`;
+  `::text` is read, as pg_dump writes it, unless the SQL creates a type so
+  named), a CREATE
   whose first schema the SQL neither creates nor names a relation in, a
   schema used before the SQL creates it `IF NOT EXISTS`, and `PREPARE
   TRANSACTION`; one set by running code (a `DO` block, a function) is not
