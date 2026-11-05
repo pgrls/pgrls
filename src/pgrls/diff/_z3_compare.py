@@ -73,14 +73,15 @@ so this is a defensive guardrail rather than a real limitation.
 from __future__ import annotations
 
 import fractions
+import functools
 import math
 import re
 import struct
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar, cast
 
 try:
     import z3
@@ -97,6 +98,7 @@ from pglast.ast import (
     A_Const,
     A_Expr,
     Boolean,
+    BooleanTest,
     BoolExpr,
     Node,
     CaseExpr,
@@ -568,6 +570,25 @@ def _diff_truths(base_node: Any, head_node: Any) -> tuple[_Context, list[Any], _
     return ctx, assertions, base, head
 
 
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _abstains_when_too_deep(result: Any) -> Callable[[_F], _F]:
+    """Return `result` (the entry point's "decided nothing") instead of a
+    RecursionError on a predicate nested past the stack — Postgres accepts
+    hundreds of levels of COALESCE."""
+    def wrap(fn: _F) -> _F:
+        @functools.wraps(fn)
+        def inner(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return fn(*args, **kwargs)
+            except RecursionError:
+                return result
+        return cast(_F, inner)
+    return wrap
+
+
+@_abstains_when_too_deep(None)
 def classify_via_z3(base_node: Any, head_node: Any) -> _Z3Result | None:
     """Classify a base/head predicate pair using Z3 implication.
 
@@ -681,6 +702,7 @@ def _py_value_sort(val: object) -> Any:
     return z3.StringSort()
 
 
+@_abstains_when_too_deep(None)
 def counterexample(base_node: Any, head_node: Any) -> dict[str, object] | None:
     """Return a concrete leaking row for a loosened predicate change, or None.
 
@@ -1056,12 +1078,39 @@ def _unwrap_scalar_sublink(node: Any) -> Any:
             or sel.havingClause
             or sel.limitCount is not None
             or sel.limitOffset is not None
+            # A set-returning function in ORDER BY or a WINDOW makes it NULL
+            # when it yields no row.
+            or sel.sortClause
+            or sel.windowClause
         ):
             return node
         target = target_list[0]
         if not isinstance(target, ResTarget):
             return node
+        # So does one inside the target, which a name cannot tell apart from
+        # any other call. A call's value is opaque and may be NULL, which
+        # covers that — unless something above it turns a NULL into a value
+        # (`(SELECT srf() IS NULL)` is NULL, not TRUE, when it yields no row).
+        nodes = list(_ast_nodes(target.val))
+        if any(isinstance(n, FuncCall) for n in nodes) and any(
+                isinstance(n, (NullTest, BooleanTest, CoalesceExpr, CaseExpr, BoolExpr))
+                or (isinstance(n, A_Expr) and n.kind in (A_Expr_Kind.AEXPR_DISTINCT,
+                                                         A_Expr_Kind.AEXPR_NOT_DISTINCT))
+                for n in nodes):
+            return node
         node = target.val
+
+
+def _ast_nodes(node: Any) -> Any:
+    """`node` and every pglast node beneath it."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (list, tuple)):
+            stack.extend(n)
+        elif isinstance(n, Node):
+            yield n
+            stack.extend(getattr(n, f, None) for f in n)
 
 
 def _as_val(x: Any) -> Any:
@@ -2024,6 +2073,7 @@ def _anon_typecast(
     )
 
 
+@_abstains_when_too_deep(None)
 def anon_read_counterexample(
     using_node: Any, auth_functions: set[str] | None = None
 ) -> dict[str, object] | None:
@@ -2139,6 +2189,7 @@ def _anon_witness_is_sufficient(
     return bool(solver.check() == z3.unsat)
 
 
+@_abstains_when_too_deep(("unverified", None))
 def prove_anon_isolation(
     using_node: Any,
     auth_functions: set[str] | None = None,
@@ -2214,6 +2265,7 @@ def prove_anon_isolation(
     return ("isolated", None)
 
 
+@_abstains_when_too_deep(False)
 def anon_leak_is_total(
     using_node: Any,
     auth_functions: set[str] | None = None,
@@ -2520,6 +2572,7 @@ def _cross_tenant_witness(
     return witness
 
 
+@_abstains_when_too_deep(("unverified", None))
 def prove_cross_tenant_isolation(
     using_node: Any,
     auth_functions: set[str] | None = None,
@@ -2645,6 +2698,7 @@ def prove_cross_tenant_isolation(
     return ("leak", witness)
 
 
+@_abstains_when_too_deep(None)
 def cross_tenant_session_identity(
     using_node: Any, auth_functions: set[str] | None = None
 ) -> tuple[str, str] | None:

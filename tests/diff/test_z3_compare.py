@@ -1249,6 +1249,46 @@ def test_a_limited_scalar_select_is_no_change_of_nothing() -> None:
     assert _classify("(SELECT x LIMIT 0) = 'a'", "x = 'a'") is None
 
 
+@pytest.mark.parametrize(("base", "head"), [
+    # A set-returning function that yields no row makes the sub-select NULL:
+    # in ORDER BY, in a WINDOW, or under something that turns NULL into a
+    # value.
+    ("false", "(SELECT true ORDER BY generate_series(1, 0)) IS NULL"),
+    ("(SELECT a ORDER BY generate_series(1, 0)) = 1", "a = 1"),
+    ("false", "(SELECT generate_series(1, 0) IS NULL) IS NULL"),
+    ("false", "(SELECT true WINDOW w AS (ORDER BY generate_series(1, 0))) IS NULL"),
+])
+def test_a_sub_select_a_set_returning_call_can_empty_is_no_expression(base, head) -> None:
+    assert _classify(base, head) is None
+
+
+def test_a_scalar_select_of_a_call_still_unwraps() -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    for using in ("tenant_id = (SELECT auth.uid())",
+                  "tenant_id = (SELECT current_setting('app.t', true)::uuid)"):
+        assert prove_anon_isolation(parse_expr(using))[0] == "isolated", using
+        assert prove_cross_tenant_isolation(parse_expr(using))[0] == "isolated", using
+
+
+def test_a_predicate_too_deep_for_the_stack_decides_nothing() -> None:
+    import sys
+
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    deep = "coalesce(" * 150 + "x" + ", 'a')" * 150 + " = 'b'"
+    base, head, using = parse_expr("x = 'b'"), parse_expr(deep), parse_expr(deep)
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(300)  # the stack a deeper nesting would exhaust
+    try:
+        anon = prove_anon_isolation(using)
+        cross = prove_cross_tenant_isolation(using)
+        diff = classify_via_z3(base, head)
+    finally:
+        sys.setrecursionlimit(limit)
+    assert anon == ("unverified", None) and cross == ("unverified", None) and diff is None
+
+
 def test_a_deeply_nested_scalar_select_does_not_crash() -> None:
     from pgrls.diff._z3_compare import prove_anon_isolation
 

@@ -89,9 +89,12 @@ breaking changes — they will be called out in this file.
   beside another argument a bare column takes its type (`coalesce(is_public,
   false)` stays exact), and `(SELECT (SELECT x))` is a bare column too
   (used directly as a condition, `AND coalesce(b, c)`, such a COALESCE
-  abstains). A `(SELECT x LIMIT …)` or `OFFSET` is no longer read as `x`:
-  `(SELECT a LIMIT 0)` is NULL, so `(SELECT a LIMIT 0) IS NULL AND a IS
-  NOT NULL` was a false PROVEN.
+  abstains). A sub-select that can be NULL however its target reads is no
+  longer read as that target: one with `LIMIT` / `OFFSET` (`(SELECT a LIMIT
+  0) IS NULL AND a IS NOT NULL` was a false PROVEN), `ORDER BY` or a
+  `WINDOW`, or one whose target turns a NULL into a value around a call
+  that may be set-returning (`(SELECT srf() IS NULL)`). A predicate nested
+  past the stack is unverified, not a crash.
   Beside such a
   value or truth, a proof whose other conjunct isolates
   still holds (`tenant_id = auth.uid() AND status < 'm'`), and one that
