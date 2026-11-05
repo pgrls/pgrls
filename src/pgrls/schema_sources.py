@@ -931,16 +931,14 @@ class _Resolver:
                     self._set("auth", value, local=local)
                 self._set("role", value if name == "role" else None, local=local)
             return
-        if not _runs_now(stmt):
+        if _only_defines(stmt):
             return  # a definition: its expressions run when it is used
         for node in _subnodes(stmt):
             if not (isinstance(node, _pgast.FuncCall)
                     and ast_utils.func_name_parts(node)[1] == "set_config"):
                 continue
             args: tuple[Any, ...] = tuple(node.args or ())
-            name = args[0] if args else None
-            while isinstance(name, _pgast.TypeCast):
-                name = name.arg
+            name = _uncast(args[0]) if args else None
             setting = str(getattr(getattr(name, "val", None), "sval", "")).lower()
             if setting not in ("search_path", "role", "session_authorization"):
                 continue
@@ -959,7 +957,8 @@ class _Resolver:
             if setting != "search_path":
                 # As SET ROLE / SET SESSION AUTHORIZATION (for `$user`).
                 role = value.val.sval
-                role = None if role.lower() in ("", "none", "default") else _truncated(role)
+                # `none` exactly is no role (`'default'` is one so named).
+                role = None if setting == "role" and role == "none" else _truncated(role)
                 if setting == "session_authorization":
                     self._set("auth", role, local=is_local.val.boolval)
                 self._set("role", role if setting == "role" else None,
@@ -1143,9 +1142,19 @@ class _Resolver:
 
 
 def _uncast(node: Any) -> Any:
-    while isinstance(node, _pgast.TypeCast):
+    """`node` through the casts that keep a literal as it is (`'x'::text`,
+    as pg_dump writes one, `true::boolean`); one that may change it
+    (`::varchar(3)`) is left, so the literal is not read."""
+    while isinstance(node, _pgast.TypeCast) and _keeps_literal(node.typeName):
         node = node.arg
     return node
+
+
+def _keeps_literal(typename: Any) -> bool:
+    names = [getattr(n, "sval", None) for n in typename.names or ()]
+    return (len(names) in (1, 2) and names[0] in ("pg_catalog", names[-1])
+            and names[-1] in ("text", "bool", "boolean", "varchar")
+            and not typename.typmods and not typename.arrayBounds)
 
 
 def _drops_on_commit(stmt: Any) -> bool:
@@ -1154,15 +1163,21 @@ def _drops_on_commit(stmt: Any) -> bool:
     return bool(on_commit == OnCommitAction.ONCOMMIT_DROP)
 
 
-def _runs_now(stmt: Any) -> bool:
-    """Whether `stmt` evaluates its expressions as it runs — not a
-    definition (a view, a DEFAULT, a policy, a rule, a function) whose
-    expressions run when it is used."""
+def _only_defines(stmt: Any) -> bool:
+    """Whether `stmt` is a definition (a view, a new table's DEFAULT or
+    CHECK, a column's SET DEFAULT, a policy, a rule, a trigger, a domain, a
+    function, a matview WITH NO DATA) whose expressions run when it is used,
+    not as it runs — anything else (a cursor, PREPARE, ALTER … USING, ADD
+    COLUMN … DEFAULT on a table with rows) may run them now."""
     if isinstance(stmt, _pgast.CreateTableAsStmt):
-        return not stmt.into.skipData
+        return bool(stmt.into.skipData)
+    if isinstance(stmt, _pgast.AlterTableStmt):
+        return all(getattr(cmd, "subtype", None) == AlterTableType.AT_ColumnDefault
+                   for cmd in stmt.cmds or ())
     return isinstance(stmt, (
-        _pgast.SelectStmt, _pgast.InsertStmt, _pgast.UpdateStmt, _pgast.DeleteStmt,
-        _pgast.MergeStmt, _pgast.ExplainStmt, _pgast.CopyStmt, _pgast.CallStmt))
+        _pgast.ViewStmt, _pgast.CreateStmt, _pgast.CreatePolicyStmt, _pgast.AlterPolicyStmt,
+        _pgast.RuleStmt, _pgast.CreateTrigStmt, _pgast.CreateDomainStmt,
+        _pgast.CreateFunctionStmt, _pgast.AlterFunctionStmt))
 
 
 # Relation kinds a name resolves among.

@@ -124,9 +124,12 @@ breaking changes — they will be called out in this file.
   undoes is left out of the model, and a temporary table is no table (nor,
   once `DISCARD`ed or dropped at COMMIT, hides one). A search path pgrls
   cannot follow is refused: one a `\connect`ed database or role may set,
-  `pg_temp` on it, a `set_config()` that runs (in a statement, not in a
-  definition such as a view, a DEFAULT or a function, which runs it when
-  used and is not seen) anywhere but a plain `SELECT` of literals, a CREATE
+  `pg_temp` on it, a `set_config()` of the path or the role anywhere but a
+  plain `SELECT` of literals (a cursor, `PREPARE`, `ALTER … USING`, `ADD
+  COLUMN … DEFAULT`; a definition — a view, a new table's DEFAULT, a policy,
+  a rule, a trigger, a function — runs it when used and is not seen), a
+  literal under a cast that may change it (`::varchar(11)`; `::text` is
+  read, as pg_dump writes it), a CREATE
   whose first schema the SQL neither creates nor names a relation in, a
   schema used before the SQL creates it `IF NOT EXISTS`, and `PREPARE
   TRANSACTION`; one set by running code (a `DO` block, a function) is not

@@ -1814,6 +1814,9 @@ def test_an_unqualified_name_resolves_on_the_search_path_the_sql_sets():
     # set_config() of the role is SET ROLE.
     ("CREATE SCHEMA AUTHORIZATION alice;\nSELECT set_config('role', 'alice', false);\n"
      "CREATE TABLE x (id int);\n", "alice"),
+    # ... `none` exactly is no role; `NONE` is one so named.
+    ('CREATE SCHEMA AUTHORIZATION "NONE";\nSELECT set_config(\'role\', \'NONE\', false);\n'
+     "CREATE TABLE x (id int);\n", "NONE"),
     # A schema's elements go in it; a temporary table is no table, and one
     # gone no longer hides the name.
     ("CREATE SCHEMA app CREATE TABLE x (id int);\n", "app"),
@@ -1880,6 +1883,18 @@ def test_a_temporary_table_still_there_still_hides_the_name(kept):
     ("SELECT set_config('search_path', 'app', 'true');\n", "set_config"),
     ("CREATE TABLE j AS SELECT set_config('search_path', 'app', false);\n", "set_config"),
     ("SELECT set_config('search_path', current_user, false);\n", "set_config"),
+    # A cast that may change the literal (`::varchar(11)` cuts it) is no
+    # literal, and set_config() in a statement that runs it now, not only
+    # a plain SELECT, is refused.
+    ("SELECT set_config('search_path_'::varchar(11), 'app', false);\n", "set_config"),
+    ("SELECT set_config('search_path', 'appx, public'::varchar(3), false);\n", "set_config"),
+    ("DECLARE c CURSOR WITH HOLD FOR SELECT set_config('search_path', 'app', false);\n",
+     "set_config"),
+    ("CREATE TABLE public.s (id int);\nINSERT INTO public.s VALUES (1);\n"
+     "ALTER TABLE public.s ALTER COLUMN id TYPE text "
+     "USING set_config('search_path', 'app', false);\n", "set_config"),
+    ("PREPARE p AS SELECT set_config('search_path', 'app', false);\nEXECUTE p;\n",
+     "set_config"),
     # The database a `\\connect` reaches may set it.
     ("CREATE DATABASE d;\nALTER DATABASE d SET search_path TO app;\n\\connect d\n"
      "CREATE TABLE x (id int);\n", "connects to a database"),
