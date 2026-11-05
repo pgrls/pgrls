@@ -406,6 +406,16 @@ def test_a_non_number_cast_in_a_list_keeps_the_provers_verdict():
     assert prove_anon_isolation(parse_expr(
         "tenant_id = (SELECT auth.uid()) OR score * (2)::double precision > 1"
     ))[0] == "leak"
+    # A `char(n)` literal as `pg_get_expr` writes it keeps the leaking row.
+    assert prove_anon_isolation(parse_expr(
+        "tenant_id = current_setting('app.tenant_id', true)::bigint"
+        " OR kind = ANY (ARRAY['demo'::bpchar, 'shared'::bpchar])"))[1] in (
+            {"kind": "demo"}, {"kind": "shared"})
+    # A `bpchar` member gives its type to a bare literal beside it: 'b ' is 'b'.
+    assert prove_anon_isolation(parse_expr(
+        "x = 'b' AND x = ANY(ARRAY['a'::bpchar, 'b ']) AND x <> 'a'::bpchar"))[0] != "isolated"
+    assert prove_anon_isolation(parse_expr(
+        "x IS NULL AND COALESCE(x::bpchar, 'b ') = 'b'"))[0] != "isolated"
     # A leak only the integer pass finds still names its tenant axis.
     assert cross_tenant_session_identity(parse_expr(
         "tenant_id = auth.uid() OR org_id = 1234567890123456789")) == ("tenant_id", "auth.uid()")

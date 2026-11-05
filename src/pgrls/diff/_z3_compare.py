@@ -532,6 +532,21 @@ def _rounds_its_kin(node: Any, ctx: _Context) -> bool:
                for n in _ast_nodes(node))
 
 
+def _blanks_its_kin(members: Sequence[Any], ctx: Any) -> bool:
+    """Off the diff path, whether a member cast to a text type that changes a
+    value (`'a'::bpchar`, `'z'::"char"`, `name`) gives that type to a bare
+    string literal beside it, which then compares as that type does
+    (`'b'::text = ANY(ARRAY['a'::bpchar, 'b '])` holds: `bpchar` ignores the
+    trailing space). A list `pg_get_expr` writes casts every member."""
+    if ctx.any_session:
+        return False  # `_has_lossy_cast` already abstains there
+    return any(isinstance(n, TypeCast) and not _exact_cast(n.typeName)
+               and _typename_last_segment(n.typeName) in _STRING_TYPES - {"uuid"}
+               for m in members for n in _ast_nodes(m)) and any(
+        isinstance(m, A_Const) and isinstance(getattr(m, "val", None), String)
+        for m in members)
+
+
 def _floats_meet(left: Any, right: Any) -> bool:
     """Whether a value cast to a float type meets a non-constant one, which
     Postgres converts to float too, rounding it (`a = 1::float8` reads a
@@ -1870,7 +1885,7 @@ def _anon_coalesce(
         # COALESCE the type of either (a float column's), rounding the
         # other, which the text does not show.
         return None
-    if any(_rounds_its_kin(a, ctx) for a in args):
+    if any(_rounds_its_kin(a, ctx) for a in args) or _blanks_its_kin(args, ctx):
         # Postgres gives every argument the float type a cast gives one,
         # rounding a column's value too (`COALESCE(id, 0::real)`).
         return None
@@ -2047,7 +2062,8 @@ def _anon_any_array(
     if not elements:
         return None
     rounded = any(_rounds_its_kin(e, ctx) for e in elements) or (
-            node.kind == A_Expr_Kind.AEXPR_IN and _rounds_its_kin(node.lexpr, ctx))
+            node.kind == A_Expr_Kind.AEXPR_IN and _rounds_its_kin(node.lexpr, ctx)) or (
+            _blanks_its_kin([node.lexpr, *elements], ctx))
     if (rounded and ctx.any_session) or (
             # An array takes one type from its elements, a column's too
             # (`ARRAY[a + 0, 1]` is a float8[] for a float `a`), rounding
@@ -2430,6 +2446,11 @@ def _anon_typecast(
             _bare_type(node.typeName, "uuid")
             or (target_sort == z3.IntSort()
                 and _typename_last_segment(node.typeName) != "oid")
+            # `'demo'::bpchar`, as `pg_get_expr` writes a `char(n)` literal,
+            # is 'demo' (a trailing space is the documented char(n) limit).
+            or (_bare_type(node.typeName, "bpchar") and isinstance(node.arg, A_Const)
+                and isinstance(getattr(node.arg, "val", None), String)
+                and not node.arg.val.sval.endswith(" "))
         )
     if lossy:
         # A cast that may change the value (`varchar(3)`, `float4`, `oid`,

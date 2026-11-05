@@ -103,7 +103,11 @@ breaking changes — they will be called out in this file.
   row, which may be a false alarm), float arithmetic a value of its own,
   and only a number cast rounds its kin there (a `uuid`, enum or `date`
   literal in a list or `COALESCE`, which `pg_get_expr` writes with a cast,
-  keeps the verdict, as on `main`). In a
+  keeps the verdict, as on `main`, and a `char(n)` one, `'demo'::bpchar`,
+  its leaking row), or a cast to a text type that changes a value
+  (`bpchar`, `"char"`, `name`) beside a bare string literal, which then
+  compares as that type (`x = ANY(ARRAY['a'::bpchar, 'b '])` holds for
+  `x = 'b'`; `main` proved such a predicate isolated). In a
   diff, an expression holding a column (`amount`, `COALESCE(amount, 0)`)
   compared with a value cast to a number type that is not a literal
   (`current_setting('app.v')::numeric`) is read as an order of its own
