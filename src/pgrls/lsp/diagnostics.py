@@ -77,8 +77,7 @@ def diagnose(text: str, *, config: Config | None = None) -> list[lsp.Diagnostic]
         config = Config()
     try:
         # Scoped by the project's schemas, as `pgrls lint --sql-file` is.
-        schema = schema_from_sql(text, schemas=tuple(config.schemas) or ("public",),
-                                 default_schema="public")
+        schema = schema_from_sql(text, schemas=tuple(config.schemas) or ("public",))
     except SchemaSourceError:
         # Unparseable mid-edit buffer: publish nothing, don't surface an error.
         return []

@@ -175,7 +175,6 @@ def resolve_schema(
     database_url: str | None = None,
     snapshot: str | None = None,
     schemas: tuple[str, ...] | None = None,
-    default_schema: str | None = None,
 ) -> tuple[Schema, SchemaSource, int | None]:
     """Build a `Schema` from EXACTLY ONE of `sql` / `database_url` / `snapshot`.
 
@@ -190,7 +189,7 @@ def resolve_schema(
 
     `schemas` applies to the `database_url` (which schemas to introspect) and
     `sql` (which schemas are in scope; an unqualified relation lands in
-    `default_schema`, `public` unless given, as psql puts it) paths; it is
+    `public`, as psql puts it) paths; it is
     ignored for `snapshot` (a snapshot already pins its captured schemas).
     Defaults to `("public",)`.
     """
@@ -221,8 +220,7 @@ def resolve_schema(
     effective_schemas = schemas if schemas else ("public",)
 
     if sql is not None:
-        return (schema_from_sql(sql, schemas=effective_schemas, default_schema=default_schema),
-                "sql", None)
+        return schema_from_sql(sql, schemas=effective_schemas), "sql", None
     if snapshot is not None:
         return _schema_from_snapshot(snapshot)
     assert database_url is not None  # guaranteed by the guards above
@@ -362,9 +360,7 @@ def reparse_policy_asts(schema: Schema) -> Schema:
     return replace(schema, tables=tuple(new_tables))
 
 
-def schema_from_sql(
-    sql: str, schemas: tuple[str, ...] = ("public",), *, default_schema: str | None = None
-) -> Schema:
+def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     """Build a `Schema` from raw DDL — the offline analysis path. THE crux.
 
     Parses `sql` with `pglast` and walks the statements TOLERANTLY: any
@@ -381,9 +377,8 @@ def schema_from_sql(
     What IS modeled:
 
     * ``CREATE TABLE`` → a `Table` with `Column`s (name + Postgres data type).
-      An unqualified relation lands in `default_schema` (``public`` unless
-      given, as psql puts it, whatever `schemas` lists), keyed on
-      ``(schema, name)``.
+      An unqualified relation lands in ``public``, as psql puts it, whatever
+      `schemas` lists; keyed on ``(schema, name)``.
     * ``ALTER TABLE … ENABLE / FORCE ROW LEVEL SECURITY`` → sets the table's
       `rls_enabled` / `force_rls`; ``ALTER TABLE … ATTACH / DETACH
       PARTITION`` sets / clears the child's `partition_of` (the form
@@ -511,7 +506,7 @@ def schema_from_sql(
 
     # Where an unqualified name lands: psql's `public`, whatever the linted
     # scope (it does not move a name).
-    default_schema = default_schema or "public"
+    default_schema = "public"
     # Relations the input creates that are not tables: pg_dump writes
     # `ALTER … OWNER TO` for each, and an ALTER on one must not invent a table.
     non_tables = {
