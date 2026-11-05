@@ -513,6 +513,9 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         )
     if connect is not None and any(
         end(raw) < connect and not _clears_a_template_flag(raw.stmt)
+        and not (isinstance(raw.stmt, _pgast.SecLabelStmt)
+                 and raw.stmt.objtype == ObjectType.OBJECT_DATABASE)
+        and not (isinstance(raw.stmt, _pgast.TransactionStmt) and not _open_at(statements, connect, end))
         and (type(raw.stmt).__name__ not in _DATABASE_LEVEL_STATEMENTS
              or getattr(raw.stmt, "intoClause", None) is not None  # SELECT … INTO
              # A CTE that writes (a database's settings into its catalog).
@@ -1624,6 +1627,24 @@ _UTF8_ENCODINGS = frozenset({"utf8", "unicode", "sqlascii"})
 _WRITES = (_pgast.InsertStmt, _pgast.UpdateStmt, _pgast.DeleteStmt, _pgast.MergeStmt)
 
 
+def _open_at(statements: Any, offset: int, end: Any) -> bool:
+    """Whether a transaction the statements before `offset` begin is still
+    open there (pg_restore --transaction-size wraps CREATE DATABASE's
+    neighbours in BEGIN / COMMIT)."""
+    open_ = False
+    for raw in statements:
+        if end(raw) >= offset:
+            break
+        if isinstance(raw.stmt, _pgast.TransactionStmt):
+            if raw.stmt.kind in (TransactionStmtKind.TRANS_STMT_BEGIN,
+                                 TransactionStmtKind.TRANS_STMT_START):
+                open_ = True
+            elif raw.stmt.kind in (TransactionStmtKind.TRANS_STMT_COMMIT,
+                                   TransactionStmtKind.TRANS_STMT_ROLLBACK):
+                open_ = bool(raw.stmt.chain)
+    return open_
+
+
 def _clears_a_template_flag(stmt: Any) -> bool:
     """`UPDATE pg_catalog.pg_database SET datistemplate = false WHERE datname
     = '<name>'`, which `pg_dump --create --clean` writes to drop a template
@@ -2383,6 +2404,13 @@ def inert_rule_ids(
     return frozenset()
 
 
+# pg_dump writes an extension's own tables as `CREATE EXTENSION` alone.
+_EXTENSION_CAVEAT = (
+    "Tables an extension creates (PostGIS's spatial_ref_sys, say) are not seen: "
+    "the SQL shows only its CREATE EXTENSION, and a GRANT on one is dropped."
+)
+
+
 def schema_source_warnings(
     source: SchemaSource,
     *,
@@ -2437,6 +2465,7 @@ def schema_source_warnings(
             "For full coverage, run against a live database "
             "(--database-url or $DATABASE_URL).",
             f"Inert on sql= input (catalog-only): {inert}.",
+            _EXTENSION_CAVEAT,
         ]
     return [
         "Analysis is of the provided SQL only — no live database. Rules that "
@@ -2445,4 +2474,5 @@ def schema_source_warnings(
         "For full coverage, run pgrls against a live database_url or a "
         "snapshot.",
         f"Inert on sql= input (catalog-only): {inert}.",
+        _EXTENSION_CAVEAT,
     ]

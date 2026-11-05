@@ -1887,6 +1887,8 @@ def test_a_temporary_table_still_there_still_hides_the_name(kept):
     ("CREATE SCHEMA AUTHORIZATION CURRENT_USER;\n", "connects as"),
     ("CREATE SCHEMA AUTHORIZATION SESSION_USER CREATE TABLE x (id int);\n", "connects as"),
     ("BEGIN;\nCREATE TABLE x (id int);\nPREPARE TRANSACTION 'x';\n", "PREPARE TRANSACTION"),
+    # A transaction still open at a \\connect is rolled back there.
+    ("BEGIN;\nCREATE DATABASE d;\n\\connect d\nCREATE TABLE x (id int);\n", "transaction"),
 ])
 def test_a_search_path_pgrls_cannot_follow_is_refused(sql, why):
     from pgrls.schema_sources import SchemaSourceError, schema_from_sql
@@ -2277,6 +2279,12 @@ def test_harmless_psql_commands_are_skipped():
     sql = ("UPDATE pg_catalog.pg_database SET datistemplate = false WHERE datname = 'd';\n"
            "DROP DATABASE IF EXISTS d;\nCREATE DATABASE d WITH TEMPLATE = template0;\n"
            "\\connect d\nCREATE TABLE t (id int);\n")
+    assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+    # A database's security label, and pg_restore --transaction-size's
+    # committed transactions, before the `\\connect`.
+    sql = ("BEGIN;\nCOMMIT;\nCREATE DATABASE d;\nBEGIN;\nCOMMIT;\n\\connect d\n"
+           "SECURITY LABEL FOR selinux ON DATABASE d IS 'x';\n"
+           "ALTER DATABASE d SET work_mem = '8MB';\n\\connect d\nCREATE TABLE t (id int);\n")
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
     # A script's settings of psql's own error and output handling.
     sql = "\\set ON_ERROR_STOP on\n\\set QUIET\nCREATE TABLE t (id int);\n"

@@ -56,6 +56,10 @@ breaking changes — they will be called out in this file.
   end to end.
 
 ### Fixed
+- **Offline analysis says that an extension's tables are not seen.** pg_dump
+  writes them as `CREATE EXTENSION` alone (PostGIS's `public.spatial_ref_sys`
+  has RLS off), so `--sql-file` lint and MCP `sql=` cannot report on them,
+  and drop a `GRANT` on one; the offline warnings now say so.
 - **`--sql-file` / `pgrls pr` read `pg_dump --schema-only` output.** A
   dump from `pg_dump` since the August 2025 minor releases (13.22, 14.19,
   15.14, 16.10, 17.6) opens with a `\restrict <key>` psql meta-command,
@@ -74,9 +78,10 @@ breaking changes — they will be called out in this file.
   as inside a string, SQL beside a meta-command that names one of psql's
   own variables (`:ROW_COUNT`), and `pg_dumpall` output, which connects to one database
   after another (dump each with `pg_dump`), or a `\connect` after anything
-  but database-level statements (a `SELECT` whose CTE writes does not count
-  as one; psql rolls an open transaction back, and ends statements by its
-  own rules), one to a database it creates with an encoding other than UTF8
+  but database-level statements (a database's `COMMENT` or `SECURITY
+  LABEL`, pg_dump's `datistemplate = false` UPDATE and a committed
+  transaction count, a `SELECT` whose CTE writes does not; psql rolls an
+  open transaction back, and ends statements by its own rules), one to a database it creates with an encoding other than UTF8
   (psql then reads the SQL in that encoding; even set back to UTF8,
   Postgres converts the text to it and, single-byte even as SQL_ASCII, cuts
   and folds names by byte and locale), or one to a database created with an
