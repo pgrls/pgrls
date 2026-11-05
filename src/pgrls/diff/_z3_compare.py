@@ -509,11 +509,24 @@ def _integer(number: int, ctx: _Context) -> Any:
 
 
 def _has_lossy_cast(node: Any) -> bool:
-    while isinstance(node, TypeCast):
-        if not _exact_cast(node.typeName):
-            return True
-        node = node.arg
-    return False
+    """Whether `node` holds a cast that may change a value anywhere in it
+    (`(SELECT 0::real)`, `0::real * 1::real` give its value that type)."""
+    return any(isinstance(n, TypeCast) and not _exact_cast(n.typeName)
+               for n in _ast_nodes(node))
+
+
+def _floats_meet(left: Any, right: Any) -> bool:
+    """Whether a value cast to a float type meets a non-constant one, which
+    Postgres converts to float too, rounding it (`a = 1::float8` reads a
+    `numeric` or past-2^53 `int8` column `a` through a double)."""
+    return ((_floatish(left) and not _is_constant(right))
+            or (_floatish(right) and not _is_constant(left)))
+
+
+def _floatish(node: Any) -> bool:
+    return any(isinstance(n, TypeCast)
+               and _typename_last_segment(n.typeName) in ("float4", "float8")
+               for n in _ast_nodes(node))
 
 
 def _real_integer(number: int, ctx: _Context) -> Any:
@@ -1863,7 +1876,8 @@ def _anon_distinct(
     )
     if left is None or right is None or left.unset or right.unset:
         return None
-    if _unlike_sql("=", left.value, right.value, any_session=ctx.any_session):
+    if _unlike_sql("=", left.value, right.value, any_session=ctx.any_session) or _floats_meet(
+            node.lexpr, node.rexpr):
         return None
     try:
         differ = z3.Or(
@@ -2000,7 +2014,8 @@ def _anon_binop(
     if ctx.session_mode and op == "=":
         _record_tenant_pair(ctx, left, right)
 
-    if _unlike_sql(op, left.value, right.value, any_session=ctx.any_session):
+    if _unlike_sql(op, left.value, right.value, any_session=ctx.any_session) or _floats_meet(
+            node.lexpr, node.rexpr):
         if ctx.any_session or comparison_fn is None:
             return None
         if left.unset or right.unset:

@@ -448,6 +448,18 @@ def test_an_integer_literal_does_not_make_its_column_an_integer():
                      "COALESCE(tenant_id, 0::real) = 16777216 AND tenant_id = 16777217") is None
     assert _classify("tenant_id::real IN (16777217, 1)",
                      "tenant_id::real IN (16777217, 16777216, 1)") is None
+    # ... as does one hidden in a sub-select or float arithmetic, and a
+    # column compared with a float is converted to it (rounded).
+    assert prove_anon_isolation(parse_expr(
+        "COALESCE(id, (SELECT 0::real)) = 16777216 AND id = 16777217"))[0] != "isolated"
+    assert prove_anon_isolation(parse_expr(
+        "a = 1::float8 AND b = 1::float8 AND b = 1 AND a > 1"))[0] != "isolated"
+    assert _classify("tenant_id = (select auth.uid())",
+                     "(tenant_id = (select auth.uid()) OR amount = 1::float8) AND "
+                     "(tenant_id = (select auth.uid()) OR (cap = 1::float8 AND cap = 1 AND amount > 1))"
+                     ) is None
+    assert prove_cross_tenant_isolation(parse_expr(
+        "tenant_id = auth.uid() AND amount > 0.5::float8"))[0] == "isolated"
     # The integer check reads an exact cast of an integer as that integer.
     assert _classify("a IN (16777217, 1) AND a > 0::numeric",
                      "a IN (16777217, 1) AND a >= 0::numeric") is None
