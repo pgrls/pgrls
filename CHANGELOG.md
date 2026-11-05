@@ -87,8 +87,11 @@ breaking changes — they will be called out in this file.
   longer crashes. A leaking row is an integer one, re-checked with every
   numeric column an integer, so it leaks for an integer or `numeric` column
   (a `float4` holds no integer past 2^24); an integer cast that wraps
-  (`(-256)::oid`) or raises is no constant. Arithmetic on a column
-  of unknown type now needs review (`col + 1 > 0` → `col > -1`).
+  (`(-256)::oid`) or raises is no constant, and a literal cast to `float4`
+  (`1::real`) gives its neighbours that type. Where the reals decide nothing
+  (an integer a `float4` may round, arithmetic) a loosening or a leak on the
+  integers still stands; an equivalence there needs review (`col + 1 > 0` →
+  `col > -1`).
 - **`pgrls verify`, `matrix --prove` and SEC038 no longer take Z3's reading
   where it differs from Postgres's.** A comparison Z3 would read otherwise —
   a Bool against a number (Z3 coerced it to 0 / 1), an ordering on text

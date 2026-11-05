@@ -493,7 +493,11 @@ def _const_to_z3(node: A_Const, ctx: _Context) -> Any:
 
 
 def _is_constant(node: Any) -> bool:
+    """A literal, through casts that keep its type's value (`1::real` gives
+    its neighbours the float4 type)."""
     while isinstance(node, TypeCast):
+        if not _exact_cast(node.typeName):
+            return False
         node = node.arg
     return isinstance(node, A_Const)
 
@@ -754,18 +758,23 @@ def classify_via_z3(base_node: Any, head_node: Any) -> _Z3Result | None:
     if not Z3_AVAILABLE:
         return None
     verdict = _classify(base_node, head_node, integers=False)
-    if verdict == "semantic_loosened" and _classify(
-            base_node, head_node, integers=True) != "semantic_loosened":
+    if verdict in ("semantic_loosened", _UNTRANSLATED):
         # Loosened only where a column is not an integer one, which the
-        # text does not say.
-        return None
-    return verdict
+        # text does not say, is no verdict; one the reals cannot read (an
+        # integer a float4 rounds) is loosened if an integer row leaks.
+        again = _classify(base_node, head_node, integers=True)
+        return "semantic_loosened" if again == "semantic_loosened" else None
+    return cast("_Z3Result | None", verdict)
 
 
-def _classify(base_node: Any, head_node: Any, *, integers: bool) -> _Z3Result | None:
+# `_classify`'s "the predicates do not translate".
+_UNTRANSLATED = "untranslated"
+
+
+def _classify(base_node: Any, head_node: Any, *, integers: bool) -> Any:
     truths = _diff_truths(base_node, head_node, integers=integers)
     if truths is None:
-        return None
+        return _UNTRANSLATED
     _, assertions, base, head = truths
 
     base_implies_head = _implies(base.is_true, head.is_true, assertions)
@@ -2567,10 +2576,12 @@ def _integers_agree(prove: Callable[[bool], tuple[str, Any]]) -> tuple[str, Any]
     """`prove` over the reals (see `_const_to_z3`), whose `isolated` holds
     for an integer column too; a leak stands only if an integer row leaks
     as well (else it may hold only where a column is not an integer one),
-    and its witness is that row."""
+    and its witness is that row (also where the reals decide nothing)."""
     verdict = prove(False)
-    if verdict[0] != "leak":
+    if verdict[0] not in ("leak", "unverified"):
         return verdict
+    # A leak the reals cannot decide (an integer a float4 rounds) is one if
+    # an integer row leaks.
     again = prove(True)
     return again if again[0] == "leak" else ("unverified", None)
 

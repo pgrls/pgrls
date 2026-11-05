@@ -377,8 +377,9 @@ def test_arithmetic_on_a_column_of_unknown_type_decides_nothing():
     # say `col` is one, and over a `numeric` / `float8` (NaN, Infinity,
     # rounding) Z3's reals are not Postgres's: the diff abstains.
     assert _classify("col + 1 > 0", "col > -1") is None
-    assert _classify("col + 1 > 0", "col + 5 > 0") is None
     assert _classify("col - 3 > 0", "col > 3") is None
+    # A loosening on the integers is a row that newly leaks for any type.
+    assert _classify("col + 1 > 0", "col + 5 > 0") == "semantic_loosened"
 
 
 def test_an_integer_literal_does_not_make_its_column_an_integer():
@@ -418,6 +419,19 @@ def test_an_integer_literal_does_not_make_its_column_an_integer():
     assert prove_anon_isolation(parse_expr(
         "user_id = auth.uid() OR (COALESCE(g, 16777217) = 16777216 AND COALESCE(g, 0) = 0)")
     )[0] != "isolated"
+    # A literal cast to float4 is no plain constant: it gives its
+    # neighbours the float4 type.
+    assert _classify("tenant_id = (select auth.uid()) OR false",
+                     "tenant_id = (select auth.uid()) OR COALESCE(16777217, 1::real) = 16777216"
+                     ) is None
+    assert prove_anon_isolation(parse_expr(
+        "tenant_id = current_setting('app.t', true)::int OR "
+        "COALESCE(16777217, 1::real) = 16777216"))[0] != "isolated"
+    # An IN list of ids past 2^24 still loosens or leaks, on the integers.
+    assert _classify("tenant_id IN (100000001, 100000002)",
+                     "tenant_id IN (100000001, 100000002, 100000003)") == "semantic_loosened"
+    assert prove_anon_isolation(parse_expr(
+        "tenant_id = (SELECT auth.uid()) OR org_id IN (100000001, 100000002)"))[0] == "leak"
     # ... and a nested IN does not end the outer one's rule.
     nested = "COALESCE(g, (a IN (1, 2))::int::float4)"
     assert _classify(f"{nested} = 1",
