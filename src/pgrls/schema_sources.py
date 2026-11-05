@@ -515,7 +515,9 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         end(raw) < connect and not _clears_a_template_flag(raw.stmt)
         and not (isinstance(raw.stmt, _pgast.SecLabelStmt)
                  and raw.stmt.objtype == ObjectType.OBJECT_DATABASE)
-        and not (isinstance(raw.stmt, _pgast.TransactionStmt) and not _open_at(statements, connect, end))
+        # psql rolls a transaction open at any `\\connect` back there.
+        and not (isinstance(raw.stmt, _pgast.TransactionStmt)
+                 and not any(_open_at(statements, c, end) for c in connects))
         and (type(raw.stmt).__name__ not in _DATABASE_LEVEL_STATEMENTS
              or getattr(raw.stmt, "intoClause", None) is not None  # SELECT … INTO
              # A CTE that writes (a database's settings into its catalog).
@@ -731,11 +733,14 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
         if not after(raw):
             # Another session's: what it leaves the next one is a database's
             # or role's search_path setting.
-            if isinstance(raw.stmt, (_pgast.AlterDatabaseSetStmt, _pgast.AlterRoleSetStmt)) and (
-                raw.stmt.setstmt.kind == VariableSetKind.VAR_RESET_ALL
-                or (raw.stmt.setstmt.name or "").lower() == "search_path"
-            ):
-                resolver.inherited = True
+            if isinstance(raw.stmt, (_pgast.AlterDatabaseSetStmt, _pgast.AlterRoleSetStmt)):
+                name = (raw.stmt.setstmt.name or "").lower()
+                reset_all = raw.stmt.setstmt.kind == VariableSetKind.VAR_RESET_ALL
+                if reset_all or name == "search_path":
+                    resolver.inherited = True
+                if reset_all or name == "role":
+                    # The role the next session runs as, and so `$user`.
+                    resolver.inherited_role = True
             continue
         resolver.start()
         stmt = raw.stmt
@@ -843,6 +848,7 @@ class _Resolver:
         self.local: dict[str, Any] = {}
         self.in_transaction = False
         self.inherited = False
+        self.inherited_role = False
         self.started = False
         self.override: list[str] = []
 
@@ -992,6 +998,13 @@ class _Resolver:
             if entry == "$user":
                 # A role is taken to have no schema of its own unless the
                 # SQL creates one; the connecting role is not known.
+                if role is None and self.inherited_role:
+                    raise SchemaSourceError(
+                        "bad_sql",
+                        "the SQL connects to a database or as a role that sets the "
+                        "role it runs as, and resolves a name on \"$user\"; pgrls "
+                        "cannot tell which schema that is. Qualify the names.",
+                    )
                 if role is None and self.for_roles & self.schemas:
                     raise SchemaSourceError(
                         "bad_sql",
@@ -1608,6 +1621,8 @@ def _non_table_relation(stmt: Any) -> Any:
 # read is not the SQL that runs, so it is refused rather than blanked.
 # `\\set` is not here: psql interpolates its variables into the SQL that
 # follows (`:n`). `\\encoding` and `\\connect` are checked on their own.
+# The whitespace psql splits a meta-command on.
+_PSQL_SPACE = " \t\n\r\f\v"
 _HARMLESS_PSQL_COMMANDS = frozenset({
     "restrict", "unrestrict", "echo", "qecho", "warn", "pset", "timing",
 })
@@ -1713,8 +1728,11 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
     SQL_ASCII."""
     connects: list[tuple[int, str]] = []
     for offset, line in commands:
-        m = re.match(r"\\([A-Za-z]+|\.)(?:\s+(.*))?$", line.strip(), re.DOTALL)
-        name, rest = (m.group(1), (m.group(2) or "").strip()) if m else ("", "")
+        # psql splits a meta-command on ASCII whitespace only (a no-break
+        # space is part of a word).
+        m = re.match(r"\\([A-Za-z]+|\.)(?:\s+(.*))?$", line.strip(_PSQL_SPACE),
+                     re.DOTALL | re.ASCII)
+        name, rest = (m.group(1), (m.group(2) or "").strip(_PSQL_SPACE)) if m else ("", "")
         if name == ".":
             raise SchemaSourceError(
                 "bad_sql",
@@ -1725,7 +1743,7 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
         target = None
         conninfo = False
         if connect and (c := re.fullmatch(
-            r'([^\s"\'=:\\-][^\s"\'=:\\]*)|"((?:[^"\\=:]|"")+)"', rest,
+            r'([^\s"\'=:\\-][^\s"\'=:\\]*)|"((?:[^"\\=:]|"")+)"', rest, re.ASCII,
         )):
             # psql takes a double-quoted name as it is (`""` a quote); one
             # holding `=` or a URI's `:` would be a conninfo string.
@@ -1747,7 +1765,7 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
             # is refused below).
             name == "set" and re.fullmatch(
                 r"(ON_ERROR_STOP|ECHO|ECHO_HIDDEN|QUIET|VERBOSITY|SHOW_CONTEXT)"
-                r"(\s+[A-Za-z0-9_]+)?", rest) is not None
+                r"(\s+[A-Za-z0-9_]+)?", rest, re.ASCII) is not None
         )
         # psql reads a line to its LF: a CR is part of the command's arguments.
         if m is None or (("\\" in rest or "`" in rest) and not conninfo) \
@@ -1938,7 +1956,7 @@ def _split_psql_meta_commands(sql: str) -> tuple[str, list[tuple[int, str]]]:
         if c == "\\" and line_start:
             j = sql.find("\n", i)
             j = n if j < 0 else j
-            commands.append((i, sql[i:j].strip()))
+            commands.append((i, sql[i:j].strip(_PSQL_SPACE)))
             out[i:j] = " " * (j - i)
             i = j
             continue

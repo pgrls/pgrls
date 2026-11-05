@@ -64,7 +64,9 @@ breaking changes — they will be called out in this file.
   dump from `pg_dump` since the August 2025 minor releases (13.22, 14.19,
   15.14, 16.10, 17.6) opens with a `\restrict <key>` psql meta-command,
   which is not SQL, so the whole file failed to parse. psql meta-command
-  lines it can ignore (`\restrict`, `\echo`, `\pset`, `\set ON_ERROR_STOP
+  lines it can ignore (split on ASCII whitespace, as psql splits them:
+  `\c` and a no-break space is no `\connect`) (`\restrict`, `\echo`,
+  `\pset`, `\set ON_ERROR_STOP
   on` and psql's other error and output settings, a `\connect` after
   `CREATE DATABASE`, …), each alone on its line and between statements as
   Postgres's own lexer reads the file, are now skipped, the LSP's ranges
@@ -79,9 +81,11 @@ breaking changes — they will be called out in this file.
   own variables (`:ROW_COUNT`), and `pg_dumpall` output, which connects to one database
   after another (dump each with `pg_dump`), or a `\connect` after anything
   but database-level statements (a database's `COMMENT` or `SECURITY
-  LABEL`, pg_dump's `datistemplate = false` UPDATE and a committed
-  transaction count, a `SELECT` whose CTE writes does not; psql rolls an
-  open transaction back, and ends statements by its own rules), one to a database it creates with an encoding other than UTF8
+  LABEL`, pg_dump's `datistemplate = false` UPDATE and a transaction
+  committed before it count, a `SELECT` whose CTE writes does not; psql
+  rolls a transaction open at any `\connect` back, and ends statements by
+  its own rules), a `\connect` to a database or as a role that sets the role
+  its session runs as when a name then resolves on `$user`, one to a database it creates with an encoding other than UTF8
   (psql then reads the SQL in that encoding; even set back to UTF8,
   Postgres converts the text to it and, single-byte even as SQL_ASCII, cuts
   and folds names by byte and locale), or one to a database created with an

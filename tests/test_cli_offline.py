@@ -1889,6 +1889,13 @@ def test_a_temporary_table_still_there_still_hides_the_name(kept):
     ("BEGIN;\nCREATE TABLE x (id int);\nPREPARE TRANSACTION 'x';\n", "PREPARE TRANSACTION"),
     # A transaction still open at a \\connect is rolled back there.
     ("BEGIN;\nCREATE DATABASE d;\n\\connect d\nCREATE TABLE x (id int);\n", "transaction"),
+    ("CREATE DATABASE d;\nBEGIN;\n\\connect d\nALTER DATABASE d SET search_path TO app;\n"
+     "ROLLBACK;\n\\connect d\nCREATE TABLE x (id int);\n", "transaction"),
+    # The role a \\connect'ed session runs as decides `$user`.
+    ("CREATE DATABASE d;\nALTER DATABASE d SET role TO 'alice';\n\\connect d\n"
+     "CREATE SCHEMA alice;\nCREATE TABLE x (id int);\n", "sets the role"),
+    # psql splits a meta-command on ASCII whitespace: `\\c\u00a0d` is no `\\c`.
+    ("SET search_path = app, public;\n\\c\u00a0d\nCREATE TABLE x (id int);\n", "psql command"),
 ])
 def test_a_search_path_pgrls_cannot_follow_is_refused(sql, why):
     from pgrls.schema_sources import SchemaSourceError, schema_from_sql
