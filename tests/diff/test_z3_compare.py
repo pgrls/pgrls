@@ -397,6 +397,18 @@ def test_an_integer_literal_does_not_make_its_column_an_integer():
     assert prove_anon_isolation(using)[0] == "unverified"
     assert prove_cross_tenant_isolation(using)[0] == "unverified"
     assert prove_anon_isolation(parse_expr("user_id = auth.uid() OR n = 2")) == ("leak", {"n": 2})
+    # A cast that wraps (`oid`) or raises (past `int4`) is no constant.
+    assert _classify("c <> 4294967040", "c = (-256)::oid") is None
+    assert prove_anon_isolation(parse_expr(
+        "user_id = auth.uid() OR (c = (-256)::oid AND c > 0)"))[0] != "isolated"
+    # An integer is read exactly where no float4 reads it (past 2^24) ...
+    assert prove_anon_isolation(parse_expr(
+        "tenant_id = (SELECT current_setting('app.t', true)::bigint) OR tenant_id = 123456789")
+    ) == ("leak", {"tenant_id": 123456789})
+    # ... and the integer pass makes a column compared with decimals an integer.
+    assert _classify("a > 0.9", "a > 0.5") is None
+    assert prove_anon_isolation(parse_expr("user_id = auth.uid() OR (a > 0.5 AND a < 0.9)"))[0] \
+        == "unverified"
 
 
 # ---------------------------------------------------------------------------
@@ -1094,8 +1106,11 @@ def test_a_decimal_column_types_read_differently_decides_nothing(base, head) -> 
 
 
 def test_a_decimal_a_single_holds_still_translates() -> None:
-    assert _classify("n > 0.5", "n >= 0.5") == "semantic_loosened"
-    assert _counterexample("n > 0.5", "n >= 0.5") == {"n": 0.5}
+    # Loosened only on a `numeric` (0.5): an integer column reads both as
+    # `n >= 1`, and the text does not say which.
+    assert _classify("n > 0.5", "n >= 0.5") is None
+    assert _classify("n > 0.5", "n >= 0") == "semantic_loosened"
+    assert _counterexample("n > 0.5", "n >= 0") == {"n": 0}
     assert _classify("n > 2.25", "n > 2.25 AND x = 1") == "semantic_tightened"
 
 
@@ -1473,10 +1488,8 @@ def test_counterexample_empty_row_for_all_rows_leak() -> None:
     assert _diff_witness_is_sufficient({}, leaks, ctx, assertions) is True
 
 
-def test_counterexample_decodes_real_column_as_float() -> None:
-    # Regression (round-5): the RealSort decode path (as_fraction -> float)
-    # is otherwise untested; a Z3/pglast upgrade could silently break it.
+def test_a_leaking_row_is_an_integer_one() -> None:
+    # It leaks whatever numeric type the column is.
     cx = counterexample(parse_expr("price > 5.0"), parse_expr("price > 0.0"))
     assert cx is not None
-    assert isinstance(cx["price"], float)
-    assert _row_satisfies_head_not_base("price > 5.0", "price > 0.0", cx)
+    assert isinstance(cx["price"], int) and 0 < cx["price"] <= 5

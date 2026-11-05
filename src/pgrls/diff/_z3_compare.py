@@ -237,8 +237,11 @@ class _Context:
 
     def __init__(self) -> None:
         self._vars: dict[str, Any] = {}  # column-key → z3.ExprRef
-        # Integer literals as integers (see `_const_to_z3`).
+        # Integer literals and numeric columns as integers (see
+        # `_const_to_z3`).
         self.integers = False
+        # Translating a hand-written `IN (...)` list's elements.
+        self.in_list = False
         # A column's last name → how it is spelled (see `_column_key`).
         self.spellings: dict[str, tuple[str, ...]] = {}
         # Phase 3 — opaque expressions (function calls,
@@ -313,6 +316,8 @@ class _Context:
         """
         if sort == z3.IntSort() and not self.integers:
             sort = z3.RealSort()
+        elif sort == z3.RealSort() and self.integers:
+            sort = z3.IntSort()  # the integer pass: an integer column
         existing = self._vars.get(key)
         if existing is None:
             var = z3.Const(key, sort)
@@ -446,7 +451,7 @@ def _const_to_z3(node: A_Const, ctx: _Context) -> Any:
     `_integers_agree`)."""
     val = node.val
     if isinstance(val, Integer):
-        return z3.IntVal(val.ival) if ctx.integers else _exact_real(str(val.ival))
+        return z3.IntVal(val.ival) if ctx.integers else _real_integer(val.ival, ctx)
     if isinstance(val, String):
         return _z3_string(val.sval)
     if isinstance(val, Boolean):
@@ -458,7 +463,7 @@ def _const_to_z3(node: A_Const, ctx: _Context) -> Any:
         text = val.fval or ""
         try:
             if re.fullmatch(r"[+-]?\d+", text):
-                return z3.IntVal(int(text)) if ctx.integers else _exact_real(text)
+                return z3.IntVal(int(text)) if ctx.integers else _real_integer(int(text), ctx)
         except (ValueError, TypeError, z3.Z3Exception):
             return None
         # A decimal reads differently against a `numeric` (exactly), a
@@ -472,6 +477,16 @@ def _const_to_z3(node: A_Const, ctx: _Context) -> Any:
     # NULL on either side of a comparison, return None and let the
     # caller fall through to requires_review.
     return None
+
+
+def _real_integer(number: int, ctx: _Context) -> Any:
+    """An integer literal as a real: exactly, up to where a `float8` holds
+    it (an `int8` compared with one is rounded past 2^53), and in a
+    hand-written `IN` list only where a `float4` does (measured: a `float4`
+    column reads `IN (16777217, 1)` through a float4, `= 16777217` not)."""
+    if ctx.in_list:
+        return _exact_real(str(number))
+    return z3.RealVal(number) if abs(number) <= 2**53 else None
 
 
 def _exact_real(text: str) -> Any:
@@ -1879,7 +1894,11 @@ def _anon_any_array(
             lexpr=node.lexpr,
             rexpr=elem,
         )
-        tv = _anon_binop(cmp_node, ctx, auth_funcs, assertions)
+        ctx.in_list = node.kind == A_Expr_Kind.AEXPR_IN
+        try:
+            tv = _anon_binop(cmp_node, ctx, auth_funcs, assertions)
+        finally:
+            ctx.in_list = False
         # `=` yields a _TV; anything else (None, or a _Val) → abstain whole.
         if not isinstance(tv, _TV):
             return None
@@ -2151,6 +2170,11 @@ def _fold_literal_cast(value: Any, target_sort: Any, type_name: str | None) -> A
     return None
 
 
+def _in_int_range(number: int, typename: Any) -> bool:
+    low, high = _INT_RANGES.get(_typename_last_segment(typename) or "", _INT_RANGES["int8"])
+    return low <= number <= high
+
+
 def _anon_typecast(
     node: TypeCast, ctx: _Context, auth_funcs: set[str], assertions: list[Any]
 ) -> Any:
@@ -2184,9 +2208,10 @@ def _anon_typecast(
     if inner is None:
         return None
     target_sort = _typename_segments_to_sort(node.typeName)
-    if (target_sort == z3.IntSort() and not ctx.integers and z3.is_rational_value(inner.value)
-            and inner.value.denominator_as_long() == 1):
-        return inner  # `5::int` is 5
+    if (target_sort == z3.IntSort() and not ctx.integers and _exact_cast(node.typeName)
+            and z3.is_rational_value(inner.value) and inner.value.denominator_as_long() == 1
+            and _in_int_range(inner.value.numerator_as_long(), node.typeName)):
+        return inner  # `5::int` is 5 (not `(-256)::oid`, which wraps)
     if (target_sort == z3.IntSort() and not ctx.integers
             and _is_real_column_term(ctx, inner.value)):
         # Over the reals (see `_const_to_z3`) an integer cast of a column

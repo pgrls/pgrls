@@ -76,12 +76,15 @@ breaking changes — they will be called out in this file.
   (the text of an offline snapshot or a migration has no casts to say so):
   `score >= 1` → `score > 0` was no change on a `numeric` column (0.5), and
   is a loosening only if it is one on the integers too, so such a change
-  needs review; a literal is read only when a `float4` holds it exactly
-  (`0.5` or `16777216`, not `0.1`: a `numeric`, a `float8` and, in an `IN`
-  list, a `float4` column read it differently; through a float,
-  `c = 9007199254740992` and `c = 9007199254740993` were one value), and a
-  literal past the double range (`1e400`) no longer crashes. A leaking row
-  is an integer one, which leaks whatever the type. Arithmetic on a column
+  needs review; a decimal is read only when a `float4` holds it exactly
+  (`0.5`, not `0.1`: a `numeric`, a `float8` and, in an `IN` list, a
+  `float4` column read it differently), an integer exactly up to 2^53 (an
+  `int8` compared with a `float8` is rounded past it; through a float,
+  `c = 9007199254740992` and `c = 9007199254740993` were one value) and in a
+  hand-written `IN` list up to 2^24, and a literal past the double range
+  (`1e400`) no longer crashes. A leaking row is an integer one, re-checked
+  with every numeric column an integer, so it leaks whatever the type; an
+  integer cast that wraps (`(-256)::oid`) or raises is no constant. Arithmetic on a column
   of unknown type now needs review (`col + 1 > 0` → `col > -1`).
 - **`pgrls verify`, `matrix --prove` and SEC038 no longer take Z3's reading
   where it differs from Postgres's.** A comparison Z3 would read otherwise —
