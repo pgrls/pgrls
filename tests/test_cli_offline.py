@@ -2031,6 +2031,7 @@ def test_pg_dumpall_output_is_refused(tmp_path):
     ("\\set ON_ERROR_STOP :x\n", "psql command"),
     ("\\set ECHO a\n\\connect :ECHO\nCREATE TABLE t (id int);\n", "psql command"),
     ("\\connect :DBNAME\nCREATE TABLE t (id int);\n", "psql command"),
+    ('\\connect "dbname=x options=-c"\nCREATE TABLE t (id int);\n', "psql command"),
     ("\\echo x\nCREATE TABLE t (id int);\nSELECT (ARRAY[1])[1:ROW_COUNT] FROM t;\n", "its own variable"),
     ("\\echo x\nSELECT :'USER', 1 FROM (SELECT 1) s(\"USER\");\n", "psql command|its own variable|parse"),
     # psql splits lines by the client encoding.
@@ -2253,6 +2254,12 @@ def test_harmless_psql_commands_are_skipped():
     sql = ("\\restrict k\n\\echo start\n"
            "CREATE DATABASE d;\n\\connect d\n\\pset pager off\nCREATE TABLE t (id int);\n")
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+    # pg_dump double-quotes a name that needs it, and psql skips a BOM.
+    for name in ("MyApp", "user", "my.app", 'a""b'):
+        sql = (f'CREATE DATABASE "{name}";\n\\connect "{name}"\n'
+               'CREATE TABLE t (id int);\n')
+        assert [t.name for t in schema_from_sql(sql).tables] == ["t"], name
+    assert [t.name for t in schema_from_sql("\ufeffCREATE TABLE t (id int);\n").tables] == ["t"]
     # A script's settings of psql's own error and output handling.
     sql = "\\set ON_ERROR_STOP on\n\\set QUIET\nCREATE TABLE t (id int);\n"
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]

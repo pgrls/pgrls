@@ -1659,8 +1659,10 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
     ends the command so the rest of the line runs as SQL; a backtick runs a
     shell command. Any of those is refused, as is any other command.
 
-    A `\\connect` is skipped only in the forms pg_dump writes — a bare
-    database name, or `-reuse-previous=on "dbname='…'"` — since a conninfo
+    A `\\connect` is skipped only in the forms pg_dump writes — a database
+    name, bare or double-quoted (`\\connect "MyApp"`, as it quotes one that
+    needs it, every one under `--quote-all-identifiers`), or
+    `-reuse-previous=on "dbname='…'"` — since a conninfo
     string can also set `options` or `client_encoding`, which change how
     the server reads the strings after it; an `\\encoding` only to UTF8 or
     SQL_ASCII."""
@@ -1677,10 +1679,13 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
         connect = name in ("c", "connect")
         target = None
         if connect and (c := re.fullmatch(
-            r'([^\s"\'=:\-][^\s"\'=:]*)|-reuse-previous=on "dbname=\'([^\'"\\:]*)\'"',
+            r'([^\s"\'=:\-][^\s"\'=:]*)|"((?:[^"\\=:]|"")+)"'
+            r'|-reuse-previous=on "dbname=\'([^\'"\\:]*)\'"',
             rest,
         )):
-            target = c.group(1) or c.group(2)
+            # psql takes a double-quoted name as it is (`""` a quote); one
+            # holding `=` would be a conninfo string.
+            target = c.group(1) or (c.group(2) or "").replace('""', '"') or c.group(3)
         known = name in _HARMLESS_PSQL_COMMANDS or target is not None or (
             name == "encoding"
             and re.sub(r"[^a-z0-9]", "", rest.lower()) in _UTF8_ENCODINGS
@@ -1859,7 +1864,10 @@ def _without_psql_meta_commands(sql: str) -> str:
 
 def _split_psql_meta_commands(sql: str) -> tuple[str, list[tuple[int, str]]]:
     """`_without_psql_meta_commands`'s text, and each meta-command line it
-    blanked, with its offset."""
+    blanked, with its offset. A UTF-8 byte-order mark opening the file,
+    which psql skips, is blanked too."""
+    if sql.startswith("\ufeff"):
+        sql = " " + sql[1:]
     out = list(sql)
     commands: list[tuple[int, str]] = []
     i, n = 0, len(sql)

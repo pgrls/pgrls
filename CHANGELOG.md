@@ -67,8 +67,10 @@ breaking changes — they will be called out in this file.
   too. Any other is refused with an error naming it, since the SQL pgrls
   would read is not the SQL that runs: a dump with data (`\.` ends its
   COPY rows, and any `COPY … FROM stdin` reads them from the file), `\i`, `\if`, `\gexec`, any other `\set`, a `\connect` in any form
-  but the two pg_dump writes (a conninfo string can set `options` or
-  `client_encoding`), a second command on the line, a line Postgres reads
+  but those pg_dump writes (a name, bare or double-quoted, or
+  `-reuse-previous=on "dbname='…'"`; a conninfo string can set `options` or
+  `client_encoding`; a byte-order mark opening the file is skipped as psql
+  skips it), a second command on the line, a line Postgres reads
   as inside a string, SQL beside a meta-command that names one of psql's
   own variables (`:ROW_COUNT`), and `pg_dumpall` output, which connects to one database
   after another (dump each with `pg_dump`), or a `\connect` after anything
