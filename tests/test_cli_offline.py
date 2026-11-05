@@ -1744,7 +1744,12 @@ def test_a_usable_schema_and_a_lone_path_entry_resolve():
                   "CREATE SCHEMA app; GRANT USAGE ON SCHEMA app TO app_user;",
                   # Revoking only the grant option keeps USAGE.
                   "CREATE SCHEMA app; GRANT USAGE ON SCHEMA app TO app_user WITH GRANT OPTION;"
-                  " REVOKE GRANT OPTION FOR USAGE ON SCHEMA app FROM app_user;"):
+                  " REVOKE GRANT OPTION FOR USAGE ON SCHEMA app FROM app_user;",
+                  # A schema made again, or given to a new owner, is the owner's.
+                  "CREATE SCHEMA app AUTHORIZATION app_user; REVOKE USAGE ON SCHEMA app FROM app_user;"
+                  " DROP SCHEMA app; CREATE SCHEMA app AUTHORIZATION app_user;",
+                  "CREATE SCHEMA app; REVOKE ALL ON SCHEMA app FROM app_user;"
+                  " ALTER SCHEMA app OWNER TO app_user;"):
         t = _only(f"{grant} CREATE TABLE app.items (id int); SET ROLE app_user;"
                   " SET search_path = app, public; ALTER TABLE items ENABLE ROW LEVEL SECURITY;")
         assert t.qualified_name == "app.items" and t.rls_enabled is True, grant

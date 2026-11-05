@@ -1292,7 +1292,10 @@ class _Resolver:
             self._drop(stmt)
         elif (isinstance(stmt, _pgast.AlterOwnerStmt)
               and stmt.objectType == ObjectType.OBJECT_SCHEMA):
-            self.owners[str(getattr(stmt.object, "sval", ""))] = self.role_of(stmt.newowner)
+            schema = str(getattr(stmt.object, "sval", ""))
+            self.owners[schema] = self.role_of(stmt.newowner)
+            # The new owner takes the old one's privileges.
+            self.revoked.discard((schema, self.owners[schema]))
         elif (isinstance(stmt, _pgast.GrantStmt) and stmt.objtype == ObjectType.OBJECT_SCHEMA
               and not (not stmt.is_grant and stmt.grant_option)  # GRANT OPTION FOR only
               and (stmt.privileges is None or any(
@@ -1338,7 +1341,7 @@ class _Resolver:
                     self.dropped.add(schema)
                     self.relations -= {r for r in self.relations if r[0] == schema}
                     self.usage = {u for u in self.usage if u[0] != schema}
-                    self.revoked.add((schema, None))
+                    self.revoked = {r for r in self.revoked if r[0] != schema} | {(schema, None)}
                 elif owner == _SOME_ROLE or _may_be(owner, roles) or owner in roles:
                     self.unsure.add(schema)
             self.dropped_owned = True
@@ -1398,9 +1401,10 @@ class _Resolver:
                 self.dropped.add(schema)
                 self.unsure.discard(schema)
                 self.relations -= {r for r in self.relations if r[0] == schema}
-                # One made again grants USAGE to no one (`public` too).
+                # One made again grants USAGE to no one (`public` too), and
+                # its owner has it.
                 self.usage = {u for u in self.usage if u[0] != schema}
-                self.revoked.add((schema, None))
+                self.revoked = {r for r in self.revoked if r[0] != schema} | {(schema, None)}
             return
         if stmt.removeType not in _RELATION_KINDS and stmt.removeType != ObjectType.OBJECT_POLICY:
             return
