@@ -1657,6 +1657,14 @@ def test_relations_postgres_removes_or_keeps_are_followed(sql, expected):
     # A role that may have no USAGE on app, which Postgres then skips.
     "CREATE SCHEMA audit; SET SESSION AUTHORIZATION app_user;"
     " SET search_path = audit, public; CREATE TABLE items (id int);",
+    # A schema made again grants no one USAGE (a reset `public` too).
+    "CREATE SCHEMA app; GRANT USAGE ON SCHEMA app TO r1; DROP SCHEMA app CASCADE;"
+    " CREATE SCHEMA app; SET ROLE r1; SET search_path = app, public; CREATE TABLE t (id int);",
+    "DROP SCHEMA public CASCADE; CREATE SCHEMA public; SET ROLE r1; CREATE TABLE t (id int);",
+    # app.t and ext.t: r1 may lack USAGE on ext (through a group), so either.
+    "CREATE SCHEMA app AUTHORIZATION r1; CREATE SCHEMA ext; CREATE TABLE app.t (id int);"
+    " CREATE TABLE ext.t (id int); GRANT USAGE ON SCHEMA ext TO grp; SET ROLE r1;"
+    " SET search_path = app, ext; ALTER TABLE t ENABLE ROW LEVEL SECURITY;",
     # An INSERT may fire a trigger that drops the temporary t.
     "CREATE TABLE public.t (id int); CREATE TEMP TABLE t (id int); CREATE TABLE public.log (id int);"
     " INSERT INTO public.log VALUES (1); GRANT SELECT ON t TO anon;",
@@ -1667,10 +1675,26 @@ def test_what_pgrls_cannot_tell_is_refused(sql):
         schema_from_sql(sql)
 
 
+def test_a_table_made_again_is_a_partition_only_as_its_create_says():
+    # DETACH, an INSERT (which may run code), then CREATE … IF NOT EXISTS:
+    # either way events_2024 is a table of its own.
+    schema = __import__("pgrls.schema_sources", fromlist=["x"]).schema_from_sql(
+        "CREATE TABLE public.events (id int, at date) PARTITION BY RANGE (at);"
+        " CREATE TABLE public.events_2024 PARTITION OF public.events"
+        " FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');"
+        " INSERT INTO public.events VALUES (1, '2024-03-01');"
+        " ALTER TABLE public.events DETACH PARTITION public.events_2024;"
+        " CREATE TABLE IF NOT EXISTS public.events_2024 (id int, at date);")
+    assert {t.name: t.partition_of for t in schema.tables}["events_2024"] is None
+
+
 def test_a_usable_schema_and_a_lone_path_entry_resolve():
     # app_user owns app, or was granted USAGE: Postgres searches it.
     for grant in ("CREATE SCHEMA app AUTHORIZATION app_user;",
-                  "CREATE SCHEMA app; GRANT USAGE ON SCHEMA app TO app_user;"):
+                  "CREATE SCHEMA app; GRANT USAGE ON SCHEMA app TO app_user;",
+                  # Revoking only the grant option keeps USAGE.
+                  "CREATE SCHEMA app; GRANT USAGE ON SCHEMA app TO app_user WITH GRANT OPTION;"
+                  " REVOKE GRANT OPTION FOR USAGE ON SCHEMA app FROM app_user;"):
         t = _only(f"{grant} CREATE TABLE app.items (id int); SET ROLE app_user;"
                   " SET search_path = app, public; ALTER TABLE items ENABLE ROW LEVEL SECURITY;")
         assert t.qualified_name == "app.items" and t.rls_enabled is True, grant

@@ -119,7 +119,8 @@ breaking changes — they will be called out in this file.
   relation or code — a `DO` block, a `CALL`, a function called, a write or
   a read of a relation (a trigger, rule or view may run code), an event
   trigger — lies
-  between, which could have taken it), and it
+  between, which could have taken it; a table made again is a partition
+  or child only as its `CREATE` says), and it
   follows its parent through a rename. A partition's parents outside the
   linted schemas (`--schemas`, else `[database] schemas`, in the LSP too)
   are left out of the model, as live lint does not see them, so the child's
@@ -153,8 +154,9 @@ breaking changes — they will be called out in this file.
   cannot follow is refused: one a `\connect`ed database or role may set,
   `pg_temp` on it ahead of the schema that holds a name, a schema on it
   that a role the SQL runs as (`SET ROLE` / `SET SESSION AUTHORIZATION`)
-  may have no `USAGE` on (Postgres skips it; one the role owns, was granted
-  `USAGE` on, or `public` is followed), a `set_config()` of the path or the role anywhere but a
+  may have no `USAGE` on where it holds the name (Postgres skips it; one
+  the role owns, was granted `USAGE` on, or a `public` the SQL did not drop
+  and make again is followed), a `set_config()` of the path or the role anywhere but a
   plain `SELECT` of literals (a cursor, `PREPARE`, `ALTER … USING`, `ADD
   COLUMN … DEFAULT`, a partition bound (in a `CREATE SCHEMA` too),
   `CREATE TABLE … AS EXECUTE`; a definition — a view, a new table's

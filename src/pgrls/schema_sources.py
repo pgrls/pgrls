@@ -622,6 +622,13 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             if stmt.if_not_exists and not gone_between(tables[key].created_at, index):
                 continue
             tables[key].created_at = index
+            # A table made again is a partition or child only as this CREATE
+            # says (the ATTACH / DETACH before it is the old one's).
+            again = [p for p in (_relation_key(rel, default_schema)
+                                 for rel in (stmt.inhRelations or ())) if p is not None]
+            partition = again and getattr(stmt, "partbound", None) is not None
+            tables[key].partition_of = again[0] if partition else None
+            tables[key].inherits = [] if partition else again
             continue
         builder = _TableBuilder(schema=key[0], name=key[1], created_at=index)
         builder.partitioned = getattr(stmt, "partspec", None) is not None
@@ -1096,7 +1103,7 @@ class _Resolver:
             )
         return schema not in self.created and schema not in self.dropped
 
-    def _entries(self) -> Any:
+    def _entries(self, *, check_usage: bool = True) -> Any:
         """The schemas on the path that exist, `$user` named, in order;
         refuses a path pgrls cannot follow."""
         path = self.path
@@ -1137,7 +1144,8 @@ class _Resolver:
                     "follow; qualify the names.",
                 )
             if self.exists(entry):  # Postgres skips one that does not
-                self._check_usage(entry)
+                if check_usage:
+                    self._check_usage(entry)
                 yield entry
 
     def _check_usage(self, schema: str) -> None:
@@ -1214,7 +1222,7 @@ class _Resolver:
         entry pgrls cannot follow (refused only if none was found before
         it: Postgres stops at the first)."""
         found: list[str] = []
-        entries = self._entries()
+        entries = self._entries(check_usage=False)
         while True:
             try:
                 entry = next(entries)
@@ -1225,6 +1233,9 @@ class _Resolver:
                     return found
                 raise  # the first may be gone, and Postgres would go on
             if (entry, name) in self.relations:
+                # One the running role may not use (so Postgres may skip it)
+                # decides nothing.
+                self._check_usage(entry)
                 found.append(entry)
 
     def qualify(self, stmt: Any) -> None:
@@ -1261,6 +1272,7 @@ class _Resolver:
               and stmt.objectType == ObjectType.OBJECT_SCHEMA):
             self.owners[str(getattr(stmt.object, "sval", ""))] = self.role_of(stmt.newowner)
         elif (isinstance(stmt, _pgast.GrantStmt) and stmt.objtype == ObjectType.OBJECT_SCHEMA
+              and not (not stmt.is_grant and stmt.grant_option)  # GRANT OPTION FOR only
               and (stmt.privileges is None or any(
                   getattr(p, "priv_name", None) == "usage" for p in stmt.privileges))):
             for item in stmt.objects or ():
@@ -1356,6 +1368,9 @@ class _Resolver:
                 self.dropped.add(schema)
                 self.unsure.discard(schema)
                 self.relations -= {r for r in self.relations if r[0] == schema}
+                # One made again grants USAGE to no one (`public` too).
+                self.usage = {u for u in self.usage if u[0] != schema}
+                self.revoked.add((schema, None))
             return
         if stmt.removeType not in _RELATION_KINDS and stmt.removeType != ObjectType.OBJECT_POLICY:
             return
