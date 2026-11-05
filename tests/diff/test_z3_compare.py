@@ -933,14 +933,20 @@ def test_reserved_marker_prefix_column_cannot_alias_the_null_flag() -> None:
     # column, so the predicate degrades to requires_review (None).
     assert _classify("x IS NULL AND y = 1", '"_nullflag__x" AND y = 1') is None
     # _column_key returns "" for every reserved synthetic prefix...
-    from pgrls.diff._z3_compare import _column_key
+    from pgrls.diff._z3_compare import _column_key, _Context
 
     for name in ("_opaque__foo", "_nullflag__z", "_session__a"):
         ref = parse_expr(f'"{name}" = 1').lexpr
-        assert _column_key(ref) == "", name
+        assert _column_key(ref, _Context()) == "", name
     # ...but a near-miss / ordinary name still binds normally.
-    assert _column_key(parse_expr('"_nullflagx" = 1').lexpr) == "_nullflagx"
-    assert _column_key(parse_expr("owner_id = 1").lexpr) == "owner_id"
+    assert _column_key(parse_expr('"_nullflagx" = 1').lexpr, _Context()) == "_nullflagx"
+    assert _column_key(parse_expr("owner_id = 1").lexpr, _Context()) == "owner_id"
+
+
+def test_a_column_spelled_two_ways_decides_nothing() -> None:
+    # pg_get_expr writes `t.a` in a sub-select and `a` outside it: one
+    # column, which as two gave a leaking row that cannot exist.
+    assert _classify("a = 1 AND b = 1", "((a = 1) AND ((b = 1) OR (( SELECT t.a) = 2)))") is None
 
 
 def test_a_null_test_is_tied_to_its_columns_value() -> None:
@@ -1318,6 +1324,11 @@ def test_a_setting_named_by_a_column_is_no_identity() -> None:
 
 def test_a_computed_missing_ok_reads_the_setting_or_null() -> None:
     from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    # The anon-key caller's claims are set: its role is 'anon'.
+    for using in ("current_setting('request.jwt.claims', flag) IS NOT NULL",
+                  "current_setting('request.jwt.claim.role', flag) = 'anon'"):
+        assert prove_anon_isolation(parse_expr(using))[0] == "leak", using
 
     # Unset under anon, so NULL or it raises; the session's own value, or
     # NULL, for a tenant.

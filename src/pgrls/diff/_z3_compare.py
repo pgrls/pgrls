@@ -236,6 +236,8 @@ class _Context:
 
     def __init__(self) -> None:
         self._vars: dict[str, Any] = {}  # column-key → z3.ExprRef
+        # A column's last name → how it is spelled (see `_column_key`).
+        self.spellings: dict[str, tuple[str, ...]] = {}
         # Phase 3 — opaque expressions (function calls,
         # COALESCE, CASE) keyed by their canonical-string shape.
         # Same key on both sides of the diff yields the same Z3
@@ -393,12 +395,15 @@ class _Context:
         return None  # type conflict — translation aborts
 
 
-def _column_key(node: ColumnRef) -> str:
+def _column_key(node: ColumnRef, ctx: _Context) -> str:
     """Render `ColumnRef.fields` as a `.`-joined identifier key.
 
     A column reference's `fields` is a tuple of `String` nodes (or
     `A_Star` for wildcards, which we don't support). Returns None
-    for unsupported shapes.
+    for unsupported shapes, and for a column `ctx` has seen spelled
+    otherwise: `pg_get_expr` writes `t.a` in a sub-select and `a`
+    outside it, one column (or `t.a` may be a field of a composite `t`),
+    which as two variables gave a leaking row that cannot exist.
     """
     parts = []
     for field in node.fields or ():
@@ -406,6 +411,8 @@ def _column_key(node: ColumnRef) -> str:
             parts.append(field.sval)
         else:
             return ""  # unsupported (e.g., A_Star)
+    if not parts or ctx.spellings.setdefault(parts[-1], tuple(parts)) != tuple(parts):
+        return ""
     key = ".".join(parts)
     # A real column whose key collides with a synthetic marker namespace
     # would alias the marker var in the implication query (Z3 keys a
@@ -1317,6 +1324,12 @@ def _anon_3vl(
         if ctx.session_mode:
             return _Val(value=ctx.session_var(_canon(node), z3.StringSort()),
                         is_null=ctx.opaque_null_flag(_canon(node)))
+        if ctx.anon_jwt and name in ("request.jwt.claim.role", "request.jwt.claims"):
+            # Set for the anon-key caller: its claim, or NULL where
+            # missing_ok is.
+            return _Val(value=(z3.StringVal("anon") if name == "request.jwt.claim.role"
+                               else ctx.opaque(_canon(node), z3.StringSort())),
+                        is_null=ctx.opaque_null_flag(_canon(node)))
         if (not ctx.any_session and _reads_unset_guc_under_anon(node)
                 and name not in ctx.set_gucs):
             # Unset under anon: NULL, or it raises (no rows).
@@ -1369,7 +1382,7 @@ def _anon_3vl(
     # bool operand); a typed comparison context rebinds it via the 3VL
     # operand resolver. The free null-flag is a Kleene U candidate.
     if isinstance(node, ColumnRef):
-        key = _column_key(node)
+        key = _column_key(node, ctx)
         if not key:
             return None
         value = ctx.column(key, z3.BoolSort())
@@ -1465,7 +1478,7 @@ def _anon_3vl(
         if ctx.any_session and isinstance(node.arg, ColumnRef):
             # Only the column's null-flag is tested: binding its value would
             # give it a sort (Bool) that clashes with its comparisons.
-            key = _column_key(node.arg)
+            key = _column_key(node.arg, ctx)
             if not key:
                 return None
             ctx.null_tested.add(key)
@@ -1618,7 +1631,7 @@ def _anon_coalesce(
     for arg in args:
         column = _unwrap_scalar_sublink(arg)
         if isinstance(column, ColumnRef):
-            key = _column_key(column)
+            key = _column_key(column, ctx)
             var = ctx.column(key, sort) if key else None
             if var is None:
                 return None
@@ -1961,7 +1974,7 @@ def _resolve_3vl_operands(
     r_is_col = isinstance(rexpr, ColumnRef)
 
     def col_val(col: ColumnRef, sort: Any) -> Any:
-        key = _column_key(col)
+        key = _column_key(col, ctx)
         if not key:
             return None
         var = ctx.column(key, sort)
