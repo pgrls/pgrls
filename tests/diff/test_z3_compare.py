@@ -411,6 +411,17 @@ def test_an_integer_literal_does_not_make_its_column_an_integer():
     assert _classify("g = '16777217'::int", "g IN ('16777217'::int, '16777217'::int)") is None
     assert prove_anon_isolation(parse_expr(
         "c = '9007199254740993'::int8 AND c <= 9007199254740992"))[0] != "isolated"
+    # A COALESCE, or an array with a column in it, gives a literal its
+    # column's type, a float4's too (rounded past 2^24), as an IN list does.
+    assert _classify("g = 16777216", "COALESCE(g, 16777217) = 16777216") is None
+    assert _classify("g = 16777216", "16777216 = ANY(ARRAY[g, 16777217])") is None
+    assert prove_anon_isolation(parse_expr(
+        "user_id = auth.uid() OR (COALESCE(g, 16777217) = 16777216 AND COALESCE(g, 0) = 0)")
+    )[0] != "isolated"
+    # ... and a nested IN does not end the outer one's rule.
+    nested = "COALESCE(g, (a IN (1, 2))::int::float4)"
+    assert _classify(f"{nested} = 1",
+                     f"{nested} IN (16777217, 1) AND {nested} <> 16777217") is None
     # A numeric tenant key leaks through its OR as an integer one does.
     assert prove_cross_tenant_isolation(parse_expr(
         "tenant_id = (SELECT current_setting('app.tenant_id', true)::numeric) OR is_public")

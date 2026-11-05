@@ -72,6 +72,7 @@ so this is a defensive guardrail rather than a real limitation.
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import dataclasses
 import fractions
@@ -240,8 +241,9 @@ class _Context:
         # Integer literals and numeric columns as integers (see
         # `_const_to_z3`).
         self.integers = False
-        # Translating a hand-written `IN (...)` list's elements.
-        self.in_list = False
+        # How deep the translation is among values Postgres gives one type
+        # (see `_real_integer`).
+        self.unified = 0
         # A column's last name → how it is spelled (see `_column_key`).
         self.spellings: dict[str, tuple[str, ...]] = {}
         # Phase 3 — opaque expressions (function calls,
@@ -305,6 +307,15 @@ class _Context:
         # manufactured a PROVEN for a policy that leaks — see
         # `_session_null_tests_offaxis`.
         self.session_null_tests: set[str] = set()
+
+    @contextlib.contextmanager
+    def unifying(self, unified: bool) -> Any:
+        """Translate among values Postgres gives one type, when `unified`."""
+        self.unified += unified
+        try:
+            yield
+        finally:
+            self.unified -= unified
 
     def column(self, key: str, sort: Any) -> Any:
         """Return the Z3 variable for `key`, binding it on first use.
@@ -481,12 +492,20 @@ def _const_to_z3(node: A_Const, ctx: _Context) -> Any:
     return None
 
 
+def _is_constant(node: Any) -> bool:
+    while isinstance(node, TypeCast):
+        node = node.arg
+    return isinstance(node, A_Const)
+
+
 def _real_integer(number: int, ctx: _Context) -> Any:
     """An integer literal as a real: exactly, up to where a `float8` holds
-    it (an `int8` compared with one is rounded past 2^53), and in a
-    hand-written `IN` list only where a `float4` does (measured: a `float4`
-    column reads `IN (16777217, 1)` through a float4, `= 16777217` not)."""
-    if ctx.in_list:
+    it (an `int8` compared with one is rounded past 2^53), and among values
+    Postgres gives one type (`ctx.unified`: an `IN` list, a `COALESCE`, an
+    array with a column in it) only where a `float4` does (measured: a
+    `float4` column reads `IN (16777217, 1)` and `COALESCE(g, 16777217)`
+    through a float4, `= 16777217` not)."""
+    if ctx.unified:
         return _exact_real(str(number))
     return z3.RealVal(number) if abs(number) <= 2**53 else None
 
@@ -1727,8 +1746,10 @@ def _anon_coalesce(
     defaults to; with no sibling to give one, the caller keeps the COALESCE
     opaque."""
     args = list(node.args or ())
-    others = [_as_val(_anon_3vl(a, ctx, auth_funcs, assertions)) for a in args
-              if not isinstance(_unwrap_scalar_sublink(a), ColumnRef)]
+    # Its arguments take one type, a column's beside a literal.
+    with ctx.unifying(not all(_is_constant(a) for a in args)):
+        others = [_as_val(_anon_3vl(a, ctx, auth_funcs, assertions)) for a in args
+                  if not isinstance(_unwrap_scalar_sublink(a), ColumnRef)]
     if not others or any(v is None for v in others):
         return None
     sorts = {v.value.sort() for v in others}
@@ -1896,11 +1917,11 @@ def _anon_any_array(
             lexpr=node.lexpr,
             rexpr=elem,
         )
-        ctx.in_list = node.kind == A_Expr_Kind.AEXPR_IN
-        try:
+        # An `IN` list takes one type with its left side, and an array
+        # one with a non-constant element.
+        with ctx.unifying(node.kind == A_Expr_Kind.AEXPR_IN or not all(
+                _is_constant(e) for e in elements)):
             tv = _anon_binop(cmp_node, ctx, auth_funcs, assertions)
-        finally:
-            ctx.in_list = False
         # `=` yields a _TV; anything else (None, or a _Val) → abstain whole.
         if not isinstance(tv, _TV):
             return None

@@ -80,8 +80,9 @@ breaking changes — they will be called out in this file.
   (`0.5`, not `0.1`: a `numeric`, a `float8` and, in an `IN` list, a
   `float4` column read it differently), an integer exactly up to 2^53 (an
   `int8` compared with a `float8` is rounded past it; through a float,
-  `c = 9007199254740992` and `c = 9007199254740993` were one value) and in a
-  hand-written `IN` list up to 2^24 (a string cast to an integer type,
+  `c = 9007199254740992` and `c = 9007199254740993` were one value) and,
+  among values Postgres gives one type (an `IN` list, a `COALESCE`, an array
+  with a column in it), up to 2^24 (a string cast to an integer type,
   `'…'::int8`, likewise), and a literal past the double range (`1e400`) no
   longer crashes. A leaking row is an integer one, re-checked with every
   numeric column an integer, so it leaks for an integer or `numeric` column
