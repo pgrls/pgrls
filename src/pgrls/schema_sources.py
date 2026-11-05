@@ -621,14 +621,26 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             # DROP since), so an ATTACH / DETACH before it still applies.
             if stmt.if_not_exists and not gone_between(tables[key].created_at, index):
                 continue
+            previous = tables[key].created_at
             tables[key].created_at = index
             # A table made again is a partition or child only as this CREATE
-            # says (the ATTACH / DETACH before it is the old one's).
+            # says (the ATTACH / DETACH before it is the old one's); one that
+            # may also be the old table (an IF NOT EXISTS after code, not
+            # after a DROP of it) keeps only a link both would have.
             again = [p for p in (_relation_key(rel, default_schema)
                                  for rel in (stmt.inhRelations or ())) if p is not None]
-            partition = again and getattr(stmt, "partbound", None) is not None
-            tables[key].partition_of = again[0] if partition else None
-            tables[key].inherits = [] if partition else again
+            partition = bool(again) and getattr(stmt, "partbound", None) is not None
+            new_parent = again[0] if partition else None
+            new_inherits = [] if partition else again
+            if stmt.if_not_exists and not _dropped_between(statements, key, previous, index,
+                                                           default_schema):
+                if tables[key].partition_of != new_parent:
+                    new_parent = None
+                new_inherits = [p for p in new_inherits if p in tables[key].inherits]
+            if new_parent is not None and _is_below(tables, new_parent, key):
+                new_parent = None  # an ATTACH would refuse the cycle
+            tables[key].partition_of = new_parent
+            tables[key].inherits = [p for p in new_inherits if not _is_below(tables, p, key)]
             continue
         builder = _TableBuilder(schema=key[0], name=key[1], created_at=index)
         builder.partitioned = getattr(stmt, "partspec", None) is not None
@@ -1312,9 +1324,14 @@ class _Resolver:
                     self.schemas.discard(schema)
                     self.dropped.add(schema)
                     self.relations -= {r for r in self.relations if r[0] == schema}
+                    self.usage = {u for u in self.usage if u[0] != schema}
+                    self.revoked.add((schema, None))
                 elif owner == _SOME_ROLE or _may_be(owner, roles) or owner in roles:
                     self.unsure.add(schema)
             self.dropped_owned = True
+            # It also revokes what was granted to them.
+            self.usage = {u for u in self.usage
+                          if not (u[1] in roles or (u[1] is not None and _may_be(u[1], roles)))}
         elif (isinstance(stmt, _pgast.AlterObjectSchemaStmt) and stmt.relation is not None
               and stmt.newschema):
             # A view, sequence, matview or foreign table moves (a table's
@@ -1853,6 +1870,34 @@ def _column_type(column_def: Any) -> str | None:
         # than aborting the whole table (tolerant-walk contract). The column
         # name is still captured by the caller only when a type renders.
         return None
+
+
+def _dropped_between(statements: Any, key: tuple[str, str], after: int, before: int,
+                     default_schema: str) -> bool:
+    """Whether a `DROP TABLE` of `key` lies between the two statements."""
+    return any(
+        isinstance(raw.stmt, _pgast.DropStmt) and raw.stmt.removeType == ObjectType.OBJECT_TABLE
+        and any(_drop_table_key(_drop_name_parts(n), default_schema) == key
+                for n in raw.stmt.objects or () if _drop_name_parts(n))
+        for raw in statements[after + 1:before])
+
+
+def _is_below(tables: dict[tuple[str, str], _TableBuilder], start: tuple[str, str],
+              key: tuple[str, str]) -> bool:
+    """Whether `key` is `start` or among its parents, its parents' parents
+    and so on (so making `key` a child of `start` would close a cycle)."""
+    pending, seen = [start], set()
+    while pending:
+        node = pending.pop()
+        if node == key:
+            return True
+        if node in seen or node not in tables:
+            continue
+        seen.add(node)
+        builder = tables[node]
+        pending.extend([builder.partition_of] if builder.partition_of else [])
+        pending.extend(builder.inherits)
+    return False
 
 
 def _apply_alter_table(

@@ -1665,6 +1665,9 @@ def test_relations_postgres_removes_or_keeps_are_followed(sql, expected):
     "CREATE SCHEMA app AUTHORIZATION r1; CREATE SCHEMA ext; CREATE TABLE app.t (id int);"
     " CREATE TABLE ext.t (id int); GRANT USAGE ON SCHEMA ext TO grp; SET ROLE r1;"
     " SET search_path = app, ext; ALTER TABLE t ENABLE ROW LEVEL SECURITY;",
+    # DROP OWNED revokes r1's USAGE on app.
+    "CREATE SCHEMA app AUTHORIZATION r2; GRANT USAGE ON SCHEMA app TO r1; DROP OWNED BY r1;"
+    " SET search_path = app, public; SET ROLE r1; CREATE TABLE t (id int);",
     # An INSERT may fire a trigger that drops the temporary t.
     "CREATE TABLE public.t (id int); CREATE TEMP TABLE t (id int); CREATE TABLE public.log (id int);"
     " INSERT INTO public.log VALUES (1); GRANT SELECT ON t TO anon;",
@@ -1686,6 +1689,23 @@ def test_a_table_made_again_is_a_partition_only_as_its_create_says():
         " ALTER TABLE public.events DETACH PARTITION public.events_2024;"
         " CREATE TABLE IF NOT EXISTS public.events_2024 (id int, at date);")
     assert {t.name: t.partition_of for t in schema.tables}["events_2024"] is None
+
+
+def test_an_if_not_exists_that_may_skip_keeps_a_table_standalone():
+    from pgrls.schema_sources import schema_from_sql
+    # c may be the standalone table still (Postgres skips the IF NOT EXISTS).
+    schema = schema_from_sql(
+        "CREATE TABLE public.p (id int) PARTITION BY RANGE (id); CREATE TABLE public.c (id int);"
+        " DROP TABLE IF EXISTS public.zzz;"
+        " CREATE TABLE IF NOT EXISTS public.c PARTITION OF public.p FOR VALUES FROM (0) TO (10);")
+    assert {t.name: t.partition_of for t in schema.tables}["c"] is None
+    # A re-create that would close a cycle of partitions is no partition.
+    schema = schema_from_sql(
+        "CREATE TABLE a (id int) PARTITION BY RANGE (id);"
+        " CREATE TABLE b PARTITION OF a FOR VALUES FROM (0) TO (100) PARTITION BY RANGE (id);"
+        " ALTER TABLE a DETACH PARTITION b; DROP TABLE IF EXISTS a;"
+        " CREATE TABLE IF NOT EXISTS a PARTITION OF b FOR VALUES FROM (0) TO (10);")
+    assert len(schema.tables) == 2
 
 
 def test_a_usable_schema_and_a_lone_path_entry_resolve():

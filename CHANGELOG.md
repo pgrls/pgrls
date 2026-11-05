@@ -120,7 +120,8 @@ breaking changes — they will be called out in this file.
   a read of a relation (a trigger, rule or view may run code), an event
   trigger — lies
   between, which could have taken it; a table made again is a partition
-  or child only as its `CREATE` says), and it
+  or child only as its `CREATE` says, and one an `IF NOT EXISTS` may have
+  skipped only as both it and the table there would be), and it
   follows its parent through a rename. A partition's parents outside the
   linted schemas (`--schemas`, else `[database] schemas`, in the LSP too)
   are left out of the model, as live lint does not see them, so the child's
