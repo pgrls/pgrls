@@ -1511,6 +1511,41 @@ def test_a_temp_table_on_a_connected_databases_path_is_refused():
         )
 
 
+def test_a_view_moved_out_of_the_path_no_longer_answers_a_name():
+    from pgrls.schema_sources import schema_from_sql
+    schema = schema_from_sql(
+        "CREATE SCHEMA app; CREATE SCHEMA stage; CREATE TABLE public.docs (id int);"
+        " CREATE VIEW app.docs AS SELECT 1 AS a; ALTER VIEW app.docs SET SCHEMA stage;"
+        " SET search_path = app, public; ALTER TABLE docs ENABLE ROW LEVEL SECURITY;"
+    )
+    assert {t.qualified_name: t.rls_enabled for t in schema.tables}["public.docs"] is True
+
+
+@pytest.mark.parametrize("drop", [
+    "DROP TABLE app.base CASCADE;",            # takes the view on it
+    "DROP OWNED BY r;",
+    "CREATE TABLE app.p (a int) PARTITION BY LIST (a); DROP TABLE app.p;",
+])
+def test_a_name_a_drop_may_have_freed_is_refused(drop):
+    # The view app.docs may be gone, so `docs` may be public.docs.
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+    with pytest.raises(SchemaSourceError, match="a DROP that may have dropped"):
+        schema_from_sql(
+            "CREATE SCHEMA app; CREATE TABLE public.docs (id int);"
+            " CREATE TABLE app.base (a int); CREATE VIEW app.docs AS SELECT a FROM app.base;"
+            f" {drop} SET search_path = app, public;"
+            " ALTER TABLE docs ENABLE ROW LEVEL SECURITY;"
+        )
+
+
+def test_a_connect_inside_a_restrict_is_refused():
+    # psql refuses it there, so the session never reconnects.
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+    with pytest.raises(SchemaSourceError, match="inside a"):
+        schema_from_sql("\\restrict abc\nSET search_path = app, public;\n"
+                        "\\connect db\nCREATE TABLE t (id int);\n\\unrestrict abc\n")
+
+
 def test_offline_create_table_if_not_exists_does_not_duplicate_columns():
     # The second CREATE re-walked tableElts and appended the columns again.
     t = _only(
@@ -2412,8 +2447,9 @@ def test_the_copy_data_check_is_linear():
 def test_harmless_psql_commands_are_skipped():
     from pgrls.schema_sources import schema_from_sql
 
-    sql = ("\\restrict k\n\\echo start\n"
-           "CREATE DATABASE d;\n\\connect d\n\\pset pager off\nCREATE TABLE t (id int);\n")
+    # pg_dump --create lifts its `\\restrict` around the `\\connect`.
+    sql = ("\\restrict k\n\\echo start\nCREATE DATABASE d;\n\\unrestrict k\n\\connect d\n"
+           "\\restrict k\n\\pset pager off\nCREATE TABLE t (id int);\n\\unrestrict k\n")
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
     # pg_dump double-quotes a name that needs it, and psql skips a BOM.
     for name in ("MyApp", "user", "my.app", 'a""b'):

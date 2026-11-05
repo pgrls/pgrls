@@ -71,7 +71,9 @@ breaking changes — they will be called out in this file.
   too. They are split on ASCII whitespace, as psql splits them (`\c` and a
   no-break space is no `\connect`); a line holding a vertical tab, which
   psql 17 splits on and earlier ones do not, is refused, and so is a
-  search_path string holding one. Any other is refused with an error naming it, since the SQL pgrls
+  search_path string holding one. Inside a `\restrict`, where psql runs
+  no meta-command but `\unrestrict` with its key, any other is refused
+  (pg_dump writes `\unrestrict` before each `\connect`). Any other is refused with an error naming it, since the SQL pgrls
   would read is not the SQL that runs: a dump with data (`\.` ends its
   COPY rows, and any `COPY … FROM stdin` reads them from the file), `\i`, `\if`, `\gexec`, any other `\set`, a `\connect` in any form
   but those pg_dump writes (a name, bare or double-quoted, or
@@ -112,8 +114,11 @@ breaking changes — they will be called out in this file.
   changes nothing when no DROP (a `CASCADE` of a function, type, access
   method or extension can take a table too), `DROP OWNED`, rename of a
   relation or code — a `DO` block, a `CALL`, a function called — lies
-  between, which could have taken it; after such code a name that would
-  resolve to another relation if one was dropped is refused), and it
+  between, which could have taken it; after such code, or a DROP that may
+  take a relation it does not name (a `CASCADE`, a partitioned table's
+  partitions, `DROP OWNED`), a name that would resolve to another relation
+  if one was dropped is refused; a view, sequence, matview or foreign
+  table's `SET SCHEMA` is followed), and it
   follows its parent through a rename. A partition's parents outside the
   linted schemas (`--schemas`, else `[database] schemas`, in the LSP too)
   are left out of the model, as live lint does not see them, so the child's
@@ -144,8 +149,8 @@ breaking changes — they will be called out in this file.
   seen, and a role is taken to have no schema of its own unless the SQL
   creates one (a name resolved on `$user` with no `SET ROLE` after the SQL
   creates a schema named as its owner — `CREATE SCHEMA AUTHORIZATION r`, or
-  `ALTER SCHEMA r OWNER TO r` as pg_dump writes it — or owned by the
-  connecting role, is refused: psql may connect as `r`; and so is `CREATE
+  `ALTER SCHEMA r OWNER TO r` as pg_dump writes it — is refused: psql may
+  connect as `r`; and so is `CREATE
   SCHEMA AUTHORIZATION CURRENT_USER`, named for a role pgrls does not know). `ALTER TABLE … SET SCHEMA` and `ALTER SCHEMA …
   RENAME` are
   refused: policies name the table by its old schema. An ATTACH Postgres

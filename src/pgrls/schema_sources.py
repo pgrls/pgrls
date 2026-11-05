@@ -737,6 +737,10 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
     void = _rolled_back(statements)
     live = [raw for index, raw in enumerate(statements) if index not in void]
     schemas = [raw.stmt for raw in live if isinstance(raw.stmt, _pgast.CreateSchemaStmt)]
+    # A DROP TABLE takes a partitioned table's partitions with it.
+    partitioned = any(isinstance(stmt, _pgast.CreateStmt) and stmt.partspec is not None
+                      for raw in live
+                      for stmt in (raw.stmt, *(getattr(raw.stmt, "schemaElts", None) or ())))
     if any(stmt.schemaname is None and getattr(stmt.authrole, "rolename", None) is None
            for stmt in schemas):
         raise SchemaSourceError(
@@ -751,8 +755,8 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
                  if not stmt.if_not_exists} - {"public"},
         maybe={_schema_created(stmt) for stmt in schemas if stmt.if_not_exists} - {"public"},
         # A schema named as the role that owns it (`AUTHORIZATION r`, or
-        # `OWNER TO r` as pg_dump writes it), or owned by the connecting
-        # role: that role's own, if psql connects as it.
+        # `OWNER TO r` as pg_dump writes it), or `AUTHORIZATION CURRENT_USER`:
+        # that role's own, if psql connects as it.
         for_roles={_schema_created(stmt) for stmt in schemas
                    if stmt.authrole is not None
                    and getattr(stmt.authrole, "rolename", None) in (None, stmt.schemaname,
@@ -792,7 +796,7 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
             continue
         resolver.track(stmt)
         resolver.qualify(stmt)
-        if _runs_code(stmt):
+        if _runs_code(stmt) or _may_drop_unseen(stmt, partitioned):
             resolver.code_ran = True
         out.append(_Stmt(stmt, raw))
     return out
@@ -1099,8 +1103,9 @@ class _Resolver:
                 (entry, name) in self.relations for entry in self._entries()) > 1:
             raise SchemaSourceError(
                 "bad_sql",
-                f"the SQL runs code (a DO block, a CALL, a function) that may have "
-                f"dropped a relation, and then names {name!r}, which resolves to "
+                f"the SQL runs code (a DO block, a CALL, a function) or a DROP that "
+                f"may have dropped a relation it does not name (a CASCADE, a "
+                f"partition, DROP OWNED), and then names {name!r}, which resolves to "
                 f"another one if it did; pgrls cannot tell which. Qualify the name.",
             )
         if name in self.temp and self.path is not None and "pg_temp" not in self.path:
@@ -1135,6 +1140,14 @@ class _Resolver:
             self._qualify_policy(stmt)
         elif isinstance(stmt, _pgast.DropStmt):
             self._drop(stmt)
+        elif (isinstance(stmt, _pgast.AlterObjectSchemaStmt) and stmt.relation is not None
+              and stmt.newschema):
+            # A view, sequence, matview or foreign table moves (a table's
+            # move is refused).
+            old = (stmt.relation.schemaname, stmt.relation.relname)
+            if old in self.relations:
+                self.relations.discard(old)
+                self.relations.add((stmt.newschema, old[1]))
         elif (isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None
               and stmt.renameType in _RELATION_KINDS and stmt.newname):
             old = (stmt.relation.schemaname, stmt.relation.relname)
@@ -1235,6 +1248,17 @@ def _drops_on_commit(stmt: Any) -> bool:
     on_commit = (stmt.oncommit if isinstance(stmt, _pgast.CreateStmt)
                  else getattr(getattr(stmt, "into", None), "onCommit", None))
     return bool(on_commit == OnCommitAction.ONCOMMIT_DROP)
+
+
+def _may_drop_unseen(stmt: Any, partitioned: bool) -> bool:
+    """Whether `stmt` may drop a relation it does not name: a CASCADE (a view
+    on the table), a partitioned table's partitions (when the SQL creates
+    one), `DROP OWNED`."""
+    if isinstance(stmt, _pgast.DropOwnedStmt):
+        return True
+    return isinstance(stmt, _pgast.DropStmt) and (
+        stmt.behavior == DropBehavior.DROP_CASCADE
+        or (partitioned and stmt.removeType == ObjectType.OBJECT_TABLE))
 
 
 def _runs_code(stmt: Any) -> bool:
@@ -1850,6 +1874,7 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
     the server reads the strings after it; an `\\encoding` only to UTF8 or
     SQL_ASCII."""
     connects: list[tuple[int, str]] = []
+    restricted: str | None = None
     for offset, line in commands:
         # psql splits a meta-command on ASCII whitespace only (a no-break
         # space is part of a word).
@@ -1898,6 +1923,18 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
                 f"the SQL uses the psql command {line.strip()[:60]!r}, which pgrls "
                 "does not model (the SQL it reads would not be the SQL that runs).",
             )
+        if restricted is not None and name not in _HARMLESS_PSQL_COMMANDS:
+            # psql then runs no meta-command but `\\unrestrict` with its key:
+            # a `\\connect` there does not reconnect.
+            raise SchemaSourceError(
+                "bad_sql",
+                f"the SQL uses the psql command {line.strip()[:60]!r} inside a "
+                "\\restrict, where psql refuses it; pgrls does not model that.",
+            )
+        if name == "restrict" and restricted is None:
+            restricted = rest
+        elif name == "unrestrict" and rest == restricted:
+            restricted = None
         if connect:
             assert target is not None  # `known` above
             connects.append((offset, target))
