@@ -46,7 +46,7 @@ Scope (intentional):
   SEC029 can over-report there — a deliberate bias toward surfacing
   a potential bypass route (allowlist a false positive) over
   missing one. The membership graph is captured version-agnostically
-  to keep the introspection query identical across PG15-17.
+  to keep the introspection query identical across PG15-18.
 * **No auto-fix.** Whether to revoke the membership, split the
   BYPASSRLS into a narrower grant, or accept the route is an
   operational decision pgrls can't make.

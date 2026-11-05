@@ -1422,6 +1422,194 @@ def test_offline_primary_key_implies_not_null():
     assert {
         c.name: c.is_nullable for c in table_level.column_details
     }["id"] is False
+    altered = _only("CREATE TABLE t (id int, x text); ALTER TABLE t ADD PRIMARY KEY (id);")
+    assert {c.name: c.is_nullable for c in altered.column_details}["id"] is False
+
+
+def test_offline_pg18_not_null_constraints():
+    # pglast 8 parses PG18's table-level / named NOT NULL. A validated one
+    # makes the column NOT NULL; a NOT VALID one leaves existing NULLs, so the
+    # column stays nullable, as introspection reads it.
+    import pglast
+
+    if not pglast.__version__.startswith("v8"):
+        pytest.skip("PG18 NOT NULL constraint syntax needs pglast 8")
+    sql = {
+        "CREATE TABLE t (id int, tenant text, NOT NULL tenant);": False,
+        "CREATE TABLE t (id int, tenant text);"
+        " ALTER TABLE t ADD CONSTRAINT tnn NOT NULL tenant;": False,
+        "CREATE TABLE t (id int, tenant text);"
+        " ALTER TABLE t ADD CONSTRAINT tnn NOT NULL tenant NOT VALID;": True,
+        # A name reused after the NOT VALID NOT NULL is gone is not it.
+        "CREATE TABLE t (id int, tenant int);"
+        " ALTER TABLE t ADD CONSTRAINT nn NOT NULL tenant NOT VALID;"
+        " ALTER TABLE t ALTER COLUMN tenant DROP NOT NULL;"
+        " ALTER TABLE t ADD CONSTRAINT nn CHECK (tenant > 0) NOT VALID;"
+        " ALTER TABLE t VALIDATE CONSTRAINT nn;": True,
+        # Validating it — SEC030's remedy — makes the column NOT NULL.
+        "CREATE TABLE t (id int, tenant text);"
+        " ALTER TABLE t ADD CONSTRAINT tnn NOT NULL tenant NOT VALID;"
+        " ALTER TABLE t VALIDATE CONSTRAINT tnn;": False,
+        "CREATE TABLE t (id int, tenant text);"
+        " ALTER TABLE t ADD CONSTRAINT tnn NOT NULL tenant NOT VALID;"
+        " ALTER TABLE t RENAME CONSTRAINT tnn TO tn2; ALTER TABLE t VALIDATE CONSTRAINT tn2;": False,
+        # In CREATE TABLE there are no rows yet: Postgres stores it validated.
+        "CREATE TABLE t (id int, tenant text, CONSTRAINT tnn NOT NULL tenant NOT VALID);": False,
+    }
+    for stmt, nullable in sql.items():
+        t = _only(stmt)
+        assert {c.name: c.is_nullable for c in t.column_details}["tenant"] is nullable, stmt
+
+
+def test_offline_no_inherit_not_null_is_not_inherited():
+    # PG18: an INHERITS child does not get a parent's NOT NULL … NO INHERIT
+    # (measured), so the child's column is nullable.
+    import pglast
+
+    from pgrls.schema_sources import schema_from_sql
+
+    if not pglast.__version__.startswith("v8"):
+        pytest.skip("NOT NULL … NO INHERIT is PG18 syntax (pglast 8)")
+    for parent in (
+        "CREATE TABLE p (id int, tenant int NOT NULL NO INHERIT);",
+        "CREATE TABLE p (id int, tenant int, NOT NULL tenant NO INHERIT);",
+    ):
+        schema = schema_from_sql(parent + " CREATE TABLE c (x int) INHERITS (p);",
+                                 schemas=("public",))
+        nullable = {t.name: {c.name: c.is_nullable for c in t.column_details}["tenant"]
+                    for t in schema.tables}
+        assert nullable == {"p": False, "c": True}, parent
+
+
+def test_offline_parent_rename_redirects_only_earlier_children():
+    # A child created after the rename names the table that now has the old
+    # name, not the renamed one (measured on PG18).
+    from pgrls.schema_sources import schema_from_sql
+
+    schema = schema_from_sql(
+        "CREATE TABLE p (a int, k int) PARTITION BY LIST (k);"
+        " CREATE TABLE o (a int, k int) PARTITION BY LIST (k);"
+        " CREATE TABLE early PARTITION OF p FOR VALUES IN (0);"
+        " ALTER TABLE p RENAME TO tmp; ALTER TABLE o RENAME TO p; ALTER TABLE tmp RENAME TO o;"
+        " CREATE TABLE late PARTITION OF p FOR VALUES IN (1);",
+        schemas=("public",))
+    parent = {t.name: t.partition_of for t in schema.tables}
+    assert parent["early"] == ("public", "o") and parent["late"] == ("public", "p")
+
+
+def test_offline_parent_constraint_rename_reaches_a_same_named_child_constraint():
+    # PG18 renames a child's own constraint of the parent's name too — even
+    # one joined by ALTER TABLE … INHERIT, which offline does not follow.
+    import pglast
+
+    from pgrls.schema_sources import schema_from_sql
+
+    if not pglast.__version__.startswith("v8"):
+        pytest.skip("named NOT NULL constraints are PG18 syntax")
+    schema = schema_from_sql(
+        "CREATE TABLE p (id int CONSTRAINT k NOT NULL);"
+        " CREATE TABLE c (id int NOT NULL, tenant_id uuid CONSTRAINT k NOT NULL);"
+        " ALTER TABLE c INHERIT p; ALTER TABLE p RENAME CONSTRAINT k TO z;"
+        " ALTER TABLE c DROP CONSTRAINT z;",
+        schemas=("public",))
+    child = next(t for t in schema.tables if t.name == "c")
+    assert {c.name: c.is_nullable for c in child.column_details}["tenant_id"] is True
+
+
+def test_offline_drop_constraint_of_a_not_null():
+    # PG18 stores NOT NULL as a named constraint, and DROP CONSTRAINT drops
+    # it; an unnamed one is `<table>_<column>_not_null`.
+    auto = _only(
+        "CREATE TABLE t (id int, tenant text NOT NULL);"
+        " ALTER TABLE t DROP CONSTRAINT t_tenant_not_null;"
+    )
+    assert {c.name: c.is_nullable for c in auto.column_details}["tenant"] is True
+    # Postgres shortens the longer name to fit 63 bytes (measured on PG18).
+    long_col = "tenant_" + "x" * 56
+    long_table = "orders_" + "y" * 50
+    for table, col, conname in (
+        ("orders", long_col, f"orders_{long_col[:47]}_not_null"),
+        (long_table, "tenant_id", f"{long_table[:44]}_tenant_id_not_null"),
+    ):
+        t = _only(f"CREATE TABLE {table} (id int, {col} text NOT NULL);"
+                  f" ALTER TABLE {table} DROP CONSTRAINT {conname};")
+        assert {c.name: c.is_nullable for c in t.column_details}[col] is True, conname
+    for sql in (
+        # A clash adds a digit; a renamed constraint keeps its column; an
+        # unnamed one keeps the table name it was created under.
+        "CREATE TABLE t (id int, tenant text NOT NULL);"
+        " ALTER TABLE t DROP CONSTRAINT t_tenant_not_null1;",
+        "CREATE TABLE t (id int, tenant text NOT NULL);"
+        " ALTER TABLE t RENAME CONSTRAINT t_tenant_not_null TO tn;"
+        " ALTER TABLE t DROP CONSTRAINT tn;",
+        "CREATE TABLE old (id int, tenant text NOT NULL); ALTER TABLE old RENAME TO t;"
+        " ALTER TABLE t DROP CONSTRAINT old_tenant_not_null;",
+        # An auto-name several columns could have: all of them.
+        "CREATE TABLE t (tenant text NOT NULL, tenant_b int NOT NULL);"
+        " ALTER TABLE t RENAME CONSTRAINT t_tenant_not_null TO keep;"
+        " ALTER TABLE t DROP CONSTRAINT keep;",
+    ):
+        t = _only(sql)
+        assert {c.name: c.is_nullable for c in t.column_details}["tenant"] is True, sql
+    # An inherited NOT NULL keeps the parent's name; a detached child can
+    # drop it by that name (measured on PG18).
+    from pgrls.schema_sources import schema_from_sql
+
+    for detach in ("ALTER TABLE c NO INHERIT p;", ""):
+        schema = schema_from_sql(
+            "CREATE TABLE p (a int NOT NULL, b int); CREATE TABLE c () INHERITS (p);"
+            f" {detach} ALTER TABLE c DROP CONSTRAINT p_a_not_null;",
+            schemas=("public",))
+        child = next(t for t in schema.tables if t.name == "c")
+        assert {c.name: c.is_nullable for c in child.column_details}["a"] is True
+    # `SET NOT NULL` validates a NOT VALID one in place, keeping its name; a
+    # parent's RENAME CONSTRAINT renames its children's copies (measured).
+    import pglast
+
+    if pglast.__version__.startswith("v8"):
+        for sql, table in (
+            ("CREATE TABLE t (id int, a int);"
+             " ALTER TABLE t ADD CONSTRAINT nn NOT NULL a NOT VALID;"
+             " ALTER TABLE t ALTER COLUMN a SET NOT NULL; ALTER TABLE t DROP CONSTRAINT nn;", "t"),
+            ("CREATE TABLE p (id int, a int NOT NULL); CREATE TABLE c () INHERITS (p);"
+             " ALTER TABLE p RENAME CONSTRAINT p_a_not_null TO keep;"
+             " ALTER TABLE c NO INHERIT p; ALTER TABLE c DROP CONSTRAINT keep;", "c"),
+            # A child that left before the rename keeps the old name.
+            ("CREATE TABLE p (id int, a int CONSTRAINT req NOT NULL, k int)"
+             " PARTITION BY LIST (k); CREATE TABLE c PARTITION OF p FOR VALUES IN (1);"
+             " ALTER TABLE p DETACH PARTITION c; ALTER TABLE p RENAME CONSTRAINT req TO p_req;"
+             " ALTER TABLE c DROP CONSTRAINT req;", "c"),
+            # The parent's rename reaches children after the parent is renamed.
+            ("CREATE TABLE p (id int, a int CONSTRAINT req NOT NULL, k int)"
+             " PARTITION BY LIST (k); CREATE TABLE c PARTITION OF p FOR VALUES IN (1);"
+             " ALTER TABLE p RENAME TO events;"
+             " ALTER TABLE events RENAME CONSTRAINT req TO events_req;"
+             " ALTER TABLE events DETACH PARTITION c; ALTER TABLE c DROP CONSTRAINT events_req;",
+             "c"),
+        ):
+            schema = schema_from_sql(sql, schemas=("public",))
+            t = next(x for x in schema.tables if x.name == table)
+            assert {c.name: c.is_nullable for c in t.column_details}["a"] is True, sql
+    # A primary key's columns stay NOT NULL when it is dropped.
+    pk = _only("CREATE TABLE t (id int, CONSTRAINT t_pk PRIMARY KEY (id));"
+               " ALTER TABLE t DROP CONSTRAINT t_pk;")
+    assert {c.name: c.is_nullable for c in pk.column_details}["id"] is False
+    other = _only(
+        "CREATE TABLE t (id int, tenant text NOT NULL, CONSTRAINT ck CHECK (id > 0));"
+        " ALTER TABLE t DROP CONSTRAINT ck;"
+    )
+    assert {c.name: c.is_nullable for c in other.column_details}["tenant"] is False
+    import pglast
+
+    if not pglast.__version__.startswith("v8"):
+        return  # named NOT NULL constraints are PG18 syntax
+    for sql in (
+        "CREATE TABLE t (id int, tenant text CONSTRAINT nn NOT NULL);",
+        "CREATE TABLE t (id int, tenant text, CONSTRAINT nn NOT NULL tenant);",
+        "CREATE TABLE t (id int, tenant text); ALTER TABLE t ADD CONSTRAINT nn NOT NULL tenant;",
+    ):
+        t = _only(sql + " ALTER TABLE t DROP CONSTRAINT nn;")
+        assert {c.name: c.is_nullable for c in t.column_details}["tenant"] is True, sql
 
 
 def test_offline_alter_column_set_and_drop_not_null():
@@ -1579,3 +1767,14 @@ def test_offline_alter_policy_rename_is_followed(tmp_path) -> None:
     )
     res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql), "--rule", "SEC008"])
     assert "SEC008" in res.output and "public.t.q" in res.output, res.output
+
+
+def test_offline_constraint_before_a_rebuild_does_not_reach_the_new_table():
+    # An ADD PRIMARY KEY / NOT NULL constraint that ran before DROP TABLE and
+    # a re-CREATE constrained the old table only (measured on PG18).
+    t = _only(
+        "CREATE TABLE docs (id int, tenant_id uuid);"
+        " ALTER TABLE docs ADD PRIMARY KEY (id, tenant_id);"
+        " DROP TABLE docs; CREATE TABLE docs (id int, tenant_id uuid);"
+    )
+    assert {c.name: c.is_nullable for c in t.column_details}["tenant_id"] is True

@@ -10,7 +10,7 @@ Security bug in CI. For the comprehensive feature tour see
 pip install pgrls
 ```
 
-Requires Python 3.11+ and Postgres 15+ (tested on PG 15, 16, 17).
+Requires Python 3.11+ and Postgres 15+ (tested on PG 15, 16, 17, 18).
 
 ## 2. Try it on a throwaway database
 
