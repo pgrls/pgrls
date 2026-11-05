@@ -632,14 +632,22 @@ def is_builtin_current_setting(node: Any) -> bool:
     return qualified in ("current_setting", "pg_catalog.current_setting")
 
 
-def has_literal_setting_name(node: Any) -> bool:
+def has_literal_setting_arguments(node: Any) -> bool:
     """Whether a ``current_setting`` call names its setting by a string
-    literal (through any cast), not by a column or other expression."""
-    name = (node.args or (None,))[0]
-    while isinstance(name, TypeCast):
-        name = name.arg
-    return (isinstance(name, A_Const) and not name.isnull
-            and isinstance(getattr(name, "val", None), String))
+    literal and gives any ``missing_ok`` as a non-NULL literal (through any
+    cast), not by a column or other expression: the function is STRICT, so
+    a NULL argument makes it NULL."""
+    args = node.args or ()
+    if not args or len(args) > 2:
+        return False
+    literals = []
+    for arg in args:
+        while isinstance(arg, TypeCast):
+            arg = arg.arg
+        if not (isinstance(arg, A_Const) and not arg.isnull):
+            return False
+        literals.append(arg)
+    return isinstance(getattr(literals[0], "val", None), String)
 
 
 def is_never_null_current_setting(node: Any) -> bool:
@@ -670,9 +678,9 @@ def is_never_null_current_setting(node: Any) -> bool:
     if not is_builtin_current_setting(node):
         return False
     args = node.args
-    if not args or not has_literal_setting_name(node):
-        # `current_setting` is STRICT: a name read from a column is NULL
-        # where the column is.
+    if not args or not has_literal_setting_arguments(node):
+        # `current_setting` is STRICT: a name or missing_ok read from a
+        # column is NULL where the column is.
         return False
     if len(args) == 1:
         return True

@@ -127,7 +127,7 @@ from pglast.stream import RawStream
 
 from pgrls.ast_utils import (
     func_name_parts,
-    has_literal_setting_name,
+    has_literal_setting_arguments,
     is_never_null_current_setting,
 )
 
@@ -207,7 +207,8 @@ _OPAQUE_PREFIX = "_opaque__"
 # volatility is not known here: it is taken to be STABLE.
 _VOLATILE_CALL = re.compile(
     r"(?<![\w.\"])(?:pg_catalog\.)?(?:random|random_normal|clock_timestamp|timeofday"
-    r"|nextval|setval|gen_random_uuid|uuidv4|uuidv7|pg_backend_pid)\s*\(",
+    r"|nextval|setval|currval|lastval|gen_random_uuid|uuidv4|uuidv7|pg_backend_pid"
+    r"|array_shuffle|array_sample)\s*\(",
     re.IGNORECASE)
 _NULLFLAG_PREFIX = "_nullflag__"
 # Cross-tenant verifier (`prove_cross_tenant_isolation`) only: the free,
@@ -927,9 +928,10 @@ def _is_anon_null_leaf(node: Any, auth_funcs: set[str]) -> bool:
         # the two-arg current_setting(name, true) is NULLable under anon.
         if is_never_null_current_setting(node):
             return False
-        if _is_builtin_current_setting_call(node) and not has_literal_setting_name(node):
-            # A name read from a column: neither the session's identity nor
-            # NULL under anon, but whatever setting the row names.
+        if (func_name_parts(node)[0] in ("current_setting", "pg_catalog.current_setting")
+                and not has_literal_setting_arguments(node)):
+            # A name or missing_ok read from a column: neither the session's
+            # identity nor NULL under anon, but whatever the row makes it.
             return False
         if qualified in auth_funcs:
             return True
@@ -969,11 +971,13 @@ def _first_string_arg(node: Any) -> str | None:
 
 
 def _is_builtin_current_setting_call(node: Any) -> bool:
+    """A call of the built-in `current_setting` with literal arguments; one
+    with a computed name or missing_ok is an opaque value."""
     qualified, bare = func_name_parts(node)
     return bare == "current_setting" and qualified in (
         "current_setting",
         "pg_catalog.current_setting",
-    )
+    ) and has_literal_setting_arguments(node)
 
 
 def _is_jwt_role_extraction(node: Any) -> bool:
@@ -1013,9 +1017,7 @@ def _anon_jwt_claim(node: Any) -> str | None:
         return "role"
     if qualified == "auth.jwt":
         return "jwt"
-    if bare == "current_setting" and (
-        qualified == "current_setting" or qualified == "pg_catalog.current_setting"
-    ):
+    if _is_builtin_current_setting_call(node):
         name = _first_string_arg(node)
         if name == "request.jwt.claim.role":
             return "role"

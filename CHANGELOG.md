@@ -98,11 +98,13 @@ breaking changes — they will be called out in this file.
   taken to be TRUE or FALSE; wrapping `auth.uid()` in a sub-select, as
   PERF001's fix does, stays no change. A predicate nested past the stack is
   unverified, or needs review in a diff (no change when it did not change),
-  not a crash. A `current_setting` whose name is read from a column is no
-  longer taken to be never NULL, or the session's identity: it is NULL where
-  the column is, so `… OR current_setting(cfg) IS NULL` was PROVEN (on
-  `main` too) and, in a diff, no change. Two calls of a built-in VOLATILE
-  function (`random()`, `clock_timestamp()`, `gen_random_uuid()`, …) are two
+  not a crash. A `current_setting` whose name or `missing_ok` is read from a
+  column (or is NULL) is no longer taken to be never NULL, or the session's
+  identity: it is NULL where the argument is, so `… OR current_setting(cfg)
+  IS NULL` and `tenant_id = current_setting('app.t', flag) OR …` were PROVEN
+  (on `main` too) and, in a diff, no change. Two calls of a built-in VOLATILE
+  function (`random()`, `clock_timestamp()`, `gen_random_uuid()`,
+  `array_shuffle()`, …) are two
   values; a user function is taken to return one value wherever the same
   call appears, as a STABLE or IMMUTABLE one does, so a VOLATILE one (which
   PERF002 flags) can hide a loosening in a diff.
