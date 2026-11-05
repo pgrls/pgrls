@@ -1847,6 +1847,10 @@ def test_a_skipped_line_must_lie_between_tokens():
     # A rule on pg_settings sets what it names.
     ("UPDATE pg_settings SET setting = 'off' WHERE name = 'standard_conforming_strings';\n",
      "pg_settings"),
+    # ... and so does an UPDATE through a view over it.
+    ("CREATE VIEW s AS SELECT * FROM pg_catalog.pg_settings;\n"
+     "UPDATE s SET setting = 'on' WHERE name = 'transform_null_equals';\n", "pg_settings"),
+    ("SELECT name, setting FROM pg_settings;\n", False),
     ("SET client_encoding = 'UTF8';\n", False),
     ("SET client_encoding = 'LATIN1';\n", False),
     ("SET standard_conforming_strings = on;\n", False),

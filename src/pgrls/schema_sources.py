@@ -1047,14 +1047,20 @@ def _check_lexer_settings(statements: Any, *, non_ascii: bool) -> None:
     `UPDATE pg_settings` is refused too. A setting changed by code (a `DO`
     block, a function) is not seen."""
     for raw in statements:
-        for node in _subnodes(raw.stmt):
-            if (isinstance(node, _pgast.UpdateStmt) and node.relation is not None
-                    and node.relation.relname == "pg_settings"):
-                raise SchemaSourceError(
-                    "bad_sql",
-                    "the SQL updates pg_settings, which changes settings pgrls "
-                    "cannot follow.",
-                )
+        nodes = list(_subnodes(raw.stmt))
+        # A rule on pg_settings sets what an UPDATE names, and a view or rule
+        # over it carries that on: only a plain query may read it.
+        if any(isinstance(node, _pgast.RangeVar) and node.relname == "pg_settings"
+               for node in nodes) and (
+            not isinstance(raw.stmt, _pgast.SelectStmt)
+            or any(isinstance(node, _pgast.UpdateStmt) for node in nodes)
+        ):
+            raise SchemaSourceError(
+                "bad_sql",
+                "the SQL changes pg_settings, or defines something over it, "
+                "which sets what pgrls cannot follow.",
+            )
+        for node in nodes:
             if isinstance(node, _pgast.VariableSetStmt) and node.args:
                 # Postgres looks a setting up ignoring case, even quoted.
                 name, arg = (node.name or "").lower(), node.args[0]
