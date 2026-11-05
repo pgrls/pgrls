@@ -60,12 +60,13 @@ breaking changes — they will be called out in this file.
   dump from `pg_dump` since the August 2025 minor releases (13.22, 14.19,
   15.14, 16.10, 17.6) opens with a `\restrict <key>` psql meta-command,
   which is not SQL, so the whole file failed to parse. psql meta-command
-  lines it can ignore (`\restrict`, `\echo`, `\pset`, a `\connect` after
+  lines it can ignore (`\restrict`, `\echo`, `\pset`, `\set ON_ERROR_STOP
+  on` and psql's other error and output settings, a `\connect` after
   `CREATE DATABASE`, …), each alone on its line and between statements as
   Postgres's own lexer reads the file, are now skipped, the LSP's ranges
   too. Any other is refused with an error naming it, since the SQL pgrls
   would read is not the SQL that runs: a dump with data (`\.` ends its
-  COPY rows, and any `COPY … FROM stdin` reads them from the file), `\i`, `\if`, `\gexec`, `\set`, a `\connect` in any form
+  COPY rows, and any `COPY … FROM stdin` reads them from the file), `\i`, `\if`, `\gexec`, any other `\set`, a `\connect` in any form
   but the two pg_dump writes (a conninfo string can set `options` or
   `client_encoding`), a second command on the line, a line Postgres reads
   as inside a string, SQL beside a meta-command that names one of psql's
@@ -118,7 +119,10 @@ breaking changes — they will be called out in this file.
   schema used before the SQL creates it `IF NOT EXISTS`, and `PREPARE
   TRANSACTION`; one set by running code (a `DO` block, a function) is not
   seen, and a role is taken to have no schema of its own unless the SQL
-  creates one. `ALTER TABLE … SET SCHEMA` and `ALTER SCHEMA … RENAME` are
+  creates one (a name resolved on `$user` with no `SET ROLE` after the SQL
+  creates a schema for a role, `CREATE SCHEMA AUTHORIZATION r`, is refused:
+  psql may connect as `r`). `ALTER TABLE … SET SCHEMA` and `ALTER SCHEMA …
+  RENAME` are
   refused: policies name the table by its old schema. An ATTACH Postgres
   refuses (of an inheritance child, of a table already attached, to a
   parent not partitioned) is not modelled.

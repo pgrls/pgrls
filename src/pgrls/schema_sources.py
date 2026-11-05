@@ -703,6 +703,11 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
         created={_schema_created(stmt) for stmt in schemas
                  if not stmt.if_not_exists} - {"public"},
         maybe={_schema_created(stmt) for stmt in schemas if stmt.if_not_exists} - {"public"},
+        # A schema made for a role (`AUTHORIZATION r` and no other name): the
+        # connecting role's own, if psql connects as it.
+        for_roles={_schema_created(stmt) for stmt in schemas
+                   if getattr(stmt.authrole, "rolename", None) is not None
+                   and stmt.schemaname in (None, stmt.authrole.rolename)},
         named={node.schemaname for raw in live for node in _subnodes(raw.stmt)
                if isinstance(node, _pgast.RangeVar) and node.schemaname})
     out: list[_Stmt] = []
@@ -800,13 +805,14 @@ class _Resolver:
     statements run in order."""
 
     def __init__(self, *, created: AbstractSet[str], maybe: AbstractSet[str],
-                 named: AbstractSet[str]) -> None:
+                 for_roles: AbstractSet[str], named: AbstractSet[str]) -> None:
         # The schemas the SQL creates, and of those, the ones created so far.
         # One it never creates is taken to be there already (`public`, or
         # one a migration's earlier SQL made), unless it drops it; one it
         # does not even name a relation in may not be (see create_schema).
         self.created = created
         self.maybe = set(maybe) - set(created)
+        self.for_roles = for_roles
         self.named = set(named) | {"public"}
         self.schemas: set[str] = set()
         self.dropped: set[str] = set()
@@ -869,7 +875,7 @@ class _Resolver:
                 # CHAIN alone says one is open.
                 self.in_transaction = bool(stmt.chain)
                 self.local.clear()
-                self._discard_temp(self.commit_drop)
+                self._discard_temp(set(self.commit_drop))
             return
         if isinstance(stmt, _pgast.DiscardStmt):
             if stmt.target in (DiscardMode.DISCARD_ALL, DiscardMode.DISCARD_TEMP):
@@ -969,7 +975,15 @@ class _Resolver:
         for entry in path:
             if entry == "$user":
                 # A role is taken to have no schema of its own unless the
-                # SQL creates one (the connecting role's is not known).
+                # SQL creates one; the connecting role is not known.
+                if role is None and self.for_roles & self.schemas:
+                    raise SchemaSourceError(
+                        "bad_sql",
+                        "the SQL creates a schema for a role "
+                        f"({sorted(self.for_roles & self.schemas)[0]!r}) and resolves a "
+                        "name on \"$user\" with no SET ROLE; pgrls does not know the "
+                        "role psql connects as. Qualify the names.",
+                    )
                 if role is None or role not in self.schemas:
                     continue
                 entry = role
@@ -1016,6 +1030,8 @@ class _Resolver:
             if creates:
                 if rel.relpersistence == "t" or rel.schemaname == "pg_temp":
                     rel.schemaname = _NOWHERE
+                    if rel.relname in self.temp and getattr(stmt, "if_not_exists", False):
+                        continue  # IF NOT EXISTS: the one there stands
                     if _drops_on_commit(stmt):
                         if not self.in_transaction:
                             continue  # gone when its statement commits
@@ -1039,6 +1055,9 @@ class _Resolver:
             if old[0] == _NOWHERE:
                 self.temp.discard(old[1])
                 self.temp.add(stmt.newname)
+                if old[1] in self.commit_drop:
+                    self.commit_drop.discard(old[1])
+                    self.commit_drop.add(stmt.newname)
 
     def _qualify_policy(self, stmt: Any) -> None:
         # A table a policy reads resolves when the policy is created; one
@@ -1079,6 +1098,7 @@ class _Resolver:
                 self.relations.discard(key)
                 if key[0] == _NOWHERE:
                     self.temp.discard(key[1])
+                    self.commit_drop.discard(key[1])
             objects.append(tuple(parts) if parts else item)
         stmt.objects = tuple(objects)
 
@@ -1651,6 +1671,12 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
         known = name in _HARMLESS_PSQL_COMMANDS or target is not None or (
             name == "encoding"
             and re.sub(r"[^a-z0-9]", "", rest.lower()) in _UTF8_ENCODINGS
+        ) or (
+            # psql's own settings that change no SQL (a `:NAME` in the SQL
+            # is refused below).
+            name == "set" and re.fullmatch(
+                r"(ON_ERROR_STOP|ECHO|ECHO_HIDDEN|QUIET|VERBOSITY|SHOW_CONTEXT)"
+                r"(\s+[A-Za-z0-9_]+)?", rest) is not None
         )
         # psql reads a line to its LF: a CR is part of the command's arguments.
         if m is None or "\\" in rest or "`" in rest or "\r" in rest or not known:

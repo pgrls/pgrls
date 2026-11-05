@@ -1838,6 +1838,8 @@ def test_the_search_path_follows_the_session(sql, where):
     "CREATE TEMP TABLE x (id int);\nDISCARD ALL;\n",
     "BEGIN;\nCREATE TEMP TABLE x (id int) ON COMMIT DROP;\nCOMMIT;\n",
     "CREATE TEMP TABLE x (id int) ON COMMIT DROP;\n",
+    # ... as it stands at COMMIT: renamed, dropped, or never made.
+    "BEGIN;\nCREATE TEMP TABLE s (id int) ON COMMIT DROP;\nALTER TABLE s RENAME TO x;\nCOMMIT;\n",
 ])
 def test_a_temporary_table_gone_no_longer_hides_the_name(gone):
     from pgrls.schema_sources import schema_from_sql
@@ -1845,6 +1847,20 @@ def test_a_temporary_table_gone_no_longer_hides_the_name(gone):
     (x,) = schema_from_sql("CREATE TABLE public.x (id int);\n" + gone
                            + "ALTER TABLE x ENABLE ROW LEVEL SECURITY;\n").tables
     assert x.rls_enabled, gone
+
+
+@pytest.mark.parametrize("kept", [
+    "BEGIN;\nCREATE TEMP TABLE x (id int) ON COMMIT DROP;\nDROP TABLE x;\n"
+    "CREATE TEMP TABLE x (id int);\nCOMMIT;\n",
+    "CREATE TEMP TABLE x (id int);\nBEGIN;\n"
+    "CREATE TEMP TABLE IF NOT EXISTS x (id int) ON COMMIT DROP;\nCOMMIT;\n",
+])
+def test_a_temporary_table_still_there_still_hides_the_name(kept):
+    from pgrls.schema_sources import schema_from_sql
+
+    (x,) = schema_from_sql("CREATE TABLE public.x (id int);\n" + kept
+                           + "ALTER TABLE x ENABLE ROW LEVEL SECURITY;\n").tables
+    assert not x.rls_enabled, kept
 
 
 @pytest.mark.parametrize(("sql", "why"), [
@@ -1863,6 +1879,8 @@ def test_a_temporary_table_gone_no_longer_hides_the_name(gone):
     ("SET search_path TO app;\nCREATE TABLE x (id int);\nCREATE SCHEMA IF NOT EXISTS app;\n",
      "IF NOT EXISTS"),
     ("CREATE SCHEMA app;\nALTER SCHEMA app RENAME TO app2;\n", "renames a schema"),
+    # psql may connect as the role a schema is made for.
+    ("CREATE SCHEMA AUTHORIZATION postgres;\nCREATE TABLE x (id int);\n", "for a role"),
     ("BEGIN;\nCREATE TABLE x (id int);\nPREPARE TRANSACTION 'x';\n", "PREPARE TRANSACTION"),
 ])
 def test_a_search_path_pgrls_cannot_follow_is_refused(sql, why):
@@ -2005,7 +2023,7 @@ def test_pg_dumpall_output_is_refused(tmp_path):
     # psql interpolates its variables into the SQL after them, including
     # its own settings (`:ON_ERROR_STOP`) and those it sets itself.
     ("\\set n 2\nSELECT (ARRAY[1,2,3])[1:n];\n", "psql command"),
-    ("\\set ON_ERROR_STOP 1\n", "psql command"),
+    ("\\set ON_ERROR_STOP :x\n", "psql command"),
     ("\\set ECHO a\n\\connect :ECHO\nCREATE TABLE t (id int);\n", "psql command"),
     ("\\connect :DBNAME\nCREATE TABLE t (id int);\n", "psql command"),
     ("\\echo x\nCREATE TABLE t (id int);\nSELECT (ARRAY[1])[1:ROW_COUNT] FROM t;\n", "its own variable"),
@@ -2229,6 +2247,9 @@ def test_harmless_psql_commands_are_skipped():
 
     sql = ("\\restrict k\n\\echo start\n"
            "CREATE DATABASE d;\n\\connect d\n\\pset pager off\nCREATE TABLE t (id int);\n")
+    assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+    # A script's settings of psql's own error and output handling.
+    sql = "\\set ON_ERROR_STOP on\n\\set QUIET\nCREATE TABLE t (id int);\n"
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
     # pg_dump --create's form for a name that needs quoting, after an
     # `\\encoding` of the server's.
