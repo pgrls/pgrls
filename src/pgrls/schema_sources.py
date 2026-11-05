@@ -786,9 +786,10 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
         stmt = raw.stmt
         if isinstance(stmt, _pgast.CreateSchemaStmt):
             schema = _schema_created(stmt)
+            if schema not in resolver.schemas:  # IF NOT EXISTS of one there: no-op
+                resolver.owners[schema] = getattr(stmt.authrole, "rolename", None)
             resolver.schemas.add(schema)
             resolver.unsure.discard(schema)
-            resolver.owners[schema] = getattr(stmt.authrole, "rolename", None)
             for element in stmt.schemaElts or ():
                 # Its elements go in it, and see it first.
                 with resolver.first(schema):
@@ -864,6 +865,11 @@ def _rolled_back(statements: Any) -> frozenset[int]:
         # psql's session ends, and Postgres rolls the open transaction back.
         void.update(range(start, len(statements)))
     return frozenset(void)
+
+
+# A schema owner pgrls cannot name (the connecting role's, after a
+# REASSIGN OWNED that may have named it).
+_SOME_ROLE = "\0some role"
 
 
 class _Resolver:
@@ -1192,17 +1198,32 @@ class _Resolver:
               and stmt.objectType == ObjectType.OBJECT_SCHEMA):
             self.owners[str(getattr(stmt.object, "sval", ""))] = getattr(
                 stmt.newowner, "rolename", None)
+        elif isinstance(stmt, _pgast.ReassignOwnedStmt):
+            # Their schemas pass to the new role; one the connecting role
+            # owns does too if it is among them, which pgrls cannot tell.
+            old = {getattr(r, "rolename", None) for r in stmt.roles or ()}
+            new = getattr(stmt.newrole, "rolename", None)
+            for schema, owner in list(self.owners.items()):
+                if owner in old:
+                    self.owners[schema] = new
+                elif owner is None:
+                    self.owners[schema] = _SOME_ROLE
+        elif (isinstance(stmt, _pgast.RenameStmt)
+              and stmt.renameType == ObjectType.OBJECT_ROLE and stmt.newname):
+            for schema, owner in list(self.owners.items()):
+                if owner is not None and owner == stmt.subname:
+                    self.owners[schema] = stmt.newname
         elif isinstance(stmt, _pgast.DropOwnedStmt):
             # It drops the schemas the roles own; one owned by the connecting
             # role (or by CURRENT_USER) may be among them.
             roles = {getattr(r, "rolename", None) for r in stmt.roles or ()}
             for schema in set(self.schemas):
                 owner = self.owners.get(schema)
-                if owner is not None and owner in roles:
+                if owner is not None and owner != _SOME_ROLE and owner in roles:
                     self.schemas.discard(schema)
                     self.dropped.add(schema)
                     self.relations -= {r for r in self.relations if r[0] == schema}
-                elif owner is None or None in roles:
+                elif owner is None or owner == _SOME_ROLE or None in roles:
                     self.unsure.add(schema)
         elif (isinstance(stmt, _pgast.AlterObjectSchemaStmt) and stmt.relation is not None
               and stmt.newschema):

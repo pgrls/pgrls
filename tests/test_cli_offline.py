@@ -1600,6 +1600,21 @@ def test_a_harmless_psql_command_psql_rejects_is_refused(line):
     ("CREATE SCHEMA app; CREATE TABLE public.x (id int); CREATE TABLE app.b (id int);"
      " CREATE INDEX x ON app.b (id); SET search_path = app, public;"
      " ALTER INDEX x RENAME TO x_idx; ALTER TABLE x ENABLE ROW LEVEL SECURITY;", "public.x"),
+    # REASSIGN OWNED passes app to s1, which DROP OWNED then drops; or to
+    # postgres, so it stays. A role rename, or a no-op CREATE SCHEMA IF NOT
+    # EXISTS, keeps who owns it.
+    ("CREATE SCHEMA app AUTHORIZATION r1; REASSIGN OWNED BY r1 TO s1; DROP OWNED BY s1;"
+     " SET search_path = app, public; CREATE TABLE t (id int);"
+     " ALTER TABLE t ENABLE ROW LEVEL SECURITY;", "public.t"),
+    ("CREATE SCHEMA app AUTHORIZATION r1; REASSIGN OWNED BY r1 TO postgres; DROP OWNED BY r1;"
+     " SET search_path = app, public; CREATE TABLE t (id int);"
+     " ALTER TABLE t ENABLE ROW LEVEL SECURITY;", "app.t"),
+    ("CREATE SCHEMA app AUTHORIZATION r1; ALTER ROLE r1 RENAME TO q; DROP OWNED BY q;"
+     " SET search_path = app, public; CREATE TABLE t (id int);"
+     " ALTER TABLE t ENABLE ROW LEVEL SECURITY;", "public.t"),
+    ("CREATE SCHEMA app AUTHORIZATION r1; CREATE SCHEMA IF NOT EXISTS app AUTHORIZATION s1;"
+     " DROP OWNED BY r1; SET search_path = app, public; CREATE TABLE t (id int);"
+     " ALTER TABLE t ENABLE ROW LEVEL SECURITY;", "public.t"),
 ])
 def test_relations_postgres_removes_or_keeps_are_followed(sql, expected):
     from pgrls.schema_sources import schema_from_sql
