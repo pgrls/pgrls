@@ -71,9 +71,11 @@ breaking changes — they will be called out in this file.
   as inside a string, SQL beside a meta-command that names one of psql's
   own variables (`:ROW_COUNT`), and `pg_dumpall` output, which connects to one database
   after another (dump each with `pg_dump`), or a `\connect` after anything
-  but database-level statements, a `SELECT` with a CTE that writes
-  excepted (psql rolls an open transaction back, and ends statements by its
-  own rules), or one to a database created with an
+  but database-level statements (a `SELECT` whose CTE writes does not count
+  as one; psql rolls an open transaction back, and ends statements by its
+  own rules), one to a database it creates with an encoding other than UTF8
+  when non-ASCII text follows (psql then reads it in that encoding, unless
+  the SQL sets `client_encoding` back first, as `pg_dump -E UTF8` does), or one to a database created with an
   explicit template other than `template0`. A NUL character, where reading
   used to stop silently, is refused too. `--sql-file` now reads a lone CR as
   psql does (part of the line), and a file that is not UTF-8 is a tool
@@ -82,8 +84,8 @@ breaking changes — they will be called out in this file.
   SQL_ASCII when the file holds non-ASCII text (an `\encoding` included),
   or turns `standard_conforming_strings` off or `transform_null_equals` on
   (by `SET`, `ALTER DATABASE / ROLE … SET`, `set_config()` or an `UPDATE`
-  of `pg_settings`, through a view or rule over it too), is refused too: Postgres then reads the text differently
-  from pgrls. And every `ALTER … OWNER TO` the dump
+  of `pg_settings` or of a view the SQL defines over it), is refused too:
+  Postgres then reads the text differently from pgrls. And every `ALTER … OWNER TO` the dump
   writes for a sequence, view or materialized view created a phantom table
   in the model, with a false SEC001 on it: an `ALTER` on a relation that is
   not a table, or one that changes nothing pgrls models (`OWNER TO`) on a

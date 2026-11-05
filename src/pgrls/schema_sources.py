@@ -440,6 +440,30 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         # Where the statement ends: its start can include the gap before it.
         return (raw.stmt_location or 0) + raw.stmt_len if raw.stmt_len else len(sql)
 
+    if connect is not None and not sql[connect:].isascii() and any(
+        isinstance(raw.stmt, _pgast.CreatedbStmt) and any(
+            opt.defname == "encoding" and str(
+                getattr(opt.arg, "sval", None) or getattr(opt.arg, "ival", "")
+            ).lower().replace("_", "").replace("-", "") not in {*_UTF8_ENCODINGS, "6", "0"}
+            for opt in raw.stmt.options or ())
+        for raw in statements
+    ) and not any(
+        # pg_dump -E UTF8 --create sets it back right after the connect.
+        end(raw) > connect
+        and isinstance(raw.stmt, _pgast.VariableSetStmt)
+        and (raw.stmt.name or "").lower() == "client_encoding" and raw.stmt.args
+        and re.sub(r"[^a-z0-9]", "", str(getattr(raw.stmt.args[0].val, "sval", "")).lower())
+        in _UTF8_ENCODINGS
+        and sql[connect:end(raw)].isascii()
+        for raw in statements
+    ):
+        # psql reads what follows in the new database's encoding.
+        raise SchemaSourceError(
+            "bad_sql",
+            "the SQL connects to a database it creates with an encoding other "
+            "than UTF8 and holds non-ASCII text, which Postgres reads as other "
+            "characters there.",
+        )
     if connect is not None and any(
         isinstance(raw.stmt, _pgast.CreatedbStmt) and any(
             opt.defname == "template" and getattr(opt.arg, "sval", None) != "template0"
@@ -467,8 +491,9 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         # which must not merge, and an open transaction is rolled back.
         raise SchemaSourceError(
             "bad_sql",
-            "the SQL creates objects and then \\connects to another database; "
-            "lint each database's schema separately.",
+            "the SQL creates objects, writes or begins a transaction and then "
+            "\\connects to another database; lint each database's schema "
+            "separately.",
         )
 
     default_schema = schemas[0] if schemas else "public"
@@ -1056,25 +1081,35 @@ def _check_lexer_settings(statements: Any, *, non_ascii: bool) -> None:
     reads the SQL as UTF-8 with standard strings, so it would end strings
     where Postgres does not. With `non_ascii`, any client encoding but UTF-8
     or SQL_ASCII is refused: Postgres reads those characters as others.
-    An UPDATE of `pg_settings`, and with an UPDATE in the SQL anything but a
-    plain query over it (a view or rule an UPDATE could go through), is
-    refused too. A setting changed by code (a `DO` block, a function) is not
+    An UPDATE of `pg_settings`, or of a view the SQL defines over it (or a
+    rename of one), is refused too. A setting changed by code (a `DO` block, a function) is not
     seen."""
     trees = [list(_subnodes(raw.stmt)) for raw in statements]
-    updates = any(isinstance(node, _pgast.UpdateStmt) for nodes in trees for node in nodes)
+    # A rule on pg_settings sets what an UPDATE of it names, through a view
+    # over it too: the relations the SQL defines over it, by name.
+    over = {"pg_settings"}
+    while True:
+        more = {
+            raw.stmt.view.relname for raw, nodes in zip(statements, trees)
+            if isinstance(raw.stmt, _pgast.ViewStmt)
+            and raw.stmt.view.relname not in over
+            and any(isinstance(n, _pgast.RangeVar) and n.relname in over for n in nodes)
+        }
+        if not more:
+            break
+        over |= more
     for raw, nodes in zip(statements, trees):
-        # A rule on pg_settings sets what an UPDATE of it names, and a view or
-        # rule over it carries that on: with an UPDATE in the SQL, only a
-        # plain query may read it (a dump's view over it has none).
-        if any(isinstance(node, _pgast.RangeVar) and node.relname == "pg_settings"
-               for node in nodes) and (
-            any(isinstance(node, _pgast.UpdateStmt) for node in nodes)
-            or (updates and not isinstance(raw.stmt, _pgast.SelectStmt))
+        if any(
+            (isinstance(n, _pgast.UpdateStmt) and n.relation is not None
+             and n.relation.relname in over)
+            or (isinstance(n, _pgast.RenameStmt) and n.relation is not None
+                and n.relation.relname in over)
+            for n in nodes
         ):
             raise SchemaSourceError(
                 "bad_sql",
-                "the SQL changes pg_settings, or defines something over it, "
-                "which sets what pgrls cannot follow.",
+                "the SQL updates pg_settings, or a view over it, which sets "
+                "what pgrls cannot follow.",
             )
         for node in nodes:
             if isinstance(node, _pgast.VariableSetStmt) and node.args:

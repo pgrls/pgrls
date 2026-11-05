@@ -1757,6 +1757,9 @@ def test_pg_dumpall_output_is_refused(tmp_path):
     # psql reads COPY rows from the file, up to `\\.`.
     ("CREATE TABLE t (x text);\nCOPY t FROM stdin;\nALTER TABLE t ENABLE ROW LEVEL SECURITY;\n",
      "stdin"),
+    # psql reads what follows in the new database's encoding ...
+    ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nCREATE TABLE \"donn\u00e9es\" (id int);\n",
+     "encoding other than UTF8"),
     # The template's objects are copied into the database.
     ("CREATE DATABASE d TEMPLATE base;\n\\connect d\nCREATE TABLE t (id int);\n", "template"),
     # pglast stops reading at a NUL; psql drops only the rest of its line.
@@ -1859,8 +1862,14 @@ def test_a_skipped_line_must_lie_between_tokens():
     ("CREATE VIEW s AS SELECT * FROM pg_catalog.pg_settings;\n"
      "UPDATE s SET setting = 'on' WHERE name = 'transform_null_equals';\n", "pg_settings"),
     ("SELECT name, setting FROM pg_settings;\n", False),
-    # A dump's view over it, with no UPDATE in the SQL, is read.
-    ("CREATE VIEW s AS SELECT name, setting FROM pg_catalog.pg_settings;\n", False),
+    # A dump's view over it is read, beside an UPDATE of something else.
+    ("CREATE VIEW s AS SELECT name, setting FROM pg_catalog.pg_settings;\n"
+     "CREATE TABLE d (id int, n int);\nCREATE FUNCTION f() RETURNS void LANGUAGE sql "
+     "BEGIN ATOMIC UPDATE d SET n = n + 1; END;\n", False),
+    # A view of the view, and a renamed one, still reach it.
+    ("CREATE VIEW s AS SELECT * FROM pg_settings;\nCREATE VIEW s2 AS SELECT * FROM s;\n"
+     "UPDATE s2 SET setting = 'on' WHERE name = 'transform_null_equals';\n", "pg_settings"),
+    ("CREATE VIEW s AS SELECT * FROM pg_settings;\nALTER VIEW s RENAME TO z;\n", "pg_settings"),
     ("SET client_encoding = 'UTF8';\n", False),
     ("SET client_encoding = 'LATIN1';\n", False),
     ("SET standard_conforming_strings = on;\n", False),
@@ -1893,6 +1902,10 @@ def test_harmless_psql_commands_are_skipped():
     sql = ('CREATE DATABASE "my-app";\n\\encoding SQL_ASCII\n'
            '\\connect -reuse-previous=on "dbname=\'my-app\'"\nCREATE TABLE t (id int);\n')
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+    # ... unless the SQL sets it back first, as pg_dump -E UTF8 does.
+    sql = ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nSET client_encoding = 'UTF8';\n"
+           'CREATE TABLE "donn\u00e9es" (id int);\n')
+    assert [t.name for t in schema_from_sql(sql).tables] == ["donn\u00e9es"]
     # pg_dump --create connects again after the database's own settings.
     sql = ("CREATE DATABASE d;\n\\connect d\nALTER DATABASE d SET work_mem = '4MB';\n"
            "ALTER ROLE app IN DATABASE d SET work_mem = '4MB';\n\\connect d\n"
