@@ -1806,9 +1806,24 @@ def test_an_unqualified_name_resolves_on_the_search_path_the_sql_sets():
     ("SELECT set_config('search_path', 'APP, public', false);\nCREATE TABLE x (id int);\n", "app"),
     # pg_dump's: an unqualified CREATE then has nowhere to go.
     ("SELECT pg_catalog.set_config('search_path', '', false);\nCREATE TABLE x (id int);\n", None),
-    # A schema's elements go in it; a temporary table is no table.
+    # A schema's elements go in it; a temporary table is no table, and one
+    # gone no longer hides the name.
     ("CREATE SCHEMA app CREATE TABLE x (id int);\n", "app"),
     ("CREATE TEMP TABLE x (id int);\n", None),
+    # `public` is there before the SQL creates it IF NOT EXISTS.
+    ("CREATE TABLE x (id int);\nCREATE SCHEMA IF NOT EXISTS public;\n", "public"),
+    # A dead SET LOCAL after COMMIT AND CHAIN and a ROLLBACK.
+    ("BEGIN;\nCOMMIT AND CHAIN;\nSET LOCAL search_path TO app;\nROLLBACK;\n"
+     "CREATE TABLE x (id int);\n", "public"),
+    # RESET ALL leaves the role, and RESET ROLE goes back to the session user.
+    ("CREATE SCHEMA AUTHORIZATION alice;\nSET ROLE alice;\nRESET ALL;\n"
+     "CREATE TABLE x (id int);\n", "alice"),
+    ("CREATE SCHEMA AUTHORIZATION alice;\nSET SESSION AUTHORIZATION alice;\nRESET ROLE;\n"
+     "CREATE TABLE x (id int);\n", "alice"),
+    # pg_dump's form of a set_config() in an expression, which runs when used.
+    ("CREATE TABLE public.audit (who text DEFAULT set_config('app.x'::text, 'y'::text, true));\n"
+     "CREATE VIEW public.v AS SELECT set_config('search_path'::text, 'app'::text, true) AS s;\n"
+     "CREATE TABLE x (id int);\n", "public"),
 ])
 def test_the_search_path_follows_the_session(sql, where):
     from pgrls.schema_sources import schema_from_sql
@@ -1816,6 +1831,20 @@ def test_the_search_path_follows_the_session(sql, where):
     sql = "CREATE SCHEMA IF NOT EXISTS app;\n" + sql if "CREATE SCHEMA app " not in sql else sql
     got = [t.schema for t in schema_from_sql(sql).tables if t.name == "x"]
     assert got == ([where] if where else []), sql
+
+
+@pytest.mark.parametrize("gone", [
+    "CREATE TEMP TABLE x (id int);\nDISCARD TEMP;\n",
+    "CREATE TEMP TABLE x (id int);\nDISCARD ALL;\n",
+    "BEGIN;\nCREATE TEMP TABLE x (id int) ON COMMIT DROP;\nCOMMIT;\n",
+    "CREATE TEMP TABLE x (id int) ON COMMIT DROP;\n",
+])
+def test_a_temporary_table_gone_no_longer_hides_the_name(gone):
+    from pgrls.schema_sources import schema_from_sql
+
+    (x,) = schema_from_sql("CREATE TABLE public.x (id int);\n" + gone
+                           + "ALTER TABLE x ENABLE ROW LEVEL SECURITY;\n").tables
+    assert x.rls_enabled, gone
 
 
 @pytest.mark.parametrize(("sql", "why"), [
@@ -1831,6 +1860,9 @@ def test_the_search_path_follows_the_session(sql, where):
     ("CREATE DATABASE d;\nALTER DATABASE d SET search_path TO app;\n\\connect d\n"
      "CREATE TABLE x (id int);\n", "connects to a database"),
     ("SET search_path TO pg_temp, public;\nCREATE TABLE x (id int);\n", "pg_temp"),
+    ("SET search_path TO app;\nCREATE TABLE x (id int);\nCREATE SCHEMA IF NOT EXISTS app;\n",
+     "IF NOT EXISTS"),
+    ("CREATE SCHEMA app;\nALTER SCHEMA app RENAME TO app2;\n", "renames a schema"),
     ("BEGIN;\nCREATE TABLE x (id int);\nPREPARE TRANSACTION 'x';\n", "PREPARE TRANSACTION"),
 ])
 def test_a_search_path_pgrls_cannot_follow_is_refused(sql, why):

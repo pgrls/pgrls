@@ -108,14 +108,18 @@ breaking changes — they will be called out in this file.
   MCP's `schemas`) moved every one into `app`, so findings named tables that
   did not exist and missed those on `public.*`. What a `ROLLBACK` (or
   `ROLLBACK TO SAVEPOINT`, or the end of the file in an open transaction)
-  undoes is left out of the model, and a temporary table is no table. A
-  search path pgrls cannot follow is refused: one a `\connect`ed database
-  or role may set, `pg_temp` on it, a `set_config()` anywhere but a plain
-  `SELECT` of literals, a CREATE whose first schema the SQL neither creates
-  nor names a relation in, and `PREPARE TRANSACTION`; one set by running
-  code (a `DO` block, a function) is not seen, and a role is taken to have no
-  schema of its own unless the SQL creates one. `ALTER TABLE … SET SCHEMA`
-  is refused: policies name the table by its old schema. An ATTACH Postgres
+  undoes is left out of the model, and a temporary table is no table (nor,
+  once `DISCARD`ed or dropped at COMMIT, hides one). A search path pgrls
+  cannot follow is refused: one a `\connect`ed database or role may set,
+  `pg_temp` on it, a `set_config()` that runs (in a statement, not in a
+  definition such as a view, a DEFAULT or a function, which runs it when
+  used and is not seen) anywhere but a plain `SELECT` of literals, a CREATE
+  whose first schema the SQL neither creates nor names a relation in, a
+  schema used before the SQL creates it `IF NOT EXISTS`, and `PREPARE
+  TRANSACTION`; one set by running code (a `DO` block, a function) is not
+  seen, and a role is taken to have no schema of its own unless the SQL
+  creates one. `ALTER TABLE … SET SCHEMA` and `ALTER SCHEMA … RENAME` are
+  refused: policies name the table by its old schema. An ATTACH Postgres
   refuses (of an inheritance child, of a table already attached, to a
   parent not partitioned) is not modelled.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
