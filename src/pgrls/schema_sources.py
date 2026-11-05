@@ -45,7 +45,6 @@ from pglast.enums.parsenodes import (
     GrantTargetType,
     ObjectType,
     RoleSpecType,
-    TransactionStmtKind,
 )
 from pglast.stream import RawStream
 
@@ -404,9 +403,15 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     # pg_dump writes psql meta-commands (`\\restrict <key>` since the August
     # 2025 minor releases: 13.22, 14.19, 15.14, 16.10, 17.6), which
     # are not SQL; each is blanked so offsets into `sql` still hold.
+    if "\x00" in sql:
+        # pglast stops at a NUL; psql drops only the rest of that line.
+        raise SchemaSourceError("bad_sql", "the SQL holds a NUL character.")
     sql, commands = _split_psql_meta_commands(sql)
     connects = _check_psql_meta_commands(commands)
-    connect = connects[0] if connects else None
+    # The last one: psql ends statements by its own rules (a `begin` in a
+    # CREATE FUNCTION opens a body to it), so one it reads past a
+    # `\\connect` runs, and commits or rolls back, in the next session.
+    connect = connects[-1] if connects else None
     try:
         statements = pglast.parse_sql(sql)
         if commands:
@@ -422,35 +427,15 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         # Where the statement ends: its start can include the gap before it.
         return (raw.stmt_location or 0) + raw.stmt_len if raw.stmt_len else len(sql)
 
-    # Whether a transaction is open after each statement: psql rolls one
-    # back when it reconnects.
-    in_transaction, states = False, []
-    for raw in statements:
-        if isinstance(raw.stmt, _pgast.TransactionStmt):
-            if raw.stmt.kind in (TransactionStmtKind.TRANS_STMT_BEGIN,
-                                 TransactionStmtKind.TRANS_STMT_START):
-                in_transaction = True
-            elif raw.stmt.kind in (TransactionStmtKind.TRANS_STMT_COMMIT,
-                                   TransactionStmtKind.TRANS_STMT_ROLLBACK,
-                                   TransactionStmtKind.TRANS_STMT_PREPARE):
-                in_transaction = bool(raw.stmt.chain)
-        states.append((end(raw), in_transaction))
-    for c in connects:
-        if [state for e, state in states if e < c][-1:] == [True]:
-            raise SchemaSourceError(
-                "bad_sql",
-                "the SQL \\connects inside an open transaction, which psql "
-                "rolls back; pgrls cannot tell what was kept.",
-            )
-
     if connect is not None and any(
         end(raw) < connect
         and (type(raw.stmt).__name__ not in _DATABASE_LEVEL_STATEMENTS
              or getattr(raw.stmt, "intoClause", None) is not None)  # SELECT … INTO
         for raw in statements
     ):
-        # A `\\connect` after objects were created switches database: what
-        # follows is another database's schema, which must not merge.
+        # A `\\connect` after objects were created (or a transaction begun)
+        # switches database: what follows is another database's schema,
+        # which must not merge, and an open transaction is rolled back.
         raise SchemaSourceError(
             "bad_sql",
             "the SQL creates objects and then \\connects to another database; "

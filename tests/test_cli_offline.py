@@ -1740,9 +1740,17 @@ def test_pg_dumpall_output_is_refused(tmp_path):
     # psql ends the name at `$`; the server lexes `USER$x` as one name.
     ("\\echo x\nSELECT (ARRAY[1, 2])[1:USER$x];\n", "its own variable"),
     ("\\encoding LATIN1\nCREATE TABLE t (id int);\n", "psql command"),
-    # psql rolls an open transaction back when it reconnects.
+    # Only database-level statements may come before the LAST connect: psql
+    # rolls an open transaction back when it reconnects, and it reads a
+    # `begin` in a CREATE FUNCTION as opening a body, so the COMMIT after
+    # it runs in the next session.
     ("CREATE DATABASE d;\n\\connect d\nCREATE TABLE t (id int);\nBEGIN;\n"
-     "ALTER TABLE t ENABLE ROW LEVEL SECURITY;\n\\connect d\n", "open transaction"),
+     "ALTER TABLE t ENABLE ROW LEVEL SECURITY;\n\\connect d\n", "connects to another"),
+    ("\\connect d\nCREATE TABLE t (id int);\nBEGIN;\nALTER TABLE t ENABLE ROW LEVEL SECURITY;\n"
+     "CREATE FUNCTION begin() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;\nCOMMIT;\n"
+     "\\connect d\nCREATE TABLE u (id int);\n", "connects to another"),
+    # pglast stops reading at a NUL; psql drops only the rest of its line.
+    ("CREATE TABLE a (id int);\n-- \x00\nCREATE TABLE b (id int);\n", "NUL"),
 ])
 def test_psql_commands_pgrls_cannot_model_are_refused(sql, why):
     from pgrls.schema_sources import SchemaSourceError, schema_from_sql

@@ -70,8 +70,9 @@ breaking changes — they will be called out in this file.
   `client_encoding`), a second command on the line, a line Postgres reads
   as inside a string, SQL that names one of psql's own variables
   (`:ROW_COUNT`), and `pg_dumpall` output, which connects to one database
-  after another (dump each with `pg_dump`), or a `\connect` inside an open
-  transaction, which psql rolls back. `--sql-file` now reads a lone CR as
+  after another (dump each with `pg_dump`), or a `\connect` after anything
+  but database-level statements (psql rolls an open transaction back, and
+  ends statements by its own rules). A NUL character is refused too. `--sql-file` now reads a lone CR as
   psql does (part of the line), and a file that is not UTF-8 is a tool
   error rather than a traceback. Any SQL file that sets `client_encoding`
   to an encoding such as SJIS or BIG5, or to anything but UTF-8 /
