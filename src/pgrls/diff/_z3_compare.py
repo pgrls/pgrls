@@ -1055,7 +1055,8 @@ def _unwrap_scalar_sublink(node: Any) -> Any:
     target = target_list[0]
     if not isinstance(target, ResTarget):
         return node
-    return target.val
+    # `(SELECT (SELECT x))` is `x` too.
+    return _unwrap_scalar_sublink(target.val)
 
 
 def _as_val(x: Any) -> Any:
@@ -1366,15 +1367,15 @@ def _anon_3vl(
     if isinstance(node, CoalesceExpr):
         args = list(node.args or ())
         # A bare column argument (`(SELECT x)` too) has no sort of its own:
-        # modelled exactly it defaults to Bool, so `COALESCE(a, b) = 5`
-        # compares a Bool with an Int, and three text columns could hold only
-        # two values. Such a COALESCE is an opaque value on every path, like
-        # CASE below, without binding those columns; the diff path also
-        # makes one it cannot model exactly for another reason opaque,
-        # shared by base and head.
-        bare_column = any(isinstance(_unwrap_scalar_sublink(a), ColumnRef) for a in args)
-        exact = None if bare_column else _anon_coalesce(node, ctx, auth_funcs, assertions)
-        if exact is None and (ctx.any_session or bare_column):
+        # `_anon_coalesce` gives it its siblings'. With every argument a
+        # bare column there is none to give — modelled as Bools, three text
+        # columns could hold only two values — so such a COALESCE is an
+        # opaque value on every path, like CASE below, without binding those
+        # columns; the diff path also makes one it cannot model exactly for
+        # another reason opaque, shared by base and head.
+        all_bare = all(isinstance(_unwrap_scalar_sublink(a), ColumnRef) for a in args)
+        exact = None if all_bare else _anon_coalesce(node, ctx, auth_funcs, assertions)
+        if exact is None and (ctx.any_session or all_bare):
             if any(not isinstance(_unwrap_scalar_sublink(a), ColumnRef)
                    and _anon_3vl(a, ctx, auth_funcs, assertions) is None
                    for a in args):
@@ -1469,15 +1470,33 @@ def _anon_boolexpr(
 def _anon_coalesce(
     node: CoalesceExpr, ctx: _Context, auth_funcs: set[str], assertions: list[Any]
 ) -> Any:
-    """COALESCE: value is the first non-null arg; null iff all null."""
-    vals: list[Any] = []
-    for arg in (node.args or ()):
-        v = _as_val(_anon_3vl(arg, ctx, auth_funcs, assertions))
-        if v is None:
-            return None
-        vals.append(v)
-    if not vals:
+    """COALESCE: value is the first non-null arg; null iff all null.
+
+    A bare column argument takes the sort its siblings share (Postgres
+    gives every argument one type), rather than the Bool a bare column
+    defaults to; with no sibling to give one, the caller keeps the COALESCE
+    opaque."""
+    args = list(node.args or ())
+    others = [_as_val(_anon_3vl(a, ctx, auth_funcs, assertions)) for a in args
+              if not isinstance(_unwrap_scalar_sublink(a), ColumnRef)]
+    if not others or any(v is None for v in others):
         return None
+    sorts = {v.value.sort() for v in others}
+    if len(sorts) != 1:
+        return None
+    sort = sorts.pop()
+    vals: list[Any] = []
+    rest = iter(others)
+    for arg in args:
+        column = _unwrap_scalar_sublink(arg)
+        if isinstance(column, ColumnRef):
+            key = _column_key(column)
+            var = ctx.column(key, sort) if key else None
+            if var is None:
+                return None
+            vals.append(_Val(value=var, is_null=ctx.null_flag(key)))
+        else:
+            vals.append(next(rest))
     # Every COALESCE branch shares a common type in Postgres, so the
     # translated branch values must share a Z3 sort. A mismatch here
     # is an ENCODING ARTIFACT, not real SQL: a bare column argument

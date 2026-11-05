@@ -84,8 +84,11 @@ breaking changes — they will be called out in this file.
   change the value (`::float4`, `::numeric(3,1)`, `::varchar(3)`,
   `::citext`) is a value of its own (a bare `uuid` cast, and an integer cast
   other than `oid`, still keep it), and so are arithmetic on reals, `/` and
-  `%`, and a `COALESCE` of bare columns (modelled exactly, they defaulted to
-  Bools, so three text columns could hold only two values). Beside such a
+  `%`, and a `COALESCE` of nothing but bare columns (modelled exactly, they
+  defaulted to Bools, so three text columns could hold only two values);
+  beside another argument a bare column takes its type (`coalesce(is_public,
+  false)` stays exact), and `(SELECT (SELECT x))` is a bare column too.
+  Beside such a
   value or truth, a proof whose other conjunct isolates
   still holds (`tenant_id = auth.uid() AND status < 'm'`), and one that
   rested on Z3's reading is no longer made:

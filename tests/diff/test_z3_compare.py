@@ -1224,6 +1224,26 @@ def test_a_coalesce_of_bare_columns_is_a_value_of_its_own() -> None:
         parse_expr(f"tenant_id = auth.uid() OR ({using})"))[0] != "isolated"
 
 
+def test_a_doubly_wrapped_column_is_no_bool() -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation
+
+    d = "(SELECT (SELECT {0}))".format
+    using = f"{d('x')} <> {d('y')} AND {d('y')} <> {d('z')} AND {d('x')} <> {d('z')}"
+    assert _classify("false", using) == "semantic_loosened"
+    assert prove_anon_isolation(parse_expr(using))[0] == "leak"
+
+
+def test_a_coalesce_column_takes_its_siblings_sort() -> None:
+    # The nullable-flag idiom stays exact: `is_public` is a Bool beside `false`.
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    leak = "tenant_id = current_setting('app.t', true) OR coalesce(is_public, false)"
+    assert prove_anon_isolation(parse_expr(leak)) == ("leak", {"is_public": True})
+    scoped = "tenant_id = current_setting('app.t', true) AND NOT coalesce(is_deleted, false)"
+    assert prove_anon_isolation(parse_expr(scoped))[0] == "isolated"
+    assert prove_cross_tenant_isolation(parse_expr(scoped))[0] == "isolated"
+
+
 def test_a_bare_column_coalesce_is_no_total_anonymous_leak() -> None:
     # `COALESCE(level, tier) < 2` modelled the two as Bools coerced to 0/1,
     # which made this policy read as TRUE for every row (a false SEC038).
