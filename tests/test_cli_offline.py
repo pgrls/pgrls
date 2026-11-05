@@ -1612,6 +1612,14 @@ def test_a_harmless_psql_command_psql_rejects_is_refused(line):
     ("CREATE SCHEMA app AUTHORIZATION r1; ALTER ROLE r1 RENAME TO q; DROP OWNED BY q;"
      " SET search_path = app, public; CREATE TABLE t (id int);"
      " ALTER TABLE t ENABLE ROW LEVEL SECURITY;", "public.t"),
+    # ALTER SCHEMA … OWNER TO gives one the SQL did not create an owner;
+    # a SET ROLE makes CURRENT_USER that role.
+    ("ALTER SCHEMA app OWNER TO r1; CREATE TABLE app.x (id int); DROP OWNED BY r1;"
+     " SET search_path = app, public; CREATE TABLE t (id int);"
+     " ALTER TABLE t ENABLE ROW LEVEL SECURITY;", "public.t"),
+    ("CREATE SCHEMA app AUTHORIZATION r1; SET ROLE r1; REASSIGN OWNED BY CURRENT_USER TO s1;"
+     " RESET ROLE; DROP OWNED BY s1; SET search_path = app, public; CREATE TABLE t (id int);"
+     " ALTER TABLE t ENABLE ROW LEVEL SECURITY;", "public.t"),
     ("CREATE SCHEMA app AUTHORIZATION r1; CREATE SCHEMA IF NOT EXISTS app AUTHORIZATION s1;"
      " DROP OWNED BY r1; SET search_path = app, public; CREATE TABLE t (id int);"
      " ALTER TABLE t ENABLE ROW LEVEL SECURITY;", "public.t"),
@@ -1630,6 +1638,12 @@ def test_relations_postgres_removes_or_keeps_are_followed(sql, expected):
     " SET search_path = app, mid, public; ALTER TABLE x DISABLE ROW LEVEL SECURITY;"
     " CREATE SCHEMA IF NOT EXISTS mid;",
     "\\restrict ''\nCREATE TABLE t (id int);\n\\unrestrict ''\n",
+    # REASSIGN OWNED BY CURRENT_USER under a SET ROLE: app may not pass.
+    "CREATE SCHEMA app; SET ROLE r2; REASSIGN OWNED BY CURRENT_USER TO s1; RESET ROLE;"
+    " DROP OWNED BY s1; SET search_path = app; CREATE TABLE t (id int);",
+    # A schema there before the SQL, whose owner it does not know.
+    "CREATE TABLE app.x (id int); DROP OWNED BY r1; SET search_path = app, public;"
+    " CREATE TABLE t (id int);",
 ])
 def test_what_pgrls_cannot_tell_is_refused(sql):
     from pgrls.schema_sources import SchemaSourceError, schema_from_sql

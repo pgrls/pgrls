@@ -787,7 +787,13 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
         if isinstance(stmt, _pgast.CreateSchemaStmt):
             schema = _schema_created(stmt)
             if schema not in resolver.schemas:  # IF NOT EXISTS of one there: no-op
-                resolver.owners[schema] = getattr(stmt.authrole, "rolename", None)
+                # Its creator is the role it runs as, unless AUTHORIZATION
+                # names one; IF NOT EXISTS of one the SQL never made may find
+                # it there, owned by someone pgrls does not know.
+                resolver.owners[schema] = (
+                    _SOME_ROLE if stmt.if_not_exists and schema not in resolver.dropped
+                    else resolver.role_of(stmt.authrole) if stmt.authrole is not None
+                    else resolver.role_of(None))
             resolver.schemas.add(schema)
             resolver.unsure.discard(schema)
             for element in stmt.schemaElts or ():
@@ -872,6 +878,16 @@ def _rolled_back(statements: Any) -> frozenset[int]:
 _SOME_ROLE = "\0some role"
 
 
+def _may_be(owner: str | None, roles: AbstractSet[str | None]) -> bool:
+    """Whether `owner` may be one of `roles` though not named so: the
+    connecting role (None) may be any named one, and one pgrls cannot name
+    any at all."""
+    if owner == _SOME_ROLE:
+        return True
+    return (owner is None and any(r is not None for r in roles)) or (
+        owner is not None and None in roles)
+
+
 class _Resolver:
     """The session state that decides where a relation name resolves, as the
     statements run in order."""
@@ -892,6 +908,7 @@ class _Resolver:
         # and the schemas a `DROP OWNED` may have dropped.
         self.owners: dict[str, str | None] = {}
         self.unsure: set[str] = set()
+        self.dropped_owned = False
         self.relations: set[tuple[str, str]] = set()
         self.temp: set[str] = set()
         self.commit_drop: set[str] = set()  # temporary, ON COMMIT DROP
@@ -1036,8 +1053,22 @@ class _Resolver:
         self.commit_drop -= names
         self.relations -= {(_NOWHERE, name) for name in names}
 
+    def role_of(self, spec: Any) -> str | None:
+        """The role a RoleSpec names (None: the connecting one, which pgrls
+        does not know); a missing one is the role the SQL runs as."""
+        role: str | None
+        if spec is None or spec.roletype in (RoleSpecType.ROLESPEC_CURRENT_USER,
+                                             RoleSpecType.ROLESPEC_CURRENT_ROLE):
+            role = self._get("role") or self._get("auth")
+        elif spec.roletype == RoleSpecType.ROLESPEC_SESSION_USER:
+            role = self._get("auth")
+        else:
+            role = getattr(spec, "rolename", None)
+        return role
+
     def exists(self, schema: str) -> bool:
-        if schema in self.unsure:
+        if schema in self.unsure or (
+                self.dropped_owned and schema not in self.owners and schema != "public"):
             raise SchemaSourceError(
                 "bad_sql",
                 f"the SQL resolves a name on search_path schema {schema!r} after a "
@@ -1196,17 +1227,17 @@ class _Resolver:
             self._drop(stmt)
         elif (isinstance(stmt, _pgast.AlterOwnerStmt)
               and stmt.objectType == ObjectType.OBJECT_SCHEMA):
-            self.owners[str(getattr(stmt.object, "sval", ""))] = getattr(
-                stmt.newowner, "rolename", None)
+            self.owners[str(getattr(stmt.object, "sval", ""))] = self.role_of(stmt.newowner)
         elif isinstance(stmt, _pgast.ReassignOwnedStmt):
-            # Their schemas pass to the new role; one the connecting role
-            # owns does too if it is among them, which pgrls cannot tell.
-            from_roles = {getattr(r, "rolename", None) for r in stmt.roles or ()}
-            to_role = getattr(stmt.newrole, "rolename", None)
+            # Their schemas pass to the new role; one that may be among them
+            # (the connecting role is no name pgrls knows) passes to one
+            # pgrls cannot name.
+            from_roles = {self.role_of(r) for r in stmt.roles or ()}
+            to_role = self.role_of(stmt.newrole)
             for schema, owner in list(self.owners.items()):
                 if owner in from_roles:
                     self.owners[schema] = to_role
-                elif owner is None:
+                elif _may_be(owner, from_roles):
                     self.owners[schema] = _SOME_ROLE
         elif (isinstance(stmt, _pgast.RenameStmt)
               and stmt.renameType == ObjectType.OBJECT_ROLE and stmt.newname):
@@ -1214,17 +1245,20 @@ class _Resolver:
                 if owner is not None and owner == stmt.subname:
                     self.owners[schema] = stmt.newname
         elif isinstance(stmt, _pgast.DropOwnedStmt):
-            # It drops the schemas the roles own; one owned by the connecting
-            # role (or by CURRENT_USER) may be among them.
-            roles = {getattr(r, "rolename", None) for r in stmt.roles or ()}
-            for schema in set(self.schemas):
-                owner = self.owners.get(schema)
-                if owner is not None and owner != _SOME_ROLE and owner in roles:
+            # It drops the schemas the roles own; one whose owner may be
+            # among them is then unsure, and so is any schema the SQL gave
+            # no owner (one there before it), `public` aside.
+            roles = {self.role_of(r) for r in stmt.roles or ()}
+            for schema, owner in list(self.owners.items()):
+                if schema in self.dropped and schema not in self.schemas:
+                    continue
+                if owner in roles and owner is not None and owner != _SOME_ROLE:
                     self.schemas.discard(schema)
                     self.dropped.add(schema)
                     self.relations -= {r for r in self.relations if r[0] == schema}
-                elif owner is None or owner == _SOME_ROLE or None in roles:
+                elif owner == _SOME_ROLE or _may_be(owner, roles) or owner in roles:
                     self.unsure.add(schema)
+            self.dropped_owned = True
         elif (isinstance(stmt, _pgast.AlterObjectSchemaStmt) and stmt.relation is not None
               and stmt.newschema):
             # A view, sequence, matview or foreign table moves (a table's

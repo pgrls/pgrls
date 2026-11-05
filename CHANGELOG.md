@@ -136,9 +136,12 @@ breaking changes — they will be called out in this file.
   temporary too). A view, sequence, matview or foreign table's `SET
   SCHEMA`, and a rename through a qualified `ALTER INDEX`, are followed; a
   `DROP SCHEMA` is taken to succeed (so what the model held there was
-  gone), and `DROP OWNED` drops the schemas the SQL gave those roles, as
-  `REASSIGN OWNED` and a role's rename pass them on (one the connecting
-  role may own is then refused). A name more than one
+  gone), and `DROP OWNED` drops the schemas the SQL gave those roles
+  (`CREATE SCHEMA`, its `AUTHORIZATION`, `ALTER SCHEMA … OWNER TO`, as
+  `REASSIGN OWNED` and a role's rename pass them on, and `CURRENT_USER`
+  as the `SET ROLE` it runs under); a later lookup in one whose owner may
+  be among them, or that the SQL gave no owner (`public` aside), is
+  refused. A name more than one
   schema on the path holds is refused, since the first may be gone or
   moved by something pgrls does not follow (a `CASCADE`, a partition
   dropped with its parent, `DROP OWNED`, an owned sequence or an
