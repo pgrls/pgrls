@@ -1019,7 +1019,13 @@ def test_where_z3_and_postgres_disagree_nothing_is_decided(base: str, head: str)
 
 
 def test_a_quoted_column_named_like_a_call_has_its_own_null_flag() -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation
+
     assert _classify('"f()" IS NULL', "f() IS NULL") is None
+    # Sharing one null-flag made these a total leak and an isolated policy.
+    assert anon_read_counterexample(parse_expr('"f()" IS NULL OR f() IS NOT NULL')) is None
+    assert prove_anon_isolation(parse_expr(
+        'tenant_id = auth.uid() OR ("f()" IS NULL AND f() IS NOT NULL)'))[0] != "isolated"
 
 
 def test_a_huge_numeric_literal_does_not_crash() -> None:
@@ -1180,8 +1186,9 @@ def test_a_leaking_row_prints_a_character_past_latin1() -> None:
 
 
 def test_the_anon_and_cross_tenant_provers_keep_their_proofs() -> None:
-    # Off the diff path a `%` is a value of its own and a text ordering is
-    # Z3's: beside the tenant equality under AND, neither can make it leak.
+    # Off the diff path a `%` is a value of its own and a text ordering a
+    # truth of its own: beside the tenant equality under AND, neither can
+    # make it leak.
     from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
 
     for using in ("tenant_id = auth.uid() AND (seq % 2) = 0",
@@ -1190,7 +1197,7 @@ def test_the_anon_and_cross_tenant_provers_keep_their_proofs() -> None:
         assert prove_cross_tenant_isolation(parse_expr(using))[0] == "isolated", using
 
 
-def test_a_bare_column_coalesce_is_no_anonymous_leak() -> None:
+def test_a_bare_column_coalesce_is_no_total_anonymous_leak() -> None:
     # `COALESCE(level, tier) < 2` modelled the two as Bools coerced to 0/1,
     # which made this policy read as TRUE for every row (a false SEC038).
     assert anon_read_counterexample(parse_expr(

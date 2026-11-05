@@ -82,8 +82,8 @@ breaking changes — they will be called out in this file.
   a Bool against a number (Z3 coerced it to 0 / 1), an ordering on text
   (Postgres orders by collation) — is a truth of its own; a cast that may
   change the value (`::float4`, `::numeric(3,1)`, `::varchar(3)`,
-  `::citext`) is a value of its own (a `uuid` or integer cast of the session
-  identity still keeps it), and so is arithmetic on reals, `/` and `%`. A
+  `::citext`) is a value of its own (a bare `uuid` cast and an integer cast
+  but `oid` still keep it), and so is arithmetic on reals, `/` and `%`. A
   proof whose other conjunct isolates still holds (`tenant_id = auth.uid()
   AND status < 'm'`), and one that rested on Z3's reading is no longer made:
   `tenant_id = auth.uid() OR (s < 'B' AND s > 'a')` (both hold for `'ab'`
@@ -93,10 +93,14 @@ breaking changes — they will be called out in this file.
   false SEC038 on `COALESCE(level, tier) < 2 OR …` is gone. Arithmetic on a
   setting an anonymous session leaves unset abstains, since Postgres raises
   there: `current_setting('app.t')::int + 0 = 5 OR … <> 5` is no longer a
-  false SEC038, but a proof resting on such arithmetic (`auth.uid() IS NOT
-  NULL AND amount < current_setting('app.limit')::numeric * 2`) is now
-  unverified, and so is a leak found only through a decimal no `float4`
-  holds (`… OR n < 0.1`), on which `verify` exits 0. The cost runs the
+  false SEC038. An abstention covers the whole predicate, so a proof whose
+  other conjunct isolates is lost when it sits beside one: beside such
+  arithmetic (`tenant_id = auth.uid() AND amount <
+  current_setting('app.limit')::numeric * 2`), beside `+` on text (`…
+  AND created_at + interval '7 days' > now()`, as `-` already was), or
+  beside a decimal no `float4` holds; these go from PROVEN to unverified,
+  which fails a `verify --strict` gate. A leak found only through such a
+  decimal (`… OR n < 0.1`) is unverified too, and `verify` exits 0 on it. The cost runs the
   other way too: like a function call already, such a value beside an `OR`
   is reported as a conditional LEAK (no witness row) even where Postgres
   admits no row (`… OR (a % 2) = 5`), so a `verify` gate that passed can
