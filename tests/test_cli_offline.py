@@ -1675,6 +1675,43 @@ def test_pg_dump_attaches_partitions_with_alter_table():
     assert parents == {"ev": None, "ev_2025": ("public", "ev"), "ev_old": None}
 
 
+def test_an_attach_reaches_only_the_child_as_it_stood():
+    from pgrls.schema_sources import schema_from_sql
+
+    # Dropped and created again, the child is a table of its own; attached
+    # before it exists, the ATTACH fails.
+    for sql in (
+        "CREATE TABLE p (id int) PARTITION BY RANGE (id);\nCREATE TABLE c (id int);\n"
+        "ALTER TABLE ONLY p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);\n"
+        "DROP TABLE c;\nCREATE TABLE c (id int);\n",
+        "CREATE TABLE p (id int) PARTITION BY RANGE (id);\n"
+        "ALTER TABLE ONLY p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);\n"
+        "CREATE TABLE c (id int);\n",
+    ):
+        parents = {t.name: t.partition_of for t in schema_from_sql(sql).tables}
+        assert parents["c"] is None, sql
+
+
+def test_a_partition_of_a_parent_outside_the_schemas_stands_alone():
+    from pgrls.schema_sources import schema_from_sql
+
+    # Live lint of `public` cannot see `s.p`, so it lints `public.c` (RLS
+    # off) on its own; so does the offline model, whichever form the SQL uses.
+    for sql in (
+        "CREATE SCHEMA s;\nCREATE TABLE s.p (id int) PARTITION BY RANGE (id);\n"
+        "ALTER TABLE s.p ENABLE ROW LEVEL SECURITY;\nCREATE TABLE public.c (id int);\n"
+        "ALTER TABLE ONLY s.p ATTACH PARTITION public.c FOR VALUES FROM (0) TO (10);\n",
+        "CREATE SCHEMA s;\nCREATE TABLE s.p (id int) PARTITION BY RANGE (id);\n"
+        "ALTER TABLE s.p ENABLE ROW LEVEL SECURITY;\n"
+        "CREATE TABLE public.c PARTITION OF s.p FOR VALUES FROM (0) TO (10);\n",
+    ):
+        tables = {t.qualified_name: t for t in schema_from_sql(sql, schemas=("public",)).tables}
+        assert tables["public.c"].partition_of is None
+        both = {t.qualified_name: t
+                for t in schema_from_sql(sql, schemas=("public", "s")).tables}
+        assert both["public.c"].partition_of == ("s", "p")
+
+
 def test_a_typed_literal_is_no_escape_string():
     from pgrls.schema_sources import _without_psql_meta_commands
 

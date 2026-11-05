@@ -93,7 +93,10 @@ breaking changes — they will be called out in this file.
   name it has not seen, no longer creates one. A partition the dump
   attaches with `ALTER TABLE … ATTACH PARTITION` is now its parent's
   partition (`DETACH PARTITION` undoes it), not a standalone table with a
-  false SEC001.
+  false SEC001 — when the child was created before the ATTACH (one dropped
+  and created again after it is a table of its own); and a partition whose
+  parent lies outside the linted schemas is linted on its own, as live lint,
+  which cannot see the parent, does.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

@@ -595,7 +595,8 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         stmt = raw.stmt
         kind = type(stmt).__name__
         if kind == "AlterTableStmt":
-            _apply_alter_table(stmt, tables, default_schema, non_tables=non_tables)
+            _apply_alter_table(stmt, tables, default_schema, non_tables=non_tables,
+                               stmt_index=index)
         elif kind == "CreatePolicyStmt":
             _apply_create_policy(stmt, tables, default_schema)
         elif kind == "AlterPolicyStmt":
@@ -608,6 +609,11 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             _apply_rename(stmt, tables, default_schema)
         # Every other statement shape is skipped tolerantly.
 
+    # Live lint sees a partition whose parent is outside the linted schemas
+    # as one with no parent in scope, and lints it on its own.
+    for builder in tables.values():
+        if builder.partition_of is not None and builder.partition_of[0] not in schemas:
+            builder.partition_of = None
     return Schema(tables=tuple(b.build() for b in tables.values()))
 
 
@@ -848,6 +854,7 @@ def _apply_alter_table(
     default_schema: str,
     *,
     non_tables: AbstractSet[tuple[str, str]] = frozenset(),
+    stmt_index: int,
 ) -> None:
     if getattr(stmt, "objtype", None) != ObjectType.OBJECT_TABLE:
         return  # ALTER SEQUENCE / VIEW / MATERIALIZED VIEW / INDEX / …
@@ -914,7 +921,9 @@ def _apply_alter_table(
             # this the child looked like a standalone table with RLS off.
             child = tables.get(_relation_key(
                 getattr(getattr(cmd, "def_", None), "name", None), default_schema) or ("", ""))
-            if child is not None:
+            # Only the child as it stood then: one created later (after a DROP,
+            # or before which the ATTACH failed) is a table of its own.
+            if child is not None and child.created_at <= stmt_index:
                 if subtype == AlterTableType.AT_AttachPartition:
                     child.partition_of = key
                 elif child.partition_of == key:
