@@ -405,6 +405,16 @@ def test_an_integer_literal_does_not_make_its_column_an_integer():
     assert prove_anon_isolation(parse_expr(
         "tenant_id = (SELECT current_setting('app.t', true)::bigint) OR tenant_id = 123456789")
     ) == ("leak", {"tenant_id": 123456789})
+    # A string cast to an integer type is an integer literal too.
+    assert _classify("c > '9007199254740992'::int8 AND c < '9007199254740994'::int8",
+                     "c = '9007199254740993'::int8") is None
+    assert _classify("g = '16777217'::int", "g IN ('16777217'::int, '16777217'::int)") is None
+    assert prove_anon_isolation(parse_expr(
+        "c = '9007199254740993'::int8 AND c <= 9007199254740992"))[0] != "isolated"
+    # A numeric tenant key leaks through its OR as an integer one does.
+    assert prove_cross_tenant_isolation(parse_expr(
+        "tenant_id = (SELECT current_setting('app.tenant_id', true)::numeric) OR is_public")
+    ) == ("leak", {"is_public": True})
     # ... and the integer pass makes a column compared with decimals an integer.
     assert _classify("a > 0.9", "a > 0.5") is None
     assert prove_anon_isolation(parse_expr("user_id = auth.uid() OR (a > 0.5 AND a < 0.9)"))[0] \

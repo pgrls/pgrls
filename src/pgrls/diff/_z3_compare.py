@@ -400,6 +400,8 @@ class _Context:
         """
         if sort == z3.IntSort() and not self.integers:
             sort = z3.RealSort()
+        elif sort == z3.RealSort() and self.integers:
+            sort = z3.IntSort()  # the integer pass, as for ``column``
         existing = self._session_vars.get(key)
         if existing is None:
             var = z3.Const(f"{_SESSION_PREFIX}{key}", sort)
@@ -2279,6 +2281,9 @@ def _anon_typecast(
     folded = None if ctx.any_session and target_sort == z3.RealSort() else _fold_literal_cast(
         inner.value, target_sort, _typename_last_segment(node.typeName)
     )
+    if folded is not None and z3.is_int_value(folded) and not ctx.integers:
+        # `'…'::int8` is an integer literal too (see `_real_integer`).
+        folded = _real_integer(folded.as_long(), ctx)
     if folded is not None:
         # A captured GUC value cast to the column's type is exactly that
         # constant — `col = current_setting('app.n')::int` with `app.n` set to
