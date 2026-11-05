@@ -1938,6 +1938,20 @@ def _has_range_function(stmt: Any) -> bool:
 # trust widening is a user function deliberately *named after* a builtin and
 # called bare — it would be cleared rather than abstained, negligible in
 # practice and in line with how bare auth-function names are already trusted.
+# That argument needs, at the least, the builtin to exist on every supported
+# server, so PostgreSQL 18's additions (`casefold`, `uuidv7`, `array_sort`, `crc32`, …)
+# are left out: on 15–17 a bare call to one can only be a user function — a
+# polyfill under the same name — and pgrls does not know the server version.
+# Measured on PG17: a door calling a user `casefold()` that read a FORCE'd
+# table was PROVEN while it held the name. Called as `pg_catalog.casefold`
+# they are trusted, like every pg_catalog-qualified call. For the same
+# reason the list holds no SQL keyword (`greatest`, `coalesce`, `trim`,
+# `current_date`, …): unquoted, each parses as its own node (or as
+# `pg_catalog.btrim` / `ltrim` / `rtrim`), never as a call by that name; a
+# quoted `"greatest"(x)` is a call, to a user function — there is no such
+# built-in. Existence is not enough on its own either: a user overload that
+# fits the arguments better (`public.lower(integer)` for `lower(1)`) is the
+# one a bare call runs — not caught here.
 _SAFE_BUILTIN_FUNCS: frozenset[str] = frozenset({
     # aggregates
     "count", "sum", "avg", "min", "max", "array_agg", "string_agg", "json_agg",
@@ -1946,7 +1960,7 @@ _SAFE_BUILTIN_FUNCS: frozenset[str] = frozenset({
     "variance", "var_pop", "var_samp",
     # string
     "lower", "upper", "initcap", "length", "char_length", "character_length",
-    "bit_length", "octet_length", "trim", "btrim", "ltrim", "rtrim", "substr",
+    "bit_length", "octet_length", "btrim", "ltrim", "rtrim", "substr",
     "substring", "left", "right", "lpad", "rpad", "replace", "translate",
     "split_part", "concat", "concat_ws", "format", "reverse", "repeat",
     "position", "strpos", "overlay", "md5", "starts_with", "to_hex", "ascii",
@@ -1954,12 +1968,9 @@ _SAFE_BUILTIN_FUNCS: frozenset[str] = frozenset({
     # numeric
     "abs", "ceil", "ceiling", "floor", "round", "trunc", "sign", "mod", "power",
     "sqrt", "cbrt", "exp", "ln", "log", "log10", "div", "gcd", "lcm",
-    "greatest", "least", "width_bucket",
-    # null / conditional
-    "coalesce", "nullif",
+    "width_bucket",
     # date / time
-    "now", "current_date", "current_time", "current_timestamp", "localtime",
-    "localtimestamp", "clock_timestamp", "statement_timestamp",
+    "now", "clock_timestamp", "statement_timestamp",
     "transaction_timestamp", "age", "date_part", "date_trunc", "extract",
     "make_date", "make_time", "make_timestamp", "make_timestamptz",
     "make_interval", "to_char", "to_date", "to_timestamp", "to_number",
@@ -2089,13 +2100,26 @@ def _bare_builtin_name(call: Any) -> str | None:
     `None` for a function in any other schema, which must NOT be trusted by
     its bare name — a user's `public.set_config` or `public.current_setting`
     is its own function, not the built-in, and may read a table."""
-    from pgrls.ast_utils import func_name_parts  # noqa: PLC0415
-
-    qualified, bare = func_name_parts(call)
-    fn_schema = qualified.rsplit(".", 1)[0] if qualified and "." in qualified else None
-    if fn_schema is None or fn_schema in ("pg_catalog", "information_schema"):
-        return bare
+    parts = _name_parts(call)
+    if parts is None:
+        return None
+    if len(parts) == 1 or parts[-2] in ("pg_catalog", "information_schema"):
+        return parts[-1]
     return None
+
+
+def _name_parts(call: Any) -> list[str] | None:
+    """The parts of `call`'s function name — None when one of them holds a
+    dot itself: a quoted `"pg_catalog.casefold"` or `"auth.uid"` is ONE
+    identifier, a user function in the search path, not that schema's
+    function, so it is never trusted as one (measured on PG17: a quoted
+    `"pg_catalog.casefold"(s)` that read a FORCE'd table was PROVEN)."""
+    from pglast.ast import String  # noqa: PLC0415
+
+    parts = [f.sval for f in getattr(call, "funcname", None) or () if isinstance(f, String)]
+    if not parts or any("." in p for p in parts):
+        return None
+    return parts
 
 
 def _opaque_call(call: Any, auth_functions: frozenset[str] | set[str]) -> bool:
@@ -2105,9 +2129,10 @@ def _opaque_call(call: Any, auth_functions: frozenset[str] | set[str]) -> bool:
     inert setting — setting a tenant id or the JWT claims changes what the
     policies of a later statement admit, so such a body cannot be judged
     under the caller's context."""
-    from pgrls.ast_utils import func_name_parts  # noqa: PLC0415
-
-    qualified, _ = func_name_parts(call)
+    parts = _name_parts(call)
+    if parts is None:
+        return True
+    qualified = ".".join(parts)
     name = _bare_builtin_name(call)
     if name is None:
         # A user-schema function is trusted only if its FULL name is a known
@@ -2118,7 +2143,7 @@ def _opaque_call(call: Any, auth_functions: frozenset[str] | set[str]) -> bool:
         return target is None or not _is_inert_setting(target)
     if name in _SQL_RUNNING_BUILTINS:
         return True
-    fn_schema = qualified.rsplit(".", 1)[0] if qualified and "." in qualified else None
+    fn_schema = parts[-2] if len(parts) > 1 else None
     return not (
         name in auth_functions
         or fn_schema in ("pg_catalog", "information_schema")
