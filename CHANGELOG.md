@@ -95,9 +95,11 @@ breaking changes — they will be called out in this file.
   partition (`DETACH PARTITION` undoes it), not a standalone table with a
   false SEC001 — when the child and parent were created before the ATTACH
   (one dropped and created again after it is a table of its own), and it
-  follows its parent through a rename or `SET SCHEMA`. A partition's
-  parents outside the linted schemas are left out of the model, as live
-  lint does not see them, so the child's ancestor walk stops there.
+  follows its parent through a rename. A partition's parents outside the
+  linted schemas (`--schemas`, else `[database] schemas`) are left out of
+  the model, as live lint does not see them, so the child's ancestor walk
+  stops there. `ALTER TABLE … SET SCHEMA` is refused: policies name the
+  table by its old schema.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

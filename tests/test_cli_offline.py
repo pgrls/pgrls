@@ -1703,8 +1703,48 @@ def test_a_partition_follows_its_parent_renamed_or_moved():
               "ALTER TABLE ONLY a.p ATTACH PARTITION a.c FOR VALUES FROM (0) TO (10);\n")
     schema = schema_from_sql(attach + "ALTER TABLE a.p RENAME TO q;\n", schemas=("a",))
     assert {t.qualified_name: t.partition_of for t in schema.tables}["a.c"] == ("a", "q")
-    schema = schema_from_sql(attach + "ALTER TABLE a.p SET SCHEMA b;\n", schemas=("a", "b"))
-    assert {t.qualified_name: t.partition_of for t in schema.tables}["a.c"] == ("b", "p")
+
+
+def test_a_table_moved_to_another_schema_is_refused():
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+
+    # Policies name it by its old schema, and a later CREATE of the old name
+    # would merge with it; a view may move.
+    with pytest.raises(SchemaSourceError, match="SET SCHEMA"):
+        schema_from_sql("CREATE TABLE a.t (id int);\nALTER TABLE a.t SET SCHEMA b;\n")
+    schema_from_sql("CREATE VIEW a.v AS SELECT 1;\nALTER VIEW a.v SET SCHEMA b;\n")
+
+
+def test_an_attach_that_would_close_a_cycle_is_left_out():
+    from pgrls.schema_sources import schema_from_sql
+
+    # The replay merges the two CREATEs of b.y, keeping its link to b.x, so
+    # the ATTACH of b.x to b.y would close a cycle Postgres never has.
+    sql = ("CREATE TABLE b.x (id int) PARTITION BY LIST (id);\n"
+           "CREATE TABLE b.y PARTITION OF b.x FOR VALUES IN (1) PARTITION BY LIST (id);\n"
+           "DROP TABLE b.x;\nCREATE TABLE b.y (id int) PARTITION BY LIST (id);\n"
+           "CREATE TABLE b.x (id int) PARTITION BY LIST (id);\n"
+           "ALTER TABLE b.y ATTACH PARTITION b.x FOR VALUES IN (1);\n"
+           "CREATE TABLE a.c PARTITION OF b.x FOR VALUES IN (2);\n")
+    for schemas in (("a",), ("a", "b")):
+        tables = {t.qualified_name: t for t in schema_from_sql(sql, schemas=schemas).tables}
+        assert tables["a.c"].partition_of == ("b", "x")
+
+
+def test_offline_lint_reads_the_configured_schemas(tmp_path):
+    from pgrls.cli import main
+
+    # `[database] schemas` scopes an offline run as it does a live one: the
+    # parent in `a` is linted, not left out as beyond the scope.
+    (tmp_path / "pgrls.toml").write_text('[database]\nschemas = ["public", "a"]\n')
+    sql = tmp_path / "s.sql"
+    sql.write_text("CREATE TABLE a.p (id int) PARTITION BY LIST (id);\n"
+                   "ALTER TABLE a.p ENABLE ROW LEVEL SECURITY;\n"
+                   "CREATE TABLE public.c PARTITION OF a.p FOR VALUES IN (1);\n")
+    res = CliRunner().invoke(main, ["lint", "--config", str(tmp_path / "pgrls.toml"),
+                                    "--sql-file", str(sql), "--format", "json"])
+    locations = {v["location"] for v in json.loads(res.stdout)["violations"]}
+    assert "a.p" in locations, res.output
 
 
 def test_a_partition_of_a_parent_outside_the_schemas_keeps_its_link():

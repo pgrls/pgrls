@@ -381,7 +381,10 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     * ``ALTER TABLE … ENABLE / FORCE ROW LEVEL SECURITY`` → sets the table's
       `rls_enabled` / `force_rls`; ``ALTER TABLE … ATTACH / DETACH
       PARTITION`` sets / clears the child's `partition_of` (the form
-      ``pg_dump`` writes partitions in). An ALTER on a view, sequence or other
+      ``pg_dump`` writes partitions in) for a child and parent created
+      before it; ``ALTER TABLE … RENAME`` carries the name to its
+      partitions and children. A partition's parents outside `schemas` are
+      left out, as live lint does not see them. An ALTER on a view, sequence or other
       non-table relation is ignored. psql meta-command lines that do not
       change the SQL (``\\restrict``, ``\\echo``, a ``\\connect`` to one
       database after only database-level statements) are skipped; any
@@ -427,6 +430,15 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             f"could not parse the provided SQL: {exc}.",
         ) from exc
     _check_lexer_settings(statements, non_ascii=not sql.isascii())
+    if any(isinstance(raw.stmt, _pgast.AlterObjectSchemaStmt)
+           and raw.stmt.objectType == ObjectType.OBJECT_TABLE for raw in statements):
+        # Policies elsewhere name the table by its old schema, and a later
+        # CREATE of the old name would merge with it.
+        raise SchemaSourceError(
+            "bad_sql",
+            "the SQL moves a table to another schema (ALTER TABLE … SET SCHEMA), "
+            "which pgrls does not model; lint the schema after the move.",
+        )
     if any(isinstance(raw.stmt, _pgast.CopyStmt) and raw.stmt.is_from
            and raw.stmt.filename is None and not raw.stmt.is_program
            for raw in statements):
@@ -607,8 +619,6 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             _apply_grant(stmt, tables, default_schema)
         elif kind == "RenameStmt":
             _apply_rename(stmt, tables, default_schema)
-        elif kind == "AlterObjectSchemaStmt":
-            _apply_set_schema(stmt, tables, default_schema)
         # Every other statement shape is skipped tolerantly.
 
     # Live lint does not see a table outside the linted schemas: a partition
@@ -616,7 +626,8 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     unseen: set[tuple[str, str]] = set()
     for key in [k for k in tables if k[0] in schemas]:
         up = tables[key].partition_of
-        while up is not None and up in tables and up[0] not in schemas:
+        # A cycle (the replay can build one from valid DDL) ends the walk.
+        while up is not None and up in tables and up[0] not in schemas and up not in unseen:
             unseen.add(up)
             up = tables[up].partition_of
     return Schema(tables=tuple(b.build() for k, b in tables.items() if k not in unseen))
@@ -739,19 +750,6 @@ def _apply_rename(
     if old is None or not newname:
         return
     _move_table(tables, old, (old[0], newname))
-
-
-def _apply_set_schema(
-    stmt: Any,
-    tables: dict[tuple[str, str], _TableBuilder],
-    default_schema: str,
-) -> None:
-    """Apply `ALTER TABLE <t> SET SCHEMA <s>`."""
-    if getattr(stmt, "objectType", None) != ObjectType.OBJECT_TABLE or not stmt.newschema:
-        return
-    old = _relation_key(stmt.relation, default_schema)
-    if old is not None:
-        _move_table(tables, old, (stmt.newschema, old[1]))
 
 
 def _move_table(
@@ -958,6 +956,17 @@ def _apply_alter_table(
             if (child is not None and child.created_at <= stmt_index
                     and builder.created_at <= stmt_index):
                 if subtype == AlterTableType.AT_AttachPartition:
+                    # The replay merges a re-created table with its first
+                    # CREATE, links and all, which can make this ATTACH close
+                    # a cycle Postgres never has: leave it out.
+                    up: tuple[str, str] | None = key
+                    seen: set[tuple[str, str]] = set()
+                    while up is not None and up in tables and up not in seen:
+                        seen.add(up)
+                        up = tables[up].partition_of
+                    child_key = (child.schema, child.name)
+                    if child_key in seen:
+                        continue
                     child.partition_of = key
                 elif child.partition_of == key:
                     child.partition_of = None

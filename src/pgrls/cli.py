@@ -584,7 +584,8 @@ def lint(
     # gate below, keeping the two consistent.
     schema_source_inert: frozenset[str] = frozenset()
     offline = _resolve_offline_schema(
-        sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas, command="lint"
+        sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas, command="lint",
+        config_path=config_path,
     )
     if offline is not None:
         if use_migrations or db_url_explicit:
@@ -943,6 +944,7 @@ def _resolve_offline_schema(
     snapshot: str | None,
     schemas_csv: str | None,
     command: WarnCommand,
+    config_path: str | None = None,
 ) -> tuple[Schema, SchemaSource, int | None] | None:
     """Build a Schema from --sql-file / --snapshot, or return None.
 
@@ -957,11 +959,11 @@ def _resolve_offline_schema(
     """
     if not sql_file and snapshot is None:
         return None
-    schemas = (
-        tuple(s.strip() for s in schemas_csv.split(",") if s.strip())
-        if schemas_csv
-        else None
-    )
+    # The schemas a live run would lint: `--schemas`, else `[database]
+    # schemas` (the model leaves out a partition's parents beyond them).
+    schemas = tuple(
+        _offline_effective_config(config_path=config_path, schemas_csv=schemas_csv).schemas
+    ) or None
     if snapshot is not None:
         try:
             snap_size = os.path.getsize(snapshot)
@@ -1857,7 +1859,8 @@ def fix(
     rules = _validate_rule_filter(rules, auto_fixable, kind="auto-fixable ")
 
     offline = _resolve_offline_schema(
-        sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas, command="fix"
+        sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas, command="fix",
+        config_path=config_path,
     )
     if offline is not None:
         _reject_apply_offline(apply, "fix")
@@ -2164,7 +2167,7 @@ def generate(
 
     offline = _resolve_offline_schema(
         sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas,
-        command="generate",
+        command="generate", config_path=config_path,
     )
     if offline is not None:
         _reject_apply_offline(apply, "generate")
@@ -2341,6 +2344,7 @@ def snapshot(
             snapshot=snapshot,
             schemas_csv=schemas,
             command="snapshot",
+            config_path=config_path,
         )
         assert offline is not None  # a source was given
         schema = offline[0]
