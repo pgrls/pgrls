@@ -1494,41 +1494,31 @@ def test_a_column_type_pgrls_cannot_tell_is_unknown(sql):
 
 
 def test_a_column_type_follows_a_re_create_and_reaches_children():
+    # The diff trusts a type only where pgrls is sure of it; anywhere a table
+    # is made again, moved or takes columns from a parent it is unknown, and
+    # never the stale one.
     from pgrls.schema_sources import schema_from_sql
-    t = _only("CREATE TABLE t (role text); DROP TABLE t; CREATE TABLE t (role citext);")
-    assert [c.data_type for c in t.column_details] == ["citext"]
-    t = _only("CREATE TABLE t (role text); CREATE TABLE IF NOT EXISTS t (role citext);")
-    # A no-op if t is still there, which pgrls cannot always tell.
-    assert [c.data_type for c in t.column_details] == ["unknown"]
-    schema = schema_from_sql(
-        "CREATE TABLE m (k int, role text) PARTITION BY LIST (k);"
-        " CREATE TABLE m1 PARTITION OF m FOR VALUES IN (1); CREATE TABLE c () INHERITS (m1);"
-        " ALTER TABLE m ALTER COLUMN role TYPE citext;")
-    assert {t.name: [c.data_type for c in t.column_details if c.name == "role"]
-            for t in schema.tables} == {"m": ["citext"], "m1": ["citext"], "c": ["citext"]}
-    # ... to an attached partition and a late child too, and a re-CREATE as
-    # a partition takes the parent's.
-    schema = schema_from_sql(
-        "CREATE TABLE m (k int, role text) PARTITION BY LIST (k); CREATE TABLE m1 (k int, role text);"
-        " ALTER TABLE m ATTACH PARTITION m1 FOR VALUES IN (1); CREATE TABLE c (k int, role text);"
-        " ALTER TABLE c INHERIT m1; ALTER TABLE m ALTER COLUMN role TYPE citext;"
-        " CREATE TABLE r (k int, role text); DROP TABLE r;"
-        " CREATE TABLE r PARTITION OF m FOR VALUES IN (2);")
-    assert {t.name: [c.data_type for c in t.column_details if c.name == "role"]
-            for t in schema.tables} == {"m": ["citext"], "m1": ["citext"], "c": ["citext"],
-                                         "r": ["citext"]}
-    # A detached partition and a child taken off keep theirs; a renamed
-    # parent's children follow it.
-    schema = schema_from_sql(
-        "CREATE TABLE p (k int, c citext) PARTITION BY LIST (k);"
-        " CREATE TABLE ch PARTITION OF p FOR VALUES IN (1); ALTER TABLE p DETACH PARTITION ch;"
-        " CREATE TABLE q (c citext); CREATE TABLE qc () INHERITS (q); ALTER TABLE qc NO INHERIT q;"
-        " CREATE TABLE r (c text); CREATE TABLE rc () INHERITS (r); ALTER TABLE r RENAME TO r2;"
-        " ALTER TABLE p ALTER COLUMN c TYPE text; ALTER TABLE q ALTER COLUMN c TYPE text;"
-        " ALTER TABLE r2 ALTER COLUMN c TYPE citext;")
-    assert {t.name: [c.data_type for c in t.column_details if c.name == "c"]
-            for t in schema.tables if t.name in ("ch", "qc", "rc")} == {
-        "ch": ["citext"], "qc": ["citext"], "rc": ["citext"]}
+
+    def roles(sql, column="role"):
+        return {t.name: {c.data_type for c in t.column_details if c.name == column}
+                for t in schema_from_sql(sql).tables}
+
+    assert roles("CREATE TABLE t (role text); ALTER TABLE t ALTER COLUMN role TYPE citext;") == {
+        "t": {"citext"}}
+    for sql, column in (
+        ("CREATE TABLE t (role text); DROP TABLE t; CREATE TABLE t (role citext);", "role"),
+        ("CREATE TABLE t (role text); CREATE TABLE IF NOT EXISTS t (role citext);", "role"),
+        ("CREATE TABLE m (k int, role text) PARTITION BY LIST (k);"
+         " CREATE TABLE m1 PARTITION OF m FOR VALUES IN (1); CREATE TABLE c () INHERITS (m1);"
+         " ALTER TABLE m ALTER COLUMN role TYPE citext;", "role"),
+        ("CREATE TABLE m (k int, role text) PARTITION BY LIST (k); CREATE TABLE m1 (k int, role text);"
+         " ALTER TABLE m ATTACH PARTITION m1 FOR VALUES IN (1); CREATE TABLE c (k int, role text);"
+         " ALTER TABLE c INHERIT m1; ALTER TABLE m ALTER COLUMN role TYPE citext;", "role"),
+        ("CREATE TABLE r (c text); CREATE TABLE rc () INHERITS (r); ALTER TABLE r RENAME TO r2;"
+         " ALTER TABLE r2 ALTER COLUMN c TYPE citext;", "c"),
+    ):
+        for name, kinds in roles(sql, column).items():
+            assert kinds <= {"citext", "unknown"}, (sql, name, kinds)
 
 
 def test_offline_alter_table_rename_is_applied():

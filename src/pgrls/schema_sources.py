@@ -518,144 +518,118 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     # is not sure of a column's type, it is `unknown` (which decides nothing).
     types = _column_types_in_order(statements, default_schema)
     for key, builder in tables.items():
-        if key in types:
-            builder.columns = [replace(c, data_type=types[key].get(c.name, "unknown"))
-                               for c in builder.columns]
+        builder.columns = [replace(c, data_type=types.get(key, {}).get(c.name, "unknown"))
+                           for c in builder.columns]
     return Schema(tables=tuple(b.build() for b in tables.values()))
 
 
 def _column_types_in_order(
     statements: Any, default_schema: str,
 ) -> dict[tuple[str, str], dict[str, str]]:
-    """Each table's column types as the statements leave them, in order:
-    CREATE (its own columns, a parent's for PARTITION OF / INHERITS, a
-    `LIKE` source's), DROP, RENAME, ADD / DROP / RENAME COLUMN and ALTER
-    COLUMN … TYPE (which reaches the partitions and children attached then:
-    PARTITION OF, INHERITS, ATTACH, INHERIT, until DETACH / NO INHERIT).
-    Where it cannot tell, a type is `unknown`: a CREATE of a table it still
-    holds (an IF NOT EXISTS that may have skipped, one a CASCADE, a parent's
-    DROP or a SET SCHEMA took, or another schema on the search_path), a
-    column a DROP COLUMN may have left in a child, a type it cannot read."""
+    """The column types the diff may trust (`pgrls diff` reads a string
+    compared with a column by the column's type): those of a table whose
+    name the input makes once and never drops, renames or moves (so no
+    search_path, temporary table or rebuild can make the name another
+    table), from its own column list and the ALTERs on it in order. A table
+    left out, a column it gets from elsewhere (a parent, `LIKE`, `CREATE
+    TABLE … AS`), and a type named like a built-in the SQL also defines are
+    `unknown`, which decides nothing."""
+    made: dict[str, int] = {}
+    tainted: set[str] = set()
+    shadowed: set[str] = set()
+    elements = [stmt for raw in statements
+                for stmt in (raw.stmt, *(getattr(raw.stmt, "schemaElts", None) or ()))]
+    for stmt in elements:
+        target = _made_relation(stmt)
+        if target is not None:
+            made[target] = made.get(target, 0) + 1
+        if isinstance(stmt, _pgast.CreateStmt) and (stmt.inhRelations or any(
+                isinstance(e, _pgast.TableLikeClause) for e in stmt.tableElts or ())):
+            tainted.add(stmt.relation.relname)
+        if isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None:
+            tainted.update({stmt.relation.relname, stmt.newname or ""})
+        elif isinstance(stmt, _pgast.AlterObjectSchemaStmt) and stmt.relation is not None:
+            tainted.add(stmt.relation.relname)
+        elif isinstance(stmt, _pgast.DropStmt):
+            tainted.update(parts[-1] for parts in map(_drop_name_parts, stmt.objects or ())
+                           if parts)
+        elif isinstance(stmt, _pgast.AlterTableStmt):
+            for cmd in stmt.cmds or ():
+                if getattr(cmd, "subtype", None) in (AlterTableType.AT_AttachPartition,
+                                                     AlterTableType.AT_AddInherit):
+                    child = (getattr(getattr(cmd, "def_", None), "name", None)
+                             if cmd.subtype == AlterTableType.AT_AttachPartition else stmt.relation)
+                    if child is not None:
+                        tainted.add(child.relname)
+        elif isinstance(stmt, (_pgast.CreateDomainStmt, _pgast.CompositeTypeStmt,
+                               _pgast.CreateEnumStmt, _pgast.CreateRangeStmt)):
+            names = (stmt.domainname if isinstance(stmt, _pgast.CreateDomainStmt)
+                     else getattr(stmt, "typeName", None) or getattr(stmt, "typevar", None))
+            last = (names.relname if isinstance(names, _pgast.RangeVar)
+                    else getattr((names or [None])[-1], "sval", None))
+            if last:
+                shadowed.add(last.lower())
+    simple = {name for name, count in made.items() if count == 1 and name not in tainted}
+
+    def typed(col: Any) -> str:
+        data_type = _column_type(col) or "unknown"
+        bare = data_type.lower().split("(")[0].strip()
+        return "unknown" if bare in shadowed else data_type
+
     types: dict[tuple[str, str], dict[str, str]] = {}
-    children: dict[tuple[str, str], set[tuple[str, str]]] = {}
-    # Tables whose columns the SQL does not list (`CREATE TABLE … AS`).
-    unlisted: set[tuple[str, str]] = set()
-
-    def below(key: tuple[str, str]) -> list[tuple[str, str]]:
-        seen, pending = [], [key]
-        while pending:
-            k = pending.pop()
-            if k not in seen:
-                seen.append(k)
-                pending.extend(children.get(k, ()))
-        return seen
-
-    def create(stmt: Any, schema: str) -> None:
-        key = _relation_key(stmt.relation, schema)
-        if key is None:
-            return
-        cols: dict[str, str] = {}
-        for rel in stmt.inhRelations or ():
-            parent = _relation_key(rel, schema)
-            if parent is not None:
-                cols.update(types.get(parent, {}))
-                children.setdefault(parent, set()).add(key)
-        for elt in stmt.tableElts or ():
-            if isinstance(elt, _pgast.ColumnDef) and elt.colname:
-                cols[elt.colname] = _column_type(elt) or "unknown"
-            elif isinstance(elt, _pgast.TableLikeClause):
-                source = _relation_key(elt.relation, schema)
-                cols.update(types.get(source, {}) if source is not None else {})
-        if key in types:
-            # It may be the table already there (or not): a type the two
-            # do not agree on is unknown.
-            old = types[key]
-            cols = {c: (t if old.get(c, t) == t else "unknown") for c, t in cols.items()}
-            cols.update({c: "unknown" for c in old if c not in cols})
-        types[key] = cols
-
     for raw in statements:
         stmt = raw.stmt
-        derived = _data_derived_relation(stmt)
-        if derived is not None:
-            key = _relation_key(derived, default_schema)
-            if key is not None:
-                types[key] = {c: "unknown" for c in types.get(key, {})}
-                unlisted.add(key)
-        elif isinstance(stmt, _pgast.CreateStmt):
-            create(stmt, default_schema)
-        elif isinstance(stmt, _pgast.CreateSchemaStmt):
-            for element in stmt.schemaElts or ():
-                if isinstance(element, _pgast.CreateStmt):
-                    create(element, stmt.schemaname or default_schema)
-        elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_TABLE:
-            for namelist in stmt.objects or ():
-                parts = _drop_name_parts(namelist)
-                if parts:
-                    gone = _drop_table_key(parts, default_schema)
-                    types.pop(gone, None)
-                    unlisted.discard(gone)
-                    children.pop(gone, None)
-                    for kids in children.values():
-                        kids.discard(gone)
-        elif isinstance(stmt, _pgast.RenameStmt) and stmt.newname:
+        for create in (stmt, *(getattr(stmt, "schemaElts", None) or ())):
+            if isinstance(create, _pgast.CreateStmt) and create.relation.relname in simple:
+                schema = (stmt.schemaname if create is not stmt and stmt.schemaname
+                          else default_schema)
+                key = _relation_key(create.relation, schema)
+                if key is not None:
+                    types[key] = {e.colname: typed(e) for e in create.tableElts or ()
+                                  if isinstance(e, _pgast.ColumnDef) and e.colname}
+        if isinstance(stmt, _pgast.RenameStmt) and stmt.renameType == ObjectType.OBJECT_COLUMN:
             key = _relation_key(stmt.relation, default_schema)
-            if key is None or key not in types:
-                continue
-            if stmt.renameType == ObjectType.OBJECT_TABLE:
-                new = (key[0], stmt.newname)
-                types[new] = types.pop(key)
-                children[new] = children.pop(key, set())
-                for kids in children.values():
-                    if key in kids:
-                        kids.discard(key)
-                        kids.add(new)
-            elif stmt.renameType == ObjectType.OBJECT_COLUMN and stmt.subname:
-                for k in below(key):
-                    if stmt.subname in types.get(k, {}):
-                        types[k][stmt.newname] = types[k].pop(stmt.subname)
+            if key in types and stmt.subname in types[key] and stmt.newname:
+                types[key][stmt.newname] = types[key].pop(stmt.subname)
         elif isinstance(stmt, _pgast.AlterTableStmt):
             key = _relation_key(stmt.relation, default_schema)
-            if key is None:
+            if key not in types:
                 continue
             for cmd in stmt.cmds or ():
                 subtype = getattr(cmd, "subtype", None)
-                if subtype == AlterTableType.AT_AlterColumnType:
-                    col = getattr(cmd, "def_", None)
-                    new_type = _column_type(col) if isinstance(col, _pgast.ColumnDef) else None
-                    for k in below(key):
-                        if cmd.name in types.get(k, {}):
-                            types[k][cmd.name] = new_type or "unknown"
-                elif subtype == AlterTableType.AT_AddColumn:
-                    col = getattr(cmd, "def_", None)
-                    if isinstance(col, _pgast.ColumnDef) and col.colname:
-                        for k in below(key):
-                            have = types.setdefault(k, {})
-                            if col.colname in have:
-                                # IF NOT EXISTS keeps the one there; else it errors.
-                                continue
-                            have[col.colname] = ("unknown" if k in unlisted
-                                                 else _column_type(col) or "unknown")
+                col = getattr(cmd, "def_", None)
+                if subtype == AlterTableType.AT_AlterColumnType and cmd.name in types[key]:
+                    types[key][cmd.name] = (typed(col) if isinstance(col, _pgast.ColumnDef)
+                                            else "unknown")
+                elif (subtype == AlterTableType.AT_AddColumn and isinstance(col, _pgast.ColumnDef)
+                      and col.colname and col.colname not in types[key]):
+                    types[key][col.colname] = typed(col)
                 elif subtype == AlterTableType.AT_DropColumn and cmd.name:
-                    types.get(key, {}).pop(cmd.name, None)
-                    for k in below(key)[1:]:
-                        # A child keeps a column of its own (or under ONLY).
-                        if cmd.name in types.get(k, {}):
-                            types[k][cmd.name] = "unknown"
-                elif subtype in (AlterTableType.AT_AttachPartition,
-                                 AlterTableType.AT_DetachPartition):
-                    child = _relation_key(getattr(getattr(cmd, "def_", None), "name", None),
-                                          default_schema)
-                    if child is not None:
-                        kids = children.setdefault(key, set())
-                        (kids.add if subtype == AlterTableType.AT_AttachPartition
-                         else kids.discard)(child)
-                elif subtype in (AlterTableType.AT_AddInherit, AlterTableType.AT_DropInherit):
-                    parent = _relation_key(getattr(cmd, "def_", None), default_schema)
-                    if parent is not None:
-                        kids = children.setdefault(parent, set())
-                        (kids.add if subtype == AlterTableType.AT_AddInherit else kids.discard)(key)
+                    types[key].pop(cmd.name, None)
     return types
+
+
+def _made_relation(stmt: Any) -> str | None:
+    """The name of the relation `stmt` makes (a table, temporary or not, a
+    view, sequence, foreign table, composite type), which an unqualified
+    name may then find."""
+    rel: Any = None
+    if isinstance(stmt, _pgast.CreateStmt):
+        rel = stmt.relation
+    elif isinstance(stmt, _pgast.CreateForeignTableStmt):
+        rel = stmt.base.relation
+    elif isinstance(stmt, _pgast.ViewStmt):
+        rel = stmt.view
+    elif isinstance(stmt, _pgast.CreateSeqStmt):
+        rel = stmt.sequence
+    elif isinstance(stmt, _pgast.CompositeTypeStmt):
+        rel = stmt.typevar
+    elif isinstance(stmt, _pgast.CreateTableAsStmt):
+        rel = stmt.into.rel  # a table or a materialized view
+    else:
+        rel = _data_derived_relation(stmt)
+    name = getattr(rel, "relname", None)
+    return str(name) if name else None
 
 
 class _TableBuilder:

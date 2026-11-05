@@ -135,16 +135,13 @@ breaking changes — they will be called out in this file.
   value whose type the text does not show (a function's result, a
   sub-select) decides nothing when it is read two ways, one in a `COALESCE`
   or `CASE` arm (which takes the arms' common type) never matching a direct
-  read of it. The offline model now replays, in statement
-  order, what changes a column's type (`CREATE`, a `PARTITION OF` /
-  `INHERITS` parent's columns, `DROP`, `RENAME`, `ADD` / `DROP` / `RENAME
-  COLUMN`, `ALTER COLUMN … TYPE` into the partitions and children attached
-  then, `ATTACH` / `DETACH` / `INHERIT` / `NO INHERIT`, a `LIKE` source's,
-  tables in a `CREATE SCHEMA`), and where it cannot tell (a `CREATE` of a
-  table it still holds, as an `IF NOT EXISTS` that may have skipped, a
-  `CASCADE`, a parent's `DROP`, `SET SCHEMA` or another schema on the
-  search path leaves; a child's column a parent's `DROP COLUMN` may leave;
-  a `CREATE TABLE … AS`) a type is `unknown`, which decides nothing. A column's
+  read of it. The offline model gives the diff a column's type only where it is
+  sure of it: the table's name is made once in the input and never
+  dropped, renamed, moved or attached (so no search_path, temporary table
+  or rebuild can make the name another table), the type is from its own
+  column list or a later `ALTER COLUMN … TYPE` / `ADD COLUMN`, and the SQL
+  defines no type of that name; any other (a parent's or `LIKE`'s column,
+  a `CREATE TABLE … AS`) is `unknown`, which decides nothing. A column's
   collation is not in the snapshots: a nondeterministic one (`text COLLATE
   ci`) compares strings otherwise, which the diff does not see, as on
   `main`. Without column types (a snapshot from before they were captured)
