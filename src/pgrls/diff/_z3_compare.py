@@ -72,6 +72,8 @@ so this is a defensive guardrail rather than a real limitation.
 """
 from __future__ import annotations
 
+import ctypes
+import dataclasses
 import fractions
 import functools
 import math
@@ -98,7 +100,6 @@ from pglast.ast import (
     A_Const,
     A_Expr,
     Boolean,
-    BooleanTest,
     BoolExpr,
     Node,
     CaseExpr,
@@ -583,6 +584,11 @@ def _abstains_when_too_deep(result: Any) -> Callable[[_F], _F]:
             try:
                 return fn(*args, **kwargs)
             except RecursionError:
+                return result
+            except ctypes.ArgumentError as exc:
+                # Z3's ctypes layer re-raises a RecursionError as this.
+                if "RecursionError" not in str(exc):
+                    raise
                 return result
         return cast(_F, inner)
     return wrap
@@ -1087,17 +1093,7 @@ def _unwrap_scalar_sublink(node: Any) -> Any:
         target = target_list[0]
         if not isinstance(target, ResTarget):
             return node
-        # So does one inside the target, which a name cannot tell apart from
-        # any other call. A call's value is opaque and may be NULL, which
-        # covers that — unless something above it turns a NULL into a value
-        # (`(SELECT srf() IS NULL)` is NULL, not TRUE, when it yields no row).
-        nodes = list(_ast_nodes(target.val))
-        if any(isinstance(n, FuncCall) for n in nodes) and any(
-                isinstance(n, (NullTest, BooleanTest, CoalesceExpr, CaseExpr, BoolExpr))
-                or (isinstance(n, A_Expr) and n.kind in (A_Expr_Kind.AEXPR_DISTINCT,
-                                                         A_Expr_Kind.AEXPR_NOT_DISTINCT))
-                for n in nodes):
-            return node
+        # (One in the target is `_anon_3vl`'s: see `_may_yield_no_row`.)
         node = target.val
 
 
@@ -1111,6 +1107,14 @@ def _ast_nodes(node: Any) -> Any:
         elif isinstance(n, Node):
             yield n
             stack.extend(getattr(n, f, None) for f in n)
+
+
+def _may_yield_no_row(target: Any, auth_funcs: set[str]) -> bool:
+    """Whether the target of a scalar sub-select calls anything that may be
+    set-returning: any call but an auth leaf (`auth.uid()`,
+    `current_setting(...)`), whose arguments are walked too."""
+    return any(isinstance(n, FuncCall) and not _is_anon_null_leaf(n, auth_funcs)
+               for n in _ast_nodes(target))
 
 
 def _as_val(x: Any) -> Any:
@@ -1175,7 +1179,23 @@ def _anon_3vl(
     Every call unwraps a scalar SubLink first, then checks the anon-NULL
     leaf BEFORE the generic FuncCall / SQLValueFunction branches.
     """
-    node = _unwrap_scalar_sublink(node)
+    inner = _unwrap_scalar_sublink(node)
+    if inner is not node and _may_yield_no_row(inner, auth_funcs):
+        # A call in the target may be set-returning, which a name cannot tell
+        # apart, and yield no row: the sub-select is then NULL whatever its
+        # target reads (`(SELECT srf() IS NULL)` is NULL, not TRUE). The same
+        # sub-select shares the one flag, in base and head alike.
+        result = _anon_3vl(inner, ctx, auth_funcs, assertions)
+        if result is None:
+            return None
+        no_row = ctx.opaque(f"no_row {_canon(node)}", z3.BoolSort())
+        if no_row is None:
+            return None
+        if isinstance(result, _TV):
+            return _TV(is_true=z3.And(result.is_true, z3.Not(no_row)),
+                       is_null=z3.Or(result.is_null, no_row))
+        return dataclasses.replace(result, is_null=z3.Or(result.is_null, no_row))
+    node = inner
 
     # --- auth-context leaf: auth.uid()/role()/jwt(), current_setting(...),
     # current_user, session_user. Checked before the generic FuncCall
@@ -1877,8 +1897,12 @@ def _resolve_3vl_operands(
     candidate). ``col OP col`` binds both as String (no other side gives
     them a type). Any None → ``(None, None)``.
     """
-    lexpr = _unwrap_scalar_sublink(lexpr)
-    rexpr = _unwrap_scalar_sublink(rexpr)
+    # A bare column is found through a sub-select; anything else is
+    # translated as written, so `_anon_3vl` sees the sub-select.
+    if isinstance(_unwrap_scalar_sublink(lexpr), ColumnRef):
+        lexpr = _unwrap_scalar_sublink(lexpr)
+    if isinstance(_unwrap_scalar_sublink(rexpr), ColumnRef):
+        rexpr = _unwrap_scalar_sublink(rexpr)
     l_is_col = isinstance(lexpr, ColumnRef)
     r_is_col = isinstance(rexpr, ColumnRef)
 

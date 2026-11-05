@@ -1251,24 +1251,34 @@ def test_a_limited_scalar_select_is_no_change_of_nothing() -> None:
 
 @pytest.mark.parametrize(("base", "head"), [
     # A set-returning function that yields no row makes the sub-select NULL:
-    # in ORDER BY, in a WINDOW, or under something that turns NULL into a
-    # value.
+    # in ORDER BY or a WINDOW, or anywhere in the target — under IS NULL, in
+    # an IN list, inside a call pinned non-NULL.
     ("false", "(SELECT true ORDER BY generate_series(1, 0)) IS NULL"),
     ("(SELECT a ORDER BY generate_series(1, 0)) = 1", "a = 1"),
     ("false", "(SELECT generate_series(1, 0) IS NULL) IS NULL"),
     ("false", "(SELECT true WINDOW w AS (ORDER BY generate_series(1, 0))) IS NULL"),
+    ("(SELECT tag IN (json_array_elements_text(current_setting('app.tags', true)::json), "
+     "'public'))", "tag = 'public'"),
+    ("false", "(SELECT current_setting(json_array_elements_text('[]'))) IS NULL"),
 ])
 def test_a_sub_select_a_set_returning_call_can_empty_is_no_expression(base, head) -> None:
-    assert _classify(base, head) is None
+    # Never equivalent or a tightening: the head admits rows the base does not.
+    assert _classify(base, head) not in ("semantic_equivalent", "semantic_tightened")
 
 
-def test_a_scalar_select_of_a_call_still_unwraps() -> None:
+def test_a_scalar_select_of_an_auth_call_still_unwraps() -> None:
     from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
 
     for using in ("tenant_id = (SELECT auth.uid())",
-                  "tenant_id = (SELECT current_setting('app.t', true)::uuid)"):
+                  "tenant_id = (SELECT current_setting('app.t', true)::uuid)",
+                  "user_id = (SELECT auth.uid()) AND (SELECT auth.uid() IS NOT NULL)"):
         assert prove_anon_isolation(parse_expr(using))[0] == "isolated", using
         assert prove_cross_tenant_isolation(parse_expr(using))[0] == "isolated", using
+    # The inverted-auth leak, written with sub-selects, stays a total leak.
+    assert anon_read_counterexample(parse_expr(
+        "user_id = (SELECT auth.uid()) OR (SELECT auth.uid() IS NULL)")) == {}
+    assert _classify("tenant_id = (SELECT auth.uid())",
+                     "tenant_id = (SELECT auth.uid()) AND x = 1") == "semantic_tightened"
 
 
 def test_a_predicate_too_deep_for_the_stack_decides_nothing() -> None:
