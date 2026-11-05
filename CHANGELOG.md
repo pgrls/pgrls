@@ -120,8 +120,10 @@ breaking changes — they will be called out in this file.
   TRANSACTION`; one set by running code (a `DO` block, a function) is not
   seen, and a role is taken to have no schema of its own unless the SQL
   creates one (a name resolved on `$user` with no `SET ROLE` after the SQL
-  creates a schema for a role, `CREATE SCHEMA AUTHORIZATION r`, is refused:
-  psql may connect as `r`). `ALTER TABLE … SET SCHEMA` and `ALTER SCHEMA …
+  creates a schema named as its owner — `CREATE SCHEMA AUTHORIZATION r`, or
+  `ALTER SCHEMA r OWNER TO r` as pg_dump writes it — or owned by the
+  connecting role, is refused: psql may connect as `r`; and so is `CREATE
+  SCHEMA AUTHORIZATION CURRENT_USER`, named for a role pgrls does not know). `ALTER TABLE … SET SCHEMA` and `ALTER SCHEMA …
   RENAME` are
   refused: policies name the table by its old schema. An ATTACH Postgres
   refuses (of an inheritance child, of a table already attached, to a

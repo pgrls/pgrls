@@ -697,17 +697,30 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
     void = _rolled_back(statements)
     live = [raw for index, raw in enumerate(statements) if index not in void]
     schemas = [raw.stmt for raw in live if isinstance(raw.stmt, _pgast.CreateSchemaStmt)]
+    if any(stmt.schemaname is None and getattr(stmt.authrole, "rolename", None) is None
+           for stmt in schemas):
+        raise SchemaSourceError(
+            "bad_sql",
+            "the SQL creates a schema named for the role psql connects as "
+            "(CREATE SCHEMA AUTHORIZATION CURRENT_USER), which pgrls does not know.",
+        )
     resolver = _Resolver(
         # `public` is in every new database; one created only IF NOT EXISTS
         # may have been there before.
         created={_schema_created(stmt) for stmt in schemas
                  if not stmt.if_not_exists} - {"public"},
         maybe={_schema_created(stmt) for stmt in schemas if stmt.if_not_exists} - {"public"},
-        # A schema made for a role (`AUTHORIZATION r` and no other name): the
-        # connecting role's own, if psql connects as it.
+        # A schema named as the role that owns it (`AUTHORIZATION r`, or
+        # `OWNER TO r` as pg_dump writes it), or owned by the connecting
+        # role: that role's own, if psql connects as it.
         for_roles={_schema_created(stmt) for stmt in schemas
-                   if getattr(stmt.authrole, "rolename", None) is not None
-                   and stmt.schemaname in (None, stmt.authrole.rolename)},
+                   if stmt.authrole is not None
+                   and getattr(stmt.authrole, "rolename", None) in (None, stmt.schemaname,
+                                                                     _schema_created(stmt))}
+        | {str(raw.stmt.object.sval) for raw in live
+           if isinstance(raw.stmt, _pgast.AlterOwnerStmt)
+           and raw.stmt.objectType == ObjectType.OBJECT_SCHEMA
+           and getattr(raw.stmt.newowner, "rolename", None) in (None, raw.stmt.object.sval)},
         named={node.schemaname for raw in live for node in _subnodes(raw.stmt)
                if isinstance(node, _pgast.RangeVar) and node.schemaname})
     out: list[_Stmt] = []

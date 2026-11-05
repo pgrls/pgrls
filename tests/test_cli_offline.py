@@ -1881,6 +1881,11 @@ def test_a_temporary_table_still_there_still_hides_the_name(kept):
     ("CREATE SCHEMA app;\nALTER SCHEMA app RENAME TO app2;\n", "renames a schema"),
     # psql may connect as the role a schema is made for.
     ("CREATE SCHEMA AUTHORIZATION postgres;\nCREATE TABLE x (id int);\n", "for a role"),
+    ("CREATE SCHEMA app;\nALTER SCHEMA app OWNER TO app;\nCREATE TABLE x (id int);\n",
+     "for a role"),
+    ("CREATE SCHEMA app AUTHORIZATION CURRENT_USER;\nCREATE TABLE x (id int);\n", "for a role"),
+    ("CREATE SCHEMA AUTHORIZATION CURRENT_USER;\n", "connects as"),
+    ("CREATE SCHEMA AUTHORIZATION SESSION_USER CREATE TABLE x (id int);\n", "connects as"),
     ("BEGIN;\nCREATE TABLE x (id int);\nPREPARE TRANSACTION 'x';\n", "PREPARE TRANSACTION"),
 ])
 def test_a_search_path_pgrls_cannot_follow_is_refused(sql, why):
