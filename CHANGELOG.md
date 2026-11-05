@@ -107,10 +107,11 @@ breaking changes — they will be called out in this file.
   attaches with `ALTER TABLE … ATTACH PARTITION` is now its parent's
   partition (`DETACH PARTITION` undoes it), not a standalone table with a
   false SEC001 — when the child and parent were created before the ATTACH
-  (one dropped and created again after it — by `DROP TABLE`, with its
-  schema, by `DROP OWNED` — is a table of its own, a `CREATE TABLE … AS` too,
-  which a DROP before it removed; a `CREATE … IF NOT EXISTS` of it while it
-  is there changes nothing), and it
+  (one created again after it is a table of its own, a `CREATE TABLE … AS`
+  too, which a DROP before it removed; a `CREATE … IF NOT EXISTS` of it
+  changes nothing when no DROP of a table, schema, type, domain or extension,
+  `DROP OWNED` or rename of a relation lies between, which could have taken
+  it), and it
   follows its parent through a rename. A partition's parents outside the
   linted schemas (`--schemas`, else `[database] schemas`, in the LSP too)
   are left out of the model, as live lint does not see them, so the child's

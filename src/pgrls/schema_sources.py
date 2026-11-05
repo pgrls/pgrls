@@ -559,30 +559,21 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     # still attaches. Two passes keep that order-independent.
     tables: dict[tuple[str, str], _TableBuilder] = {}
 
-    # Where a table may go away — a DROP of it or its schema, a DROP OWNED,
-    # a rename of it — so a CREATE … IF NOT EXISTS of one still there is told
-    # from a re-create.
-    drops: dict[tuple[str, str], list[int]] = {}
-    gone_any: list[int] = []  # DROP OWNED: any table
-    gone_schema: dict[str, list[int]] = {}
-    for index, raw in enumerate(statements):
-        stmt = raw.stmt
-        if isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_TABLE:
-            for namelist in stmt.objects or ():
-                if parts := _drop_name_parts(namelist):
-                    drops.setdefault(_drop_table_key(parts, default_schema), []).append(index)
-        elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_SCHEMA:
-            for item in stmt.objects or ():
-                gone_schema.setdefault(str(getattr(item, "sval", "")), []).append(index)
-        elif isinstance(stmt, _pgast.DropOwnedStmt):
-            gone_any.append(index)
-        elif (isinstance(stmt, _pgast.RenameStmt) and stmt.renameType == ObjectType.OBJECT_TABLE
-              and (key := _relation_key(stmt.relation, default_schema)) is not None):
-            drops.setdefault(key, []).append(index)
+    # Where any table may go away — a DROP of a table, schema, type, domain
+    # or extension (CASCADE reaches partitions and typed tables in any
+    # schema), a DROP OWNED, a rename of a relation — so a CREATE … IF NOT
+    # EXISTS of one still there is told from a re-create. Conservative: the
+    # skip only stands with none of these between (pg_dump writes no IF NOT
+    # EXISTS).
+    removals = [
+        index for index, raw in enumerate(statements)
+        if (isinstance(raw.stmt, _pgast.DropStmt) and raw.stmt.removeType in _REMOVING_DROPS)
+        or isinstance(raw.stmt, _pgast.DropOwnedStmt)
+        or (isinstance(raw.stmt, _pgast.RenameStmt) and raw.stmt.relation is not None)
+    ]
 
-    def gone_between(key: tuple[str, str], after: int, before: int) -> bool:
-        return any(after < d < before for d in (
-            *drops.get(key, ()), *gone_schema.get(key[0], ()), *gone_any))
+    def gone_between(after: int, before: int) -> bool:
+        return any(after < r < before for r in removals)
 
     # Pass 1: CREATE TABLE (plus the two data-derived forms).
     for index, raw in enumerate(statements):
@@ -604,8 +595,10 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             if key is None:
                 continue
             if key in tables:
-                # A re-create after a DROP is the table now (see below).
-                if gone_between(key, tables[key].created_at, index):
+                # As a re-CREATE below: the table now, unless an IF NOT
+                # EXISTS skips while it is there.
+                if not (getattr(stmt, "if_not_exists", False)
+                        and not gone_between(tables[key].created_at, index)):
                     tables[key].created_at = index
                 continue
             tables[key] = _TableBuilder(
@@ -626,7 +619,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             # CREATE` keeps the table, `CREATE; CREATE; DROP` removes it.
             # One `IF NOT EXISTS` skips while the table is there (with no
             # DROP since), so an ATTACH / DETACH before it still applies.
-            if stmt.if_not_exists and not gone_between(key, tables[key].created_at, index):
+            if stmt.if_not_exists and not gone_between(tables[key].created_at, index):
                 continue
             tables[key].created_at = index
             continue
@@ -1247,6 +1240,13 @@ def _only_defines(stmt: Any) -> bool:
         _pgast.ViewStmt, _pgast.CreateStmt, _pgast.CreatePolicyStmt, _pgast.AlterPolicyStmt,
         _pgast.RuleStmt, _pgast.CreateTrigStmt, _pgast.CreateDomainStmt,
         _pgast.CreateFunctionStmt, _pgast.AlterFunctionStmt))
+
+
+# DROPs that may take a table with them.
+_REMOVING_DROPS = frozenset({
+    ObjectType.OBJECT_TABLE, ObjectType.OBJECT_SCHEMA, ObjectType.OBJECT_TYPE,
+    ObjectType.OBJECT_DOMAIN, ObjectType.OBJECT_EXTENSION, ObjectType.OBJECT_FOREIGN_TABLE,
+})
 
 
 # Relation kinds a name resolves among.

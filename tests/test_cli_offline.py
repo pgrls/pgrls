@@ -1695,6 +1695,22 @@ def test_a_create_if_not_exists_of_a_table_there_does_not_undo_a_detach():
                + "CREATE TABLE IF NOT EXISTS s.c (k int);\n")
         parents = {t.name: t.partition_of for t in schema_from_sql(sql).tables}
         assert parents["c"] is None, gone
+    # ... and so is one a DROP of an ancestor, a type or an extension may have
+    # taken, or a CREATE TABLE ... AS of the name.
+    for gone in ("DROP TABLE public.top;\n", "DROP TYPE ty CASCADE;\n", "DROP EXTENSION hstore;\n",
+                 "ALTER INDEX public.c RENAME TO d;\n"):
+        sql = ("CREATE TABLE public.top (k int) PARTITION BY LIST (k);\n"
+               "CREATE TABLE public.p PARTITION OF public.top FOR VALUES IN (1) PARTITION BY LIST (k);\n"
+               "CREATE TABLE public.c (k int);\n"
+               "ALTER TABLE public.p ATTACH PARTITION public.c FOR VALUES IN (1);\n" + gone
+               + "CREATE TABLE IF NOT EXISTS public.c (k int);\n")
+        parents = {t.name: t.partition_of for t in schema_from_sql(sql).tables}
+        assert parents["c"] is None, gone
+    sql = ("CREATE TABLE public.p (k int) PARTITION BY LIST (k);\nCREATE TABLE public.c (k int);\n"
+           "ALTER TABLE public.p ATTACH PARTITION public.c FOR VALUES IN (1);\n"
+           "CREATE TABLE public.c AS SELECT 1 AS k;\n")
+    parents = {t.name: t.partition_of for t in schema_from_sql(sql).tables}
+    assert parents["c"] is None
     # ... nor an ATTACH.
     sql = ("CREATE TABLE public.p (k int) PARTITION BY LIST (k);\nCREATE TABLE public.c (k int);\n"
            "ALTER TABLE public.p ATTACH PARTITION public.c FOR VALUES IN (1);\n"
