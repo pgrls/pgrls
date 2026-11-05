@@ -304,6 +304,9 @@ def test_a_predicate_too_deep_for_the_stack_needs_review() -> None:
     sys.setrecursionlimit(300)
     try:
         result = compare_predicates(parse_expr("x = 1"), head)
+        # ... while one that did not change is no change.
+        same = compare_predicates(deep, deep)
     finally:
         sys.setrecursionlimit(limit)
     assert result == "requires_review"
+    assert same == "unchanged"

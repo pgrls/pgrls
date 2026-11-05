@@ -874,7 +874,11 @@ are a sound, self-sufficient witness; when the leak depends on an opaque
 value (a function call, a `current_setting(...)` GUC, a `CASE`, or a
 `COALESCE` it cannot model exactly), or on a column being NOT NULL that the
 predicates only test for NULL, pgrls prints the label-only DANGEROUS verdict
-rather than a row that would not actually leak.
+rather than a row that would not actually leak. A function the predicates
+call is taken to return one value wherever the same call appears — true of
+a STABLE or IMMUTABLE function and of every built-in but the VOLATILE ones
+(`random()`, `clock_timestamp()`, …), which pgrls knows; a user-defined
+VOLATILE function (PERF002 flags one) can hide a loosening.
 
 See [AGENTS.md](AGENTS.md) for the full classification table and AST
 pattern documentation.

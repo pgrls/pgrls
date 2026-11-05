@@ -632,6 +632,16 @@ def is_builtin_current_setting(node: Any) -> bool:
     return qualified in ("current_setting", "pg_catalog.current_setting")
 
 
+def has_literal_setting_name(node: Any) -> bool:
+    """Whether a ``current_setting`` call names its setting by a string
+    literal (through any cast), not by a column or other expression."""
+    name = (node.args or (None,))[0]
+    while isinstance(name, TypeCast):
+        name = name.arg
+    return (isinstance(name, A_Const) and not name.isnull
+            and isinstance(getattr(name, "val", None), String))
+
+
 def is_never_null_current_setting(node: Any) -> bool:
     """True iff `node` is a builtin ``current_setting`` call that can
     NEVER return NULL — so an ``IS NULL`` test on it is a dead disjunct,
@@ -660,7 +670,9 @@ def is_never_null_current_setting(node: Any) -> bool:
     if not is_builtin_current_setting(node):
         return False
     args = node.args
-    if not args:
+    if not args or not has_literal_setting_name(node):
+        # `current_setting` is STRICT: a name read from a column is NULL
+        # where the column is.
         return False
     if len(args) == 1:
         return True

@@ -148,7 +148,9 @@ def compare_predicates(
         base_canon = _canon(base_node)
         head_canon = _canon(head_node)
     except RecursionError:
-        return "requires_review"  # nested past the stack (Postgres takes it)
+        # Nested past the stack (Postgres takes it).
+        same = base_sql is head_sql or (isinstance(base_sql, str) and base_sql == head_sql)
+        return "unchanged" if same else "requires_review"
 
     if base_canon == head_canon:
         return "unchanged"

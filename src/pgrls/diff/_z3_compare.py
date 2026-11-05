@@ -125,7 +125,11 @@ from pglast.enums import (
 )
 from pglast.stream import RawStream
 
-from pgrls.ast_utils import func_name_parts, is_never_null_current_setting
+from pgrls.ast_utils import (
+    func_name_parts,
+    has_literal_setting_name,
+    is_never_null_current_setting,
+)
 
 
 # Comparison operator strings appearing in `A_Expr.name[0].sval` for
@@ -198,6 +202,13 @@ _BOOL_TYPES = frozenset({"bool", "boolean"})
 # requires_review, the safe direction). Single source of truth so the
 # minting sites and that guard cannot drift. (R15 #3)
 _OPAQUE_PREFIX = "_opaque__"
+# Built-in VOLATILE calls (PERF002's set and kin): each call returns its own
+# value, so two of the same text are not one value. A user function's
+# volatility is not known here: it is taken to be STABLE.
+_VOLATILE_CALL = re.compile(
+    r"(?<![\w.\"])(?:pg_catalog\.)?(?:random|random_normal|clock_timestamp|timeofday"
+    r"|nextval|setval|gen_random_uuid|uuidv4|uuidv7|pg_backend_pid)\s*\(",
+    re.IGNORECASE)
 _NULLFLAG_PREFIX = "_nullflag__"
 # Cross-tenant verifier (`prove_cross_tenant_isolation`) only: the free,
 # NON-NULL symbol that stands for an authenticated session's own tenant
@@ -230,6 +241,7 @@ class _Context:
         # variable, enabling implication checks across predicates
         # that reference identical opaque expressions.
         self._opaque_vars: dict[str, Any] = {}
+        self._volatile_calls = 0
         # Kleene three-valued null-flags, keyed per column / opaque-expr.
         # Decl names are
         # prefixed `_nullflag__` and never land in `_vars`, so
@@ -304,7 +316,9 @@ class _Context:
         """Return a Z3 free variable for an opaque expression keyed by
         its canonical shape. Bound to ``sort`` on first use; subsequent
         calls with a different sort return None (type-conflict abort).
+        An expression with a volatile call gets a variable of its own.
         """
+        key = self._unshared(key)
         existing = self._opaque_vars.get(key)
         if existing is None:
             var = z3.Const(f"{_OPAQUE_PREFIX}{key}", sort)
@@ -333,7 +347,13 @@ class _Context:
         """``null_flag`` of the opaque expression keyed ``key`` — under the
         reserved ``_opaque__`` prefix, so it never aliases the null-flag of a
         column whose (quoted) name happens to equal ``key``."""
-        return self.null_flag(f"{_OPAQUE_PREFIX}{key}")
+        return self.null_flag(f"{_OPAQUE_PREFIX}{self._unshared(key)}")
+
+    def _unshared(self, key: str) -> str:
+        if _VOLATILE_CALL.search(key) is None:
+            return key
+        self._volatile_calls += 1
+        return f"{key} #volatile{self._volatile_calls}"
 
     def is_real_column(self, name: str) -> bool:
         """True iff `name` is a real column var (not a null/opaque marker).
@@ -906,6 +926,10 @@ def _is_anon_null_leaf(node: Any, auth_funcs: set[str]) -> bool:
         # valid and false-fire (mirrors SEC004 via the shared guard). Only
         # the two-arg current_setting(name, true) is NULLable under anon.
         if is_never_null_current_setting(node):
+            return False
+        if _is_builtin_current_setting_call(node) and not has_literal_setting_name(node):
+            # A name read from a column: neither the session's identity nor
+            # NULL under anon, but whatever setting the row names.
             return False
         if qualified in auth_funcs:
             return True

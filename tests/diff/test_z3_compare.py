@@ -1280,6 +1280,34 @@ def test_wrapping_an_auth_call_is_no_change(base, head) -> None:
     assert _classify(head, base) == "semantic_equivalent"
 
 
+@pytest.mark.parametrize("head", [
+    # `current_setting` is STRICT: a name read from a column is NULL where
+    # the column is, whatever the form.
+    "kind = 'public' OR current_setting(cfg) IS NULL",
+    "kind = 'public' OR current_setting(cfg, false) IS NULL",
+    "kind = 'public' OR (SELECT current_setting(cfg)) IS NULL",
+    # Two calls of a built-in VOLATILE function are two values.
+    "kind = 'public' OR (random() IS NULL AND random() IS NOT NULL)",
+    "kind = 'public' OR (clock_timestamp() < '2020-01-01' "
+    "AND clock_timestamp() >= '2020-01-01')",
+    "kind = 'public' OR ((SELECT gen_random_uuid()) = x AND (SELECT gen_random_uuid()) <> x)",
+])
+def test_a_value_that_can_differ_is_not_taken_as_one(head) -> None:
+    assert _classify("kind = 'public'", head) not in ("semantic_equivalent", "semantic_tightened")
+
+
+def test_a_setting_named_by_a_column_is_no_identity() -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    # NULL where the column is, so anon reads that row; and the setting the
+    # row names, not the session's tenant.
+    for using in ("tenant_id = (SELECT auth.uid()) OR current_setting(cfg) IS NULL",
+                  "tenant_id = (SELECT auth.uid()) OR current_setting(cfg, false) IS NULL"):
+        assert prove_anon_isolation(parse_expr(using))[0] == "leak", using
+    for using in ("tenant_id = current_setting(s)", "tenant_id = current_setting(s, true)"):
+        assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated", using
+
+
 def test_a_scalar_select_of_an_auth_call_still_unwraps() -> None:
     from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
 
