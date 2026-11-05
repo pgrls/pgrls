@@ -4543,11 +4543,12 @@ def verify(
 
     The `anon` and `cross-tenant` modes are complementary: the inverted `auth.uid() IS NULL OR …`
     policy is an anon LEAK but cross-tenant PROVEN. Unlike `pgrls lint`
-    (heuristic findings) this is a soundness proof: it never reports a leak it
-    the policy predicate does not admit (or, for the anonymous-role RLS
-    exemption — BYPASSRLS/superuser, or the table owner's privileges without
-    FORCE — that Postgres does not grant), and never
-    reports isolated unless Z3 proves it or Postgres default-denies outright. The provers reason about the policy predicate and the policy's
+    (heuristic findings) this is a soundness proof: it never reports isolated
+    unless Z3 proves it or Postgres default-denies outright. A leak with a
+    witness row is one the policy predicate admits (or, for the anonymous-role
+    RLS exemption — BYPASSRLS/superuser, or the table owner's privileges
+    without FORCE — that Postgres grants); a conditional leak (no single row)
+    can rest on a value the prover treats as opaque and may over-report. The provers reason about the policy predicate and the policy's
     TO roles, not about table GRANTs, so a predicate admitting every row on a
     table anon cannot SELECT is still a LEAK (an over-report in the safe
     direction; --mode reachability is where the grant is decided). Exits

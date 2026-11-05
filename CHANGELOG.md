@@ -89,7 +89,9 @@ breaking changes — they will be called out in this file.
   auth.uid() OR f + 0.5 = f` (true for `Infinity`) from PROVEN to LEAK, and
   `n < '-0.10000000000000000001'::numeric AND n > '-0.10000000000000000002'::numeric`,
   which the float reading made an empty range, from PROVEN to LEAK under
-  `--mode anon`. A leak found through a decimal no `float4` holds (`… OR n <
+  `--mode anon`. Integer arithmetic on an unset setting now keeps the
+  setting unset, so `current_setting('app.t')::int + 0 = 5 OR … <> 5` is
+  no longer a false SEC038 (Postgres raises). A leak found through a decimal no `float4` holds (`… OR n <
   0.1`) is now unverified, so `verify` exits 0 on it. The cost runs the
   other way too: like a function call already, such a cast or
   arithmetic beside an `OR` is reported as a conditional LEAK (no witness

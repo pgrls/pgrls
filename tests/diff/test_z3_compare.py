@@ -1102,6 +1102,17 @@ def test_arithmetic_z3_does_not_compute_as_postgres_proves_nothing(using) -> Non
     assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated"
 
 
+@pytest.mark.parametrize("using", [
+    # An unset GUC raises before its NULL reaches `IS NULL` / COALESCE.
+    "(current_setting('app.v', true)::numeric % current_setting('app.u')::numeric) IS NULL",
+    "COALESCE(current_setting('app.v', true)::numeric % current_setting('app.u')::numeric, 0.5) "
+    "= ANY(ARRAY[0.5])",
+    "current_setting('app.t')::int + 0 = 5 OR current_setting('app.t')::int + 0 <> 5",
+])
+def test_arithmetic_on_an_unset_guc_is_not_an_anonymous_leak(using) -> None:
+    assert _anon(using) is None
+
+
 def test_arithmetic_beside_the_identity_keeps_the_proof() -> None:
     from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
 
@@ -1119,6 +1130,7 @@ def test_a_huge_exponent_is_refused_at_once() -> None:
     start = time.monotonic()
     assert _exact_real("1e999999999") is None
     assert _exact_real("1e" + "9" * 5000) is None  # past int()'s digit limit
+    assert _exact_real("1e+00005") is not None  # a sign and zeros are not digits
     assert _classify("x < 1e999999999", "x < 2e999999999") is None
     assert time.monotonic() - start < 5
 

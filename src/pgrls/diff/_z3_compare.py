@@ -44,11 +44,12 @@ decide; a cast that may change the value, such as ``varchar(3)`` or
 ``float4``, or of a function's result, is an opaque value of its own), a
 decimal literal only when a ``float4`` holds it exactly (otherwise a
 ``numeric``, ``float8`` and ``float4`` column read it differently),
-AND / OR / NOT, ``IS [NOT] NULL``, ``IS [NOT] DISTINCT FROM``, ``[NOT]
-BETWEEN``, ``= ANY (ARRAY[…])`` / ``IN (…)`` over literals, casts,
-``COALESCE``, and function calls (an opaque value per distinct call, shared
-by base and head). On the diff path a ``CASE``, or a ``COALESCE`` it cannot
-model exactly, is an opaque value too. An opaque call or CASE is text:
+AND / OR / NOT, ``IS [NOT] NULL``, ``IS [NOT] DISTINCT FROM`` and ``[NOT]
+BETWEEN`` (on the diff path), ``= ANY (ARRAY[…])`` / ``IN (…)`` over
+literals, casts, ``COALESCE``, and function calls (an opaque value per
+distinct call, shared by base and head). On the diff path a ``CASE``, or a
+``COALESCE`` it cannot model exactly, is an opaque value too. An opaque
+call, CASE or COALESCE is text:
 compared with something else it translates only through a cast; an opaque
 cast or arithmetic result takes its own type. Anything else
 returns None and the caller
@@ -433,7 +434,8 @@ def _exact_real(text: str) -> Any:
     m = re.fullmatch(r"\s*[+-]?(\d+\.?\d*|\.\d+)(?:[eE]([+-]?\d+))?\s*", text, re.ASCII)
     # A float4 holds nothing past 1e39 or with more digits than its exact
     # subnormals have; `Fraction` would build `1e999999999` exactly first.
-    if (m is None or len(m.group(1)) > 200 or len(m.group(2) or "") > 5
+    if (m is None or len(m.group(1)) > 200
+            or len((m.group(2) or "").lstrip("+-").lstrip("0")) > 5
             or abs(int(m.group(2) or 0)) > 200):
         return None
     exact = fractions.Fraction(text.strip())
@@ -643,7 +645,8 @@ def _decode_model(model: Any, ctx: _Context) -> dict[str, object]:
         if sort == z3.IntSort():
             row[name] = value.as_long()
         elif sort == z3.StringSort():
-            # `as_string` escapes every character past U+00FF as `\\u{…}`.
+            # `as_string` escapes every character past U+00FF, and the
+            # backslash `_z3_string` escaped, as `\\u{…}`.
             row[name] = re.sub(r"\\u\{([0-9a-fA-F]+)\}",
                                lambda m: chr(int(m.group(1), 16)), value.as_string())
         elif sort == z3.BoolSort():
@@ -1697,12 +1700,14 @@ def _anon_binop(
     if arithmetic_fn is not None and (sorts != {z3.IntSort()} or op in ("/", "%")):
         # Off the diff path too, a result Z3 does not compute as Postgres
         # does — on reals (no NaN / ±Infinity, no rounding), `/` and `%`
-        # (Postgres truncates) — is a fresh value of its own each time
-        # (not keyed by its rendering, which recursed a second time down a
-        # deep chain; a fresh value only frees it further). Arithmetic on anything else — text standing for
-        # a timestamp or an interval, whose order is not text's —
-        # abstains, as the diff path did above.
-        if not sorts <= {z3.IntSort(), z3.RealSort()}:
+        # (Postgres truncates) — is a fresh value of its own each time (not
+        # keyed by its rendering, which recursed a second time down a deep
+        # chain; a fresh value only frees it further). Arithmetic on
+        # anything else — text standing for a timestamp or an interval,
+        # whose order is not text's — abstains, as the diff path did above.
+        if not sorts <= {z3.IntSort(), z3.RealSort()} or left.unset or right.unset:
+            # An unset GUC raises before its NULL could reach an `IS NULL`
+            # or a COALESCE, which read only the null-flag.
             return None
         sort = z3.RealSort() if z3.RealSort() in sorts else z3.IntSort()
         return _Val(
@@ -1720,7 +1725,8 @@ def _anon_binop(
             # where now()/interval resolve to opaque String operands).
             # Z3 raises a plain TypeError, not Z3Exception. NO-OP.
             return None
-        return _Val(value=value, is_null=z3.Or(left.is_null, right.is_null))
+        return _Val(value=value, is_null=z3.Or(left.is_null, right.is_null),
+                    unset=left.unset or right.unset)
 
     return None  # unreachable (guarded above) — satisfies the type checker
 
