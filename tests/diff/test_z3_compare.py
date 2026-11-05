@@ -533,6 +533,10 @@ def test_an_integer_literal_does_not_make_its_column_an_integer():
                      "lvl <= current_setting('a.b')::int") == "semantic_loosened"
     assert _classify("t >= current_setting('a.b')::int OR t = 1",
                      "NOT (t < current_setting('a.b')::int) OR t = 1") == "semantic_equivalent"
+    # `x = ANY(ARRAY['US '])` compares as text (a `text[]`), `x = 'US '` as
+    # `x`'s type: a `char(n)` or `citext` `x` reads them differently.
+    for left in ("code::bpchar", "email::citext", "code"):
+        assert _classify(f"{left} = ANY (ARRAY['US '])", f"{left} = 'US '") is None, left
     # In an `IN` list the value takes the list's type (a `real` column's
     # float4), not the column's, so it is not the same comparison.
     assert _classify("amount = current_setting('app.v')::numeric OR amount = 1",

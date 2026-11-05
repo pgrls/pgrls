@@ -2061,6 +2061,14 @@ def _anon_any_array(
         return None
     if not elements:
         return None
+    if ctx.any_session and node.kind != A_Expr_Kind.AEXPR_IN and (
+            _has_lossy_cast(node.lexpr) or any(
+                isinstance(e, A_Const) and isinstance(getattr(e, "val", None), String)
+                for e in elements)):
+        # In a diff, `x = ANY(ARRAY['US '])` is no `x = 'US '`: the bare
+        # literals make a `text[]`, so a `char(n)` or `citext` `x` (which the
+        # text may not show) compares as text there, and as itself here.
+        return None
     rounded = any(_rounds_its_kin(e, ctx) for e in elements) or (
             node.kind == A_Expr_Kind.AEXPR_IN and _rounds_its_kin(node.lexpr, ctx)) or (
             _blanks_its_kin([node.lexpr, *elements], ctx))
