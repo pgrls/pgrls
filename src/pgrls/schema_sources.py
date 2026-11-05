@@ -44,7 +44,9 @@ from pglast.enums.parsenodes import (
     ConstrType,
     GrantTargetType,
     ObjectType,
+    DiscardMode,
     RoleSpecType,
+    VariableSetKind,
 )
 from pglast.stream import RawStream
 
@@ -447,15 +449,13 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             ).lower().replace("_", "").replace("-", "") not in {*_UTF8_ENCODINGS, "6", "0"}
             for opt in raw.stmt.options or ())
         for raw in statements
-    ) and not any(
-        # pg_dump -E UTF8 --create sets it back right after the connect.
-        end(raw) > connect
-        and isinstance(raw.stmt, _pgast.VariableSetStmt)
-        and (raw.stmt.name or "").lower() == "client_encoding" and raw.stmt.args
-        and re.sub(r"[^a-z0-9]", "", str(getattr(raw.stmt.args[0].val, "sval", "")).lower())
-        in _UTF8_ENCODINGS
-        and sql[connect:end(raw)].isascii()
-        for raw in statements
+    ) and not (
+        # pg_dump -E UTF8 --create sets it back right after the connect, for
+        # the session, and nothing after puts it back.
+        any(end(raw) > connect and sql[connect:end(raw)].isascii()
+            and _sets_client_encoding_utf8(raw.stmt) for raw in statements)
+        and not any(end(raw) > connect and _resets_client_encoding(raw.stmt)
+                    for raw in statements)
     ):
         # psql reads what follows in the new database's encoding.
         raise SchemaSourceError(
@@ -982,6 +982,34 @@ _DATABASE_LEVEL_STATEMENTS = frozenset({
 })
 
 
+def _sets_client_encoding_utf8(stmt: Any) -> bool:
+    """Whether `stmt` sets the session's client encoding to UTF8 / SQL_ASCII
+    (not `SET LOCAL`, which lasts to the end of the transaction at most)."""
+    return (
+        isinstance(stmt, _pgast.VariableSetStmt)
+        and (stmt.name or "").lower() == "client_encoding"
+        and stmt.kind == VariableSetKind.VAR_SET_VALUE and not stmt.is_local
+        and bool(stmt.args)
+        and re.sub(r"[^a-z0-9]", "", str(getattr(stmt.args[0].val, "sval", "")).lower())
+        in _UTF8_ENCODINGS
+    )
+
+
+def _resets_client_encoding(stmt: Any) -> bool:
+    """Whether `stmt` may put the client encoding back to the database's:
+    `RESET`, `SET … TO DEFAULT` or `SET LOCAL` of it, `RESET ALL`,
+    `DISCARD ALL`."""
+    if isinstance(stmt, _pgast.DiscardStmt):
+        return bool(stmt.target == DiscardMode.DISCARD_ALL)
+    if not isinstance(stmt, _pgast.VariableSetStmt):
+        return False
+    if stmt.kind == VariableSetKind.VAR_RESET_ALL:
+        return True
+    return (stmt.name or "").lower() == "client_encoding" and (
+        stmt.is_local or stmt.kind in (VariableSetKind.VAR_SET_DEFAULT,
+                                       VariableSetKind.VAR_RESET))
+
+
 def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
     """Refuse the meta-commands pgrls cannot model (raising
     `SchemaSourceError`); the offset of each `\\connect` — every one must
@@ -1088,12 +1116,14 @@ def _check_lexer_settings(statements: Any, *, non_ascii: bool) -> None:
     # A rule on pg_settings sets what an UPDATE of it names, through a view
     # over it too: the relations the SQL defines over it, by name.
     over = {"pg_settings"}
+    # A view inside CREATE SCHEMA counts too.
+    views = [(view.view.relname, list(_subnodes(view.query)))
+             for nodes in trees for view in nodes if isinstance(view, _pgast.ViewStmt)]
     while True:
         more = {
-            raw.stmt.view.relname for raw, nodes in zip(statements, trees)
-            if isinstance(raw.stmt, _pgast.ViewStmt)
-            and raw.stmt.view.relname not in over
-            and any(isinstance(n, _pgast.RangeVar) and n.relname in over for n in nodes)
+            name for name, reads in views
+            if name not in over
+            and any(isinstance(n, _pgast.RangeVar) and n.relname in over for n in reads)
         }
         if not more:
             break

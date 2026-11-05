@@ -1760,6 +1760,17 @@ def test_pg_dumpall_output_is_refused(tmp_path):
     # psql reads what follows in the new database's encoding ...
     ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nCREATE TABLE \"donn\u00e9es\" (id int);\n",
      "encoding other than UTF8"),
+    # ... and a SET that does not last for the session, or one put back, is
+    # no set-back.
+    ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nSET LOCAL client_encoding = 'UTF8';\n"
+     "CREATE TABLE \"donn\u00e9es\" (id int);\n", "encoding other than UTF8"),
+    ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nSET client_encoding = 'UTF8';\n"
+     "RESET ALL;\nCREATE TABLE \"donn\u00e9es\" (id int);\n", "encoding other than UTF8"),
+    ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nSET client_encoding = 'UTF8';\n"
+     "SET client_encoding TO DEFAULT;\nCREATE TABLE \"donn\u00e9es\" (id int);\n",
+     "encoding other than UTF8"),
+    ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nSET client_encoding = 'UTF8';\n"
+     "DISCARD ALL;\nCREATE TABLE \"donn\u00e9es\" (id int);\n", "encoding other than UTF8"),
     # The template's objects are copied into the database.
     ("CREATE DATABASE d TEMPLATE base;\n\\connect d\nCREATE TABLE t (id int);\n", "template"),
     # pglast stops reading at a NUL; psql drops only the rest of its line.
@@ -1870,6 +1881,8 @@ def test_a_skipped_line_must_lie_between_tokens():
     ("CREATE VIEW s AS SELECT * FROM pg_settings;\nCREATE VIEW s2 AS SELECT * FROM s;\n"
      "UPDATE s2 SET setting = 'on' WHERE name = 'transform_null_equals';\n", "pg_settings"),
     ("CREATE VIEW s AS SELECT * FROM pg_settings;\nALTER VIEW s RENAME TO z;\n", "pg_settings"),
+    ("CREATE SCHEMA s CREATE VIEW v AS SELECT * FROM pg_catalog.pg_settings;\n"
+     "UPDATE s.v SET setting = 'on' WHERE name = 'transform_null_equals';\n", "pg_settings"),
     ("SET client_encoding = 'UTF8';\n", False),
     ("SET client_encoding = 'LATIN1';\n", False),
     ("SET standard_conforming_strings = on;\n", False),
