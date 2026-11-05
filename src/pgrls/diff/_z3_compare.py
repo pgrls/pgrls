@@ -126,9 +126,9 @@ from pglast.enums import (
     SQLValueFunctionOp,
     SubLinkType,
 )
-from pglast.stream import RawStream
 
 from pgrls.ast_utils import (
+    canonical_key,
     func_name_parts,
     has_literal_setting_arguments,
     is_never_null_current_setting,
@@ -859,9 +859,10 @@ def _typename_segments_to_sort(typename: Any) -> Any:
 
 
 def _canon(node: Any) -> str:
-    """Canonical RawStream rendering of an AST node."""
-    rendered: str = RawStream()(node)
-    return rendered
+    """``canonical_key``: the node's faithful SQL, tagged with an AST digest
+    only when no rendering parses back to it — so two different expressions
+    never share a Z3 variable."""
+    return canonical_key(node)
 
 
 _Z3Result = Literal["semantic_equivalent", "semantic_tightened", "semantic_loosened"]
@@ -3398,7 +3399,8 @@ def cross_tenant_session_identity(
     prover verified (a LEAK verdict guarantees exactly one pair). The session
     SQL is the canonical rendering of the auth expression the discriminator is
     compared to — recovered from the session symbol's decl name (keyed by
-    ``_canon`` = the RawStream SQL) — e.g. ``auth.uid()`` or
+    ``_canon`` = ``canonical_key``: the faithful SQL, which may be
+    parenthesized or, rarely, end in an ``/* ast … */`` tag) — e.g. ``auth.uid()`` or
     ``current_setting('app.tenant_id', TRUE)``.
 
     Returns None when Z3 is unavailable, the predicate is untranslatable, or
