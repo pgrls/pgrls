@@ -117,15 +117,18 @@ breaking changes — they will be called out in this file.
 - **Offline: a table made under a name the SQL used before is a table of
   its own.** A name dropped (with its schema too), or renamed away, and
   made again — by `CREATE TABLE`, `CREATE TABLE … AS` or `SELECT … INTO` —
-  holds a new table, with the new CREATE's columns and links; what the SQL
-  did to the one before (its RLS flags, policies, grants, constraint
-  renames, a DETACH) stays with that one, gone or renamed. Each statement
-  reaches the table its name held when it ran. The old RLS carried over
-  (hiding SEC001 on a rebuild migration), and a table made under a name
-  renamed away was lost. `DROP SCHEMA` takes its tables, and an `IF NOT
-  EXISTS` over a view's or sequence's name makes no table. Not yet
-  followed: a parent's drop taking its partitions (or, with CASCADE, its
-  children), and a drop by `DROP OWNED` or code.
+  holds a new table, with the new CREATE's columns and links (a partition
+  or child of it takes its columns); what the SQL did to the one before
+  (its RLS flags, policies, grants, constraint renames, a DETACH, a
+  rename) stays with that one, gone or renamed, a table there before the
+  SQL (a rebuild migration's) included. The old RLS carried over (hiding
+  SEC001 on a rebuild migration), and a table made under a name renamed
+  away was lost. `DROP SCHEMA` takes its tables, a view, sequence,
+  materialized view or foreign table dropped frees its name, and an `IF
+  NOT EXISTS` over a view's or sequence's name makes no table (after code,
+  a rename or a DROP between, it is taken to). Not yet followed: a
+  parent's drop taking its partitions (or, with CASCADE, its children), and
+  a drop by `DROP OWNED` or code.
 - **Offline analysis says that an extension's tables are not seen.** pg_dump
   writes them as `CREATE EXTENSION` alone (PostGIS's `public.spatial_ref_sys`
   has RLS off), so `--sql-file` lint and MCP `sql=` cannot report on them,
