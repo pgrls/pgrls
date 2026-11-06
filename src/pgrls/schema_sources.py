@@ -572,8 +572,12 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         or _runs_code(raw.stmt)  # a DROP in a DO block, a procedure, a function
     ]
 
-    def gone_between(after: int, before: int) -> bool:
-        return any(after < r < before for r in removals)
+    def gone_between(after: int, before: int, key: tuple[str, str] | None = None) -> bool:
+        # (A rename takes away only the relation it renames.)
+        return any(after < r < before and not (
+            key is not None and isinstance(statements[r].stmt, _pgast.RenameStmt)
+            and _relation_key(statements[r].stmt.relation, default_schema) != key)
+            for r in removals)
 
     # Pass 1: CREATE TABLE (plus the two data-derived forms).
     # (Stepped a statement behind: as each runs, it holds what came before.)
@@ -654,7 +658,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             # CREATE` keeps the table, `CREATE; CREATE; DROP` removes it.
             # One `IF NOT EXISTS` skips while the table is there (with no
             # DROP since), so an ATTACH / DETACH before it still applies.
-            if stmt.if_not_exists and not gone_between(current.created_at, index):
+            if stmt.if_not_exists and not gone_between(current.created_at, index, key):
                 continue
             previous = current.created_at
             current.created_at = index
@@ -669,9 +673,16 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             new_inherits = [] if partition else again
             if stmt.if_not_exists and not _dropped_between(statements, key, previous, index,
                                                            default_schema):
-                if current.partition_of != new_parent:
+                def same(p: tuple[str, str]) -> bool:
+                    # (A parent name renamed away or dropped between names
+                    # another table for each.)
+                    return not (_renamed_between(statements, p, previous, index, default_schema)
+                                or _dropped_between(statements, p, previous, index,
+                                                    default_schema))
+                if current.partition_of != new_parent or (
+                        new_parent is not None and not same(new_parent)):
                     new_parent = None
-                new_inherits = [p for p in new_inherits if p in current.inherits]
+                new_inherits = [p for p in new_inherits if p in current.inherits and same(p)]
             if new_parent is not None and _is_below(tables, new_parent, key):
                 new_parent = None  # an ATTACH would refuse the cycle
             if _renamed_between(statements, key, previous, index, default_schema):
@@ -697,8 +708,10 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             )
             if p is not None
         ]
-        # (Not itself: an IF NOT EXISTS over another relation of its name.)
-        parents = [p for p in parents if p != key]
+        # (Not itself, nor one below it: an IF NOT EXISTS over another
+        # relation of its name, or over a table the SQL did not make, may
+        # have been a no-op that set no link.)
+        parents = [p for p in parents if p != key and not _is_below(tables, p, key)]
         if parents and getattr(stmt, "partbound", None) is not None:
             builder.partition_of = parents[0]
         elif parents:
@@ -2091,8 +2104,14 @@ def _move_table(
         tables[new] = builder
     # Its partitions and children follow it to the new name — those created
     # before the rename; a later one names a new table that took the old name.
-    for other in tables.values():
-        if other.made_at >= index >= 0:
+    if builder is None or builder.made_at > index >= 0:
+        # A rename onto a name a table already holds cannot run: there was
+        # nothing to rename (`IF EXISTS`).
+        held = tables.get(new)
+        if held is not None and not held.made_at > index >= 0:
+            return
+    for key, other in tables.items():
+        if other.made_at >= index >= 0 or key == new:
             continue
         if other.partition_of == old:
             other.partition_of = new

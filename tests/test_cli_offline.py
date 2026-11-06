@@ -3317,3 +3317,31 @@ def test_an_if_not_exists_over_its_own_parents_name_is_no_cycle():
     # Postgres skips it (the name is a sequence's); pgrls must not crash.
     _tables_of("CREATE SEQUENCE c;\nALTER SEQUENCE c RENAME TO a;\n"
                "CREATE TABLE IF NOT EXISTS a PARTITION OF a FOR VALUES IN (3);\n")
+
+
+def test_a_partition_made_again_after_code_takes_the_new_parent_of_its_name():
+    # The `a` it names is the new one, not the `a` renamed to `b`.
+    tables = _tables_of(
+        "CREATE TABLE a (id int) PARTITION BY RANGE (id);\n"
+        "CREATE TABLE c PARTITION OF a FOR VALUES FROM (0) TO (5);\n"
+        "ALTER TABLE a RENAME TO b;\nCREATE TABLE a (id int) PARTITION BY RANGE (id);\n"
+        "DO $$ BEGIN EXECUTE 'DROP TABLE c'; END $$;\n"
+        "CREATE TABLE IF NOT EXISTS c PARTITION OF a FOR VALUES FROM (0) TO (5);\n")
+    assert tables["c"].partition_of != ("public", "b")
+
+
+@pytest.mark.parametrize("sql", [
+    # A no-op rename onto a name a table holds re-points nothing.
+    "CREATE VIEW c AS SELECT 1 AS id;\nDO $$ BEGIN END $$;\n"
+    "CREATE TABLE IF NOT EXISTS c PARTITION OF b DEFAULT;\nALTER TABLE IF EXISTS b RENAME TO c;\n",
+    # An IF NOT EXISTS over a table the SQL did not make set no link.
+    "CREATE TABLE IF NOT EXISTS b PARTITION OF a FOR VALUES FROM (0) TO (1);\n"
+    "CREATE TABLE a PARTITION OF b DEFAULT;\n",
+])
+def test_valid_sql_makes_no_partition_cycle(sql, tmp_path):
+    from click.testing import CliRunner
+    from pgrls.cli import main
+    path = tmp_path / "m.sql"
+    path.write_text(sql)
+    res = CliRunner().invoke(main, ["lint", "--sql-file", str(path)])
+    assert res.exit_code != 2, res.output
