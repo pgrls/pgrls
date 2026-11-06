@@ -3105,3 +3105,66 @@ def test_offline_constraint_before_a_rebuild_does_not_reach_the_new_table():
         " DROP TABLE docs; CREATE TABLE docs (id int, tenant_id uuid);"
     )
     assert {c.name: c.is_nullable for c in t.column_details}["tenant_id"] is True
+
+
+@pytest.mark.parametrize("sql", [
+    # The RLS flags, policies and grants of a table dropped and made again
+    # are gone with it.
+    "CREATE TABLE public.t (id int);\nALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+    "CREATE POLICY p ON public.t USING (id = 1);\nGRANT SELECT ON public.t TO anon;\n"
+    "DROP TABLE public.t;\nCREATE TABLE public.t (id int);\n",
+    "CREATE SCHEMA x;\nCREATE TABLE x.t (id int);\nALTER TABLE x.t ENABLE ROW LEVEL SECURITY;\n"
+    "DROP SCHEMA x CASCADE;\nCREATE SCHEMA x;\nCREATE TABLE x.t (id int);\n",
+])
+def test_a_table_made_again_after_a_drop_starts_afresh(sql):
+    from pgrls.schema_sources import schema_from_sql
+    (t,) = schema_from_sql(sql, schemas=("public", "x")).tables
+    assert (t.rls_enabled, t.policies, t.grants) == (False, (), ())
+
+
+def test_a_schema_dropped_takes_its_tables():
+    from pgrls.schema_sources import schema_from_sql
+    assert schema_from_sql("CREATE SCHEMA x;\nCREATE TABLE x.t (id int);\n"
+                           "DROP SCHEMA x CASCADE;\n", schemas=("x",)).tables == ()
+
+
+def test_an_empty_search_path_set_names_no_schema():
+    from pgrls.schema_sources import schema_from_sql
+    (t,) = schema_from_sql("CREATE TABLE public.t (id int);\nSET search_path = '';\n"
+                           "ALTER TABLE t ENABLE ROW LEVEL SECURITY;\n").tables
+    assert not t.rls_enabled  # Postgres: relation "t" does not exist
+
+
+def test_a_policy_reading_a_name_with_no_schema_to_find_it_in_is_refused():
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+    with pytest.raises(SchemaSourceError, match="no schema on search_path to find it"):
+        schema_from_sql("CREATE TABLE public.t (id int);\nCREATE TABLE public.u (id int);\n"
+                        "SET search_path = '';\n"
+                        "CREATE POLICY p ON public.t USING (EXISTS (SELECT 1 FROM u));\n")
+
+
+@pytest.mark.parametrize("ending", [
+    "BEGIN;\nCOMMIT AND CHAIN;\nALTER TABLE public.t DISABLE ROW LEVEL SECURITY;\n",
+    "BEGIN;\nROLLBACK AND CHAIN;\nALTER TABLE public.t DISABLE ROW LEVEL SECURITY;\n",
+])
+def test_a_migration_file_left_in_a_chained_transaction_is_refused(tmp_path, ending):
+    res, _ = _migrations_snapshot(tmp_path, {
+        "001_a.sql": "CREATE TABLE public.t (id int);\nALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n",
+        "002_b.sql": ending,
+    })
+    assert res.exit_code != 0 and "ends inside a transaction" in res.output
+
+
+def test_a_migration_file_preparing_a_transaction_is_refused_not_a_crash(tmp_path):
+    res, _ = _migrations_snapshot(tmp_path, {
+        "001_a.sql": "BEGIN;\nCREATE TABLE public.t (id int);\nPREPARE TRANSACTION 'x';\n"})
+    assert res.exit_code == 2 and "PREPARE TRANSACTION" in res.output
+
+
+def test_alter_system_search_path_is_not_followed_in_later_files(tmp_path):
+    res, _ = _migrations_snapshot(tmp_path, {
+        "001_a.sql": "CREATE SCHEMA app;\nALTER SYSTEM SET search_path = app, public;\n"
+                     "SELECT pg_reload_conf();\n",
+        "002_b.sql": "CREATE TABLE t (id int);\n",
+    })
+    assert res.exit_code != 0 and "search_path" in res.output

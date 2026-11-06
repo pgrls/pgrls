@@ -28,6 +28,7 @@ that absence-of-finding is NOT proof.
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
 
 import json
@@ -719,10 +720,45 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
                 if _only_no_inherit_not_null([elt]):
                     builder.no_inherit_not_null.add(col_name)
 
+    # A table dropped and made again is a table of its own: what the SQL did
+    # to the one before (its RLS flags, policies, grants) is gone with it.
+    drops: dict[Any, list[int]] = {}  # a table's key, or a schema's name
+    for index, raw in enumerate(statements):
+        stmt = raw.stmt
+        if isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_SCHEMA:
+            for item in stmt.objects or ():
+                drops.setdefault(getattr(item, "sval", None), []).append(index)
+        elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_TABLE:
+            for n in stmt.objects or ():
+                if _drop_name_parts(n):
+                    drops.setdefault(_drop_table_key(_drop_name_parts(n), default_schema),
+                                     []).append(index)
+    last_drop = {key: max(found) for key, builder in tables.items()
+                 if (found := [i for i in drops.get(key, []) + drops.get(key[0], [])
+                               if i < builder.created_at])}
+
+    def before_last_drop(relation: Any, index: int) -> bool:
+        key = _relation_key(relation, default_schema) if relation is not None else None
+        return key is not None and index < last_drop.get(key, -1)
+
     # Pass 2: ALTER TABLE (RLS toggles), CREATE POLICY, GRANT, RENAME.
     for index, raw in enumerate(statements):
         stmt = raw.stmt
         kind = type(stmt).__name__
+        if kind in ("AlterTableStmt", "CreatePolicyStmt", "AlterPolicyStmt") and \
+                before_last_drop(getattr(stmt, "relation", None) or getattr(stmt, "table", None),
+                                 index):
+            continue
+        if kind == "GrantStmt" and any(isinstance(obj, _pgast.RangeVar)
+                                       and before_last_drop(obj, index)
+                                       for obj in stmt.objects or ()):
+            if all(isinstance(obj, _pgast.RangeVar) and before_last_drop(obj, index)
+                   for obj in stmt.objects or ()):
+                continue
+            stmt = copy.copy(stmt)
+            stmt.objects = tuple(obj for obj in stmt.objects
+                                 if not (isinstance(obj, _pgast.RangeVar)
+                                         and before_last_drop(obj, index)))
         if kind == "AlterTableStmt":
             _apply_alter_table(stmt, tables, default_schema, non_tables=non_tables,
                                stmt_index=index)
@@ -880,10 +916,18 @@ def ends_in_transaction(sql: str) -> bool:
     sql, _ = _split_psql_meta_commands(sql)
     try:
         statements = pglast.parse_sql(sql)
-    except pglast.parser.ParseError:
+        start = _transaction_state(statements)[1]
+    except (pglast.parser.ParseError, SchemaSourceError):
         return False
-    start = _transaction_state(statements)[1]
-    return start is not None and start < len(statements) - 1
+    if start is None:
+        return False
+    # The open transaction holds what follows its BEGIN, or (one an AND
+    # CHAIN opened) what follows the COMMIT / ROLLBACK, at `start`.
+    opener = statements[start].stmt if start < len(statements) else None
+    if isinstance(opener, _pgast.TransactionStmt) and opener.kind in (
+            TransactionStmtKind.TRANS_STMT_BEGIN, TransactionStmtKind.TRANS_STMT_START):
+        start += 1
+    return start < len(statements)
 
 
 def _rolled_back(statements: Any) -> frozenset[int]:
@@ -959,8 +1003,10 @@ def _may_be(owner: str | None, roles: AbstractSet[str | None]) -> bool:
 
 def _sets_for_next_session(stmt: Any) -> tuple[bool, bool]:
     """Whether a statement sets the search_path, and the role, a session
-    started after it begins with (a database's or role's setting)."""
-    if not isinstance(stmt, (_pgast.AlterDatabaseSetStmt, _pgast.AlterRoleSetStmt)):
+    started after it begins with (a database's, a role's, or the server's
+    once reloaded)."""
+    if not isinstance(stmt, (_pgast.AlterDatabaseSetStmt, _pgast.AlterRoleSetStmt,
+                             _pgast.AlterSystemStmt)):
         return False, False
     name = (stmt.setstmt.name or "").lower()
     reset_all = stmt.setstmt.kind == VariableSetKind.VAR_RESET_ALL
@@ -1086,9 +1132,11 @@ class _Resolver:
                     self._set("search_path", self._default(), local=local)
                 elif stmt.kind == VariableSetKind.VAR_SET_VALUE:
                     # Each item is one schema, a quoted string too (Postgres
-                    # quotes it).
+                    # quotes it); an empty one (`SET search_path = ''`) names
+                    # none, no schema having an empty name.
                     self._set("search_path", tuple(
-                        _truncated(str(getattr(a.val, "sval", ""))) for a in stmt.args or ()
+                        item for a in stmt.args or ()
+                        if (item := _truncated(str(getattr(a.val, "sval", ""))))
                     ), local=local)
             elif name in ("role", "session_authorization"):
                 value = (str(getattr(stmt.args[0].val, "sval", ""))
@@ -1164,7 +1212,8 @@ class _Resolver:
 
     def exists(self, schema: str) -> bool:
         if schema in self.unsure or (
-                self.dropped_owned and schema not in self.owners and schema != "public"):
+                self.dropped_owned and schema not in self.owners
+                and schema not in ("public", "pg_catalog")):
             raise SchemaSourceError(
                 "bad_sql",
                 f"the SQL resolves a name on search_path schema {schema!r} after a "
@@ -1476,6 +1525,15 @@ class _Resolver:
             if isinstance(node, _pgast.RangeVar) and not node.schemaname \
                     and node.relname not in ctes:
                 schema, found = self.find(node.relname)
+                if schema == _NOWHERE and not found and not node.relname.startswith("pg_"):
+                    # No schema on the path to find it in, and no catalog's
+                    # (pg_dump leaves `pg_roles` unqualified): Postgres errors.
+                    raise SchemaSourceError(
+                        "bad_sql",
+                        f"the SQL creates a policy reading {node.relname!r} with no "
+                        f"schema on search_path to find it in (Postgres errors); "
+                        f"qualify the names.",
+                    )
                 if found and schema != own:
                     node.schemaname = schema
 
@@ -2094,12 +2152,19 @@ def _column_type(column_def: Any) -> str | None:
 
 def _dropped_between(statements: Any, key: tuple[str, str], after: int, before: int,
                      default_schema: str) -> bool:
-    """Whether a `DROP TABLE` of `key` lies between the two statements."""
-    return any(
-        isinstance(raw.stmt, _pgast.DropStmt) and raw.stmt.removeType == ObjectType.OBJECT_TABLE
-        and any(_drop_table_key(_drop_name_parts(n), default_schema) == key
-                for n in raw.stmt.objects or () if _drop_name_parts(n))
-        for raw in statements[after + 1:before])
+    """Whether a `DROP TABLE` of `key` (or a `DROP SCHEMA` of its schema)
+    lies between the two statements."""
+    return any(_drops(raw.stmt, key, default_schema) for raw in statements[after + 1:before])
+
+
+def _drops(stmt: Any, key: tuple[str, str], default_schema: str) -> bool:
+    if not isinstance(stmt, _pgast.DropStmt):
+        return False
+    if stmt.removeType == ObjectType.OBJECT_SCHEMA:
+        return any(getattr(item, "sval", None) == key[0] for item in stmt.objects or ())
+    return stmt.removeType == ObjectType.OBJECT_TABLE and any(
+        _drop_table_key(_drop_name_parts(n), default_schema) == key
+        for n in stmt.objects or () if _drop_name_parts(n))
 
 
 def _renamed_between(statements: Any, key: tuple[str, str], after: int, before: int,
@@ -2916,6 +2981,12 @@ def _apply_drop(
                 builder.policies = [
                     p for p in builder.policies if p.name != policy_name
                 ]
+    elif remove_type == ObjectType.OBJECT_SCHEMA:
+        # Its tables go with it (CASCADE; without it, only an empty one
+        # drops): one made again later stands.
+        gone = {getattr(item, "sval", None) for item in stmt.objects or ()}
+        for key in [k for k, b in tables.items() if k[0] in gone and b.created_at < stmt_index]:
+            tables.pop(key, None)
     elif remove_type == ObjectType.OBJECT_TABLE:
         for namelist in stmt.objects or ():
             parts = _drop_name_parts(namelist)

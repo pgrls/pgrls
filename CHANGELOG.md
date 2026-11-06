@@ -97,7 +97,11 @@ breaking changes — they will be called out in this file.
   writes them as `CREATE EXTENSION` alone (PostGIS's `public.spatial_ref_sys`
   has RLS off), so `--sql-file` lint and MCP `sql=` cannot report on them,
   and drop a `GRANT` on one; the offline warnings now say so.
-- **`--sql-file` / `pgrls pr` read `pg_dump --schema-only` output.** A
+- A table dropped (or its schema dropped) and made again is a table of
+  its own: the RLS flags, policies and grants of the one before are gone
+  with it (they carried over, hiding SEC001), and `DROP SCHEMA` takes its
+  tables. `SET search_path = ''` names no schema, as the `set_config()`
+  spelling already did. **`--sql-file` / `pgrls pr` read `pg_dump --schema-only` output.** A
   dump from `pg_dump` since the August 2025 minor releases (13.22, 14.19,
   15.14, 16.10, 17.6) opens with a `\restrict <key>` psql meta-command,
   which is not SQL, so the whole file failed to parse. psql meta-command
@@ -201,8 +205,8 @@ breaking changes — they will be called out in this file.
   back, `psql -1` and `lint --migrations` commit it), a last statement with
   no `;` ends with its file, and a
   database's or role's `search_path` or role set by `ALTER DATABASE` /
-  `ALTER ROLE … SET` is one later files start with, so is not followed
-  there; `lint --migrations` still applies the files in one session), a schema on it
+  `ALTER ROLE … SET` (or `ALTER SYSTEM SET`) is one later files start
+  with, so is not followed there; `lint --migrations` still applies the files in one session), a schema on it
   that a role the SQL runs as (`SET ROLE` / `SET SESSION AUTHORIZATION`)
   may have no `USAGE` on where it holds the name (Postgres skips it; one
   the role owns and did not revoke `USAGE` on, was granted `USAGE` on
