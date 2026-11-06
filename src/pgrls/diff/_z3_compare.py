@@ -549,7 +549,8 @@ def _rounds_its_kin(node: Any, ctx: _Context) -> bool:
 _STRING_CASTS = frozenset({"as text", "as varchar", "as bpchar", "as name"})
 
 
-def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any]) -> None:
+def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any], *,
+                      in_list: bool = False) -> None:
     """In a diff, note how `left` compared with each of `rights` (one, or an
     `IN` list's members, which take one type) reads each column the operands
     yield against a string: bare (`email = 'A'`), where the literal takes
@@ -557,7 +558,10 @@ def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any]) -> None:
     `(SELECT 'A')`, `COALESCE('A', '')`, a typed list member, a function's
     result), where a `citext` or `char(n)` column compares as text. The text
     may not show the column's type, so a column read both ways decides
-    nothing (`_diff_truths`)."""
+    nothing (`_diff_truths`). In an `IN` list with two or more members that
+    hold no column (`in_list`), Postgres types the left side with them, so a
+    `char(n)` one compares with `'a '::text` members as char, where `col =
+    'a '::text` compares as text: such a read is a kind of its own."""
     if not ctx.any_session:
         return
     operands = [left, *rights]
@@ -589,6 +593,8 @@ def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any]) -> None:
         if any(_has_typed_arm(v) for v in values):
             # `COALESCE(x, 'a'::citext)` takes a type its arm may decide.
             kind = "arm " + kind
+    if in_list and kind in ("typed", "as text", "as name"):
+        kind = "in-list " + kind
     for value in values:
         for n in _ast_nodes(value):
             if isinstance(n, ColumnRef) and n.fields and isinstance(n.fields[-1], String):
@@ -2368,7 +2374,8 @@ def _anon_any_array(
         return None
     # The list is read as a whole: its members take one common type, which
     # a typed member may decide.
-    _note_string_read(ctx, node.lexpr, elements)
+    _note_string_read(ctx, node.lexpr, elements, in_list=node.kind == A_Expr_Kind.AEXPR_IN and sum(
+        not any(isinstance(n, ColumnRef) for n in _ast_nodes(e)) for e in elements) > 1)
     acc: _TV | None = None
     for elem in elements:
         cmp_node = A_Expr(

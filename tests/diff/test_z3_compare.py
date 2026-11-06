@@ -1815,7 +1815,7 @@ def test_a_string_cast_beside_a_column_of_no_known_type_is_no_exact_reading():
             "unchanged", "semantic_equivalent", "semantic_tightened"), head
 
 
-def test_a_column_trusted_on_one_side_only_is_read_by_no_type():
+def test_a_column_trusted_on_one_side_only_is_read_by_that_sides_type():
     from pgrls.diff.policies import _column_types
     from pgrls.model import Column, Table
 
@@ -1823,8 +1823,26 @@ def test_a_column_trusted_on_one_side_only_is_read_by_no_type():
         return Table(schema="public", name="t", rls_enabled=True, force_rls=False, policies=(),
                      column_details=(Column("role", "text", type_known=type_known),))
 
-    assert _column_types(table(True), table(False)) == {"role": "unknown"}
-    # A widening still reads as one.
+    assert _column_types(table(True), table(False)) == {"role": "text"}
+    assert _column_types(table(False), table(True)) == {"role": "text"}
+    # A live base (`pg_get_expr` writes `'admin'::text`) against an offline
+    # head (bare literals): the widening still reads as one.
     from pgrls.diff.ast_compare import compare_predicates
+    assert compare_predicates("role = 'admin'::text", "role IN ('admin', 'owner')",
+                              column_types={"role": "text"}) == "semantic_loosened"
     assert compare_predicates("role = 'admin'", "role IN ('admin', 'owner')",
                               column_types={"role": "unknown"}) == "semantic_loosened"
+
+
+def test_an_in_list_of_typed_members_types_its_column_with_them():
+    # A `char(n)` `code` compares with `'a '::text` members as char in an
+    # IN list (Postgres types the left side with them), as text in `=`.
+    from pgrls.diff.ast_compare import compare_predicates
+    for base, head in (("code = 'a '::text OR code = 'b'::text", "code IN ('a '::text, 'b'::text)"),
+                       ("code = 'a '::text", "code IN ('a '::text, 'a '::text)")):
+        for types in (None, {"code": "unknown"}, {"code": "bpchar"}):
+            assert compare_predicates(base, head, column_types=types) not in (
+                "unchanged", "semantic_equivalent", "semantic_tightened"), (head, types)
+        # A text column reads them alike.
+        assert compare_predicates(base, head, column_types={"code": "text"}) == (
+            "semantic_equivalent")

@@ -199,8 +199,12 @@ breaking changes — they will be called out in this file.
   keeps each declared type for `generate` and `diff --apply`, marked
   `"type_known": false` (one an earlier version wrote, with no such key,
   is read the same way by its `"source": "sql"` marker), and the diff reads
-  such a column like one of a snapshot with no types (one way only), also
-  where the other side is a live snapshot that knows it. A column of no
+  such a column like one of a snapshot with no types (one way only); where
+  the other side is a live snapshot that knows it, by that side's type. An
+  `IN` list with two or more typed members that hold no column (`code IN
+  ('a '::text, 'b'::text)`) is a read of its own: Postgres types the column
+  with them, so a `char(n)` one compares as char there, as text in `code =
+  'a '::text`. A column of no
   known type beside a literal cast to a string type (`COALESCE(code, 'a
   '::text) = 'a'`) decides nothing either: a `char(n)` one makes the two
   literals compare as `char`. A column
