@@ -1855,3 +1855,22 @@ def test_an_in_list_of_typed_members_types_its_column_with_them():
         for types in (None, {"code": "unknown", "a": "unknown", "s2": "unknown"}):
             assert compare_predicates(base, head, column_types=types) not in (
                 "unchanged", "semantic_equivalent", "semantic_tightened"), (head, types)
+
+
+def test_an_in_list_read_is_tied_to_its_left_side():
+    # Postgres types a list from its left side: `alt IN (code, code)` reads
+    # `code` as text, `code IN (alt, alt)` reads `alt` as a char(n) `code`.
+    from pgrls.diff.ast_compare import compare_predicates
+    for base, head, types in (
+            ("(SELECT alt IN (code, code))", "(SELECT code IN (alt, alt))", None),
+            ("(SELECT alt IN (code, code))", "(SELECT code IN (alt, alt))",
+             {"alt": "unknown", "code": "unknown"}),
+            ("app.k() IN (app.f(), app.f())", "app.f() IN (app.k(), app.k())", None),
+            ("s2 = s AND (SELECT app.f() IN (s2, s2))",
+             "(SELECT app.f() IN (s, s)) AND (SELECT app.f() IN (s2, s2))",
+             {"s": "text", "s2": "text"})):
+        assert compare_predicates(base, head, column_types=types) not in (
+            "unchanged", "semantic_equivalent", "semantic_tightened"), (head, types)
+    # The same left side both ways still reads alike.
+    same = "(SELECT auth.uid() IN (owner_id, editor_id))"
+    assert compare_predicates(same, f"{same} AND x = 1") == "tightened_and"
