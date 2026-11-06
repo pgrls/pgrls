@@ -27,7 +27,6 @@ that absence-of-finding is NOT proof.
 """
 from __future__ import annotations
 
-import bisect
 import contextlib
 import copy
 import dataclasses
@@ -2193,34 +2192,43 @@ def _drops(stmt: Any, key: tuple[str, str], default_schema: str) -> bool:
 
 
 class _Made:
-    """Where each relation name is made and renamed to in the input, to
-    follow a name back to the CREATE that made it."""
+    """Which CREATE made the relation each name holds, as the statements
+    run (made, an IF NOT EXISTS of a name held a no-op, renamed, dropped),
+    read where a CREATE names its parents."""
 
     def __init__(self, statements: Any, default_schema: str) -> None:
-        self.creates: dict[tuple[str, str], list[int]] = {}
-        self.renames: dict[tuple[str, str], list[tuple[int, tuple[str, str]]]] = {}
+        holds: dict[tuple[str, str], tuple[tuple[str, str], int]] = {}
+        self.parents: dict[tuple[int, tuple[str, str]], tuple[tuple[str, str], int]] = {}
         for index, raw in enumerate(statements):
             stmt = raw.stmt
+            if isinstance(stmt, _pgast.CreateStmt):
+                for rel in stmt.inhRelations or ():
+                    if (key := _relation_key(rel, default_schema)) in holds:
+                        self.parents[index, key] = holds[key]
             for rel, creates in _named_relations(stmt):
-                if creates and (key := _relation_key(rel, default_schema)) is not None:
-                    self.creates.setdefault(key, []).append(index)
+                key = _relation_key(rel, default_schema) if creates else None
+                if key is not None and not (getattr(stmt, "if_not_exists", False)
+                                            and key in holds):
+                    holds[key] = (key, index)
             if (isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None
                     and stmt.renameType in _RELATION_KINDS and stmt.newname
-                    and (old := _relation_key(stmt.relation, default_schema)) is not None):
-                self.renames.setdefault((old[0], stmt.newname), []).append((index, old))
+                    and (old := _relation_key(stmt.relation, default_schema)) in holds):
+                # (One of a name held by nothing is an IF EXISTS no-op.)
+                holds[(old[0], stmt.newname)] = holds.pop(old)
+            elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_TABLE:
+                for n in stmt.objects or ():
+                    if _drop_name_parts(n):
+                        holds.pop(_drop_table_key(_drop_name_parts(n), default_schema), None)
+            elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_SCHEMA:
+                gone = {getattr(item, "sval", None) for item in stmt.objects or ()}
+                for key in [k for k in holds if k[0] in gone]:
+                    del holds[key]
 
     def origin(self, key: tuple[str, str], index: int) -> tuple[tuple[str, str], int] | None:
-        """The name the relation called `key` at statement `index` was made
-        with, and the CREATE that made it: followed back through the renames
-        to it; None when no CREATE is reached."""
-        creates = self.creates.get(key, [])
-        at = bisect.bisect_left(creates, index)
-        created = creates[at - 1] if at else -1
-        for rename, old in reversed(self.renames.get(key, [])):
-            if created < rename < index and (found := self.origin(old, rename)) is not None:
-                return found
-            # (A rename of a name never made is an IF EXISTS no-op.)
-        return (key, created) if created >= 0 else None
+        """The name the relation `key` names at the CREATE at `index` (a
+        parent it names) was made with, and the CREATE that made it; None
+        when the SQL made none."""
+        return self.parents.get((index, key))
 
 
 def _renamed_between(statements: Any, key: tuple[str, str], after: int, before: int,
