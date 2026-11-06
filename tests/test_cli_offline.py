@@ -3332,3 +3332,40 @@ def test_an_alter_between_a_drop_and_the_create_does_not_reach_the_new_table():
 def test_if_not_exists_over_a_views_name_makes_no_table():
     assert "v" not in _tables_of("CREATE VIEW v AS SELECT 1 AS id;\n"
                                  "CREATE TABLE IF NOT EXISTS v (id int);\n")
+
+
+def test_a_child_of_a_parent_made_again_takes_the_new_parents_columns():
+    tables = _tables_of("CREATE TABLE p (a int) PARTITION BY LIST (a);\nDROP TABLE p;\n"
+                        "CREATE TABLE p (a int, owner_id uuid) PARTITION BY LIST (a);\n"
+                        "CREATE TABLE c PARTITION OF p FOR VALUES IN (1);\n")
+    assert list(tables["c"].columns) == ["a", "owner_id"]
+
+
+@pytest.mark.parametrize("kind", ["SEQUENCE", "VIEW", "MATERIALIZED VIEW"])
+def test_a_name_another_relation_left_holds_the_table_made_after(kind):
+    made = {"SEQUENCE": "CREATE SEQUENCE t;\n", "VIEW": "CREATE VIEW t AS SELECT 1 AS x;\n",
+            "MATERIALIZED VIEW": "CREATE MATERIALIZED VIEW t AS SELECT 1 AS x;\n"}[kind]
+    tables = _tables_of(made + f"DROP {kind} t;\nCREATE TABLE t (id int);\n"
+                        "ALTER TABLE t ENABLE ROW LEVEL SECURITY;\n"
+                        "CREATE TABLE IF NOT EXISTS t (id int);\n")
+    assert tables["t"].rls_enabled
+
+
+def test_statements_before_a_drop_of_a_table_the_sql_did_not_make_stay_with_it():
+    # The rebuild migration over a table made by an earlier migration.
+    tables = _tables_of("ALTER TABLE IF EXISTS t ENABLE ROW LEVEL SECURITY;\n"
+                        "CREATE POLICY p ON t USING (true);\nDROP TABLE IF EXISTS t;\n"
+                        "CREATE TABLE t (id int);\n")
+    assert not tables["t"].rls_enabled and not tables["t"].policies
+
+
+def test_a_rename_before_a_tables_create_does_not_move_it():
+    tables = _tables_of("ALTER TABLE t RENAME TO t_old;\nCREATE TABLE t (id int);\n"
+                        "ALTER TABLE t_old ENABLE ROW LEVEL SECURITY;\n")
+    assert "t" in tables and not tables["t"].rls_enabled
+
+
+def test_if_not_exists_over_a_view_made_after_a_drop_makes_no_table():
+    tables = _tables_of("CREATE TABLE t (id int);\nDROP TABLE t;\n"
+                        "CREATE VIEW t AS SELECT 1 AS id;\nCREATE TABLE IF NOT EXISTS t (id int);\n")
+    assert "t" not in tables
