@@ -103,9 +103,12 @@ breaking changes — they will be called out in this file.
   and the SQL has made one, as it runs up to the policy, in exactly one
   schema on the path (other schemas are taken to have none, as for
   tables). A name the SQL drops, renames or moves, or one of an aggregate,
-  is not followed, nor is any after an extension, a `DO` block, a `CALL` or
-  `DROP OWNED` (which may make or drop functions pgrls does not see); a
-  call it cannot settle stays as written.
+  is not followed, nor is any after an extension (made, altered, moved or
+  dropped), a `DO` block, a `CALL`, an `EXECUTE`, a statement that runs a
+  function that may be no built-in (`SELECT setup()`, whose body may make
+  one), an event trigger, a range type (its constructors) or `DROP OWNED`;
+  a trigger a write fires is taken to make none. A call it cannot settle
+  stays as written.
 - **Offline analysis says that an extension's tables are not seen.** pg_dump
   writes them as `CREATE EXTENSION` alone (PostGIS's `public.spatial_ref_sys`
   has RLS off), so `--sql-file` lint and MCP `sql=` cannot report on them,

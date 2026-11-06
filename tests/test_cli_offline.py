@@ -3214,9 +3214,22 @@ def test_an_unqualified_policy_call_names_the_function_the_path_finds(tmp_path):
     "CREATE POLICY p ON docs USING (owner_id = uid());\n",
     "DO $$ BEGIN END $$;\nSET search_path = public, auth;\n"
     "CREATE POLICY p ON docs USING (owner_id = uid());\n",
+    # A function it runs may make one (with EXECUTE), as may a range type.
+    "CREATE FUNCTION public.setup() RETURNS void LANGUAGE sql AS $$ SELECT $$;\n"
+    "SELECT public.setup();\nSET search_path = public, auth;\n"
+    "CREATE POLICY p ON docs USING (owner_id = uid());\n",
+    "CREATE TYPE public.r AS RANGE (subtype = int, multirange_type_name = public.uid);\n"
+    "SET search_path = public, auth;\nCREATE POLICY p ON docs USING (owner_id = uid());\n",
 ])
 def test_an_unqualified_policy_call_stays_as_written_where_unsure(sql):
     assert "auth" not in _policy_using(_AUTH_UID + sql)
+
+
+def test_a_built_in_run_leaves_the_policy_calls_followed():
+    # pg_dump's `SELECT pg_catalog.set_config(…)` runs no user code.
+    sql = (_AUTH_UID + "SELECT pg_catalog.set_config('search_path', 'public, auth', false);\n"
+           "CREATE POLICY p ON docs USING (owner_id = uid());\n")
+    assert _policy_using(sql) == "owner_id = auth.uid()"
 
 
 def test_a_policy_call_on_the_default_path_stays_unqualified():

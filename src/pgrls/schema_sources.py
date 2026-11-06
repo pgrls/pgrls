@@ -1528,7 +1528,13 @@ class _Resolver:
             return
         if isinstance(stmt, (_pgast.CreateExtensionStmt, _pgast.AlterExtensionStmt,
                              _pgast.AlterExtensionContentsStmt, _pgast.DoStmt,
-                             _pgast.CallStmt, _pgast.DropOwnedStmt)):
+                             _pgast.CallStmt, _pgast.ExecuteStmt, _pgast.CreateEventTrigStmt,
+                             _pgast.DropOwnedStmt)) or (
+                isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_EXTENSION
+                or isinstance(stmt, _pgast.AlterObjectSchemaStmt)
+                and stmt.objectType == ObjectType.OBJECT_EXTENSION) or _calls_a_user_function(stmt):
+            # (A trigger a write fires is taken to make none: a migration's
+            # INSERT would otherwise end the following for good.)
             self.functions = None
         elif isinstance(stmt, _pgast.CreateFunctionStmt) and not stmt.is_procedure:
             names = [str(getattr(n, "sval", "")) for n in stmt.funcname or ()]
@@ -1543,6 +1549,10 @@ class _Resolver:
                 self.functions.setdefault(names[-1], set()).add(schema)
         elif isinstance(stmt, _pgast.DefineStmt) and stmt.kind == ObjectType.OBJECT_AGGREGATE:
             self.unsure_functions.add(str(getattr(stmt.defnames[-1], "sval", "")))
+        elif isinstance(stmt, _pgast.CreateRangeStmt):
+            # Its constructors: the range's name and its multirange's (given,
+            # or derived from the range's), which pgrls does not follow.
+            self.functions = None
         elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_SCHEMA:
             gone = {str(getattr(item, "sval", "")) for item in stmt.objects or ()}
             for schemas in self.functions.values():
@@ -1744,6 +1754,19 @@ def _runs_code(stmt: Any) -> bool:
         isinstance(n, _pgast.FuncCall)
         and not (ast_utils.func_name_parts(n)[0] or "").startswith("pg_catalog.")
         for n in _subnodes(stmt))
+
+
+def _calls_a_user_function(stmt: Any) -> bool:
+    """Whether `stmt` runs, as it runs, a function that may be no built-in
+    (one off `pg_catalog`, or unqualified with a name none there has)."""
+    if _only_defines(stmt):
+        return False
+    for n in _subnodes(stmt):
+        if isinstance(n, _pgast.FuncCall):
+            names = [getattr(part, "sval", None) for part in n.funcname or ()]
+            if names[:-1] not in ([], ["pg_catalog"]) or names[-1] not in PG_CATALOG_FUNCTIONS:
+                return True
+    return False
 
 
 def _only_defines(stmt: Any) -> bool:
