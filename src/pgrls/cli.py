@@ -129,6 +129,7 @@ from pgrls.schema_sources import (
     SchemaSourceError,
     WarnCommand,
     ends_in_transaction,
+    sets_local_outside_transaction,
     inert_rule_ids,
     reparse_policy_asts,
     resolve_schema,
@@ -1016,6 +1017,15 @@ def _resolve_offline_schema(
                     "offline SQL input exceeds "
                     f"{_OFFLINE_MAX_BYTES // (1024 * 1024)} MiB; split it or "
                     "lint against a live database."
+                )
+            if migrations and sets_local_outside_transaction(chunk):
+                raise ToolError(
+                    f"--migrations file {entry!r} sets search_path or the role with SET "
+                    "LOCAL (or set_config(…, true)) outside a transaction: psql "
+                    "ignores it, a runner that wraps each file in a transaction (the "
+                    "Supabase CLI, Flyway, Prisma, `pgrls lint --migrations`) keeps it "
+                    "for the file, so pgrls cannot tell where its names go. Use SET, "
+                    "or wrap the file in BEGIN / COMMIT."
                 )
             if migrations and ends_in_transaction(chunk):
                 raise ToolError(

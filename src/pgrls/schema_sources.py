@@ -966,7 +966,9 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
                     else resolver.role_of(None))
             resolver.schemas.add(schema)
             resolver.unsure.discard(schema)
-            for element in stmt.schemaElts or ():
+            # Postgres runs them by kind, not as written: sequences, tables,
+            # views, indexes, triggers, grants (`transformCreateSchemaStmtElements`).
+            for element in sorted(stmt.schemaElts or (), key=_schema_element_order):
                 # Its elements go in it, and see it first.
                 with resolver.first(schema):
                     resolver.track(element)
@@ -1015,6 +1017,46 @@ def ends_in_transaction(sql: str) -> bool:
             TransactionStmtKind.TRANS_STMT_BEGIN, TransactionStmtKind.TRANS_STMT_START):
         start += 1
     return start < len(statements)
+
+
+def sets_local_outside_transaction(sql: str) -> bool:
+    """Whether `sql` (a migration file) sets the search_path, the role or the
+    session user `SET LOCAL` (or `set_config(…, true)`) outside a
+    transaction it begins: psql ignores it there, but a runner that wraps
+    the file in a transaction (the Supabase CLI, Flyway, Prisma, `lint
+    --migrations`) keeps it for the file. False for SQL that does not parse."""
+    sql, _ = _split_psql_meta_commands(sql)
+    try:
+        statements = pglast.parse_sql(sql)
+    except pglast.parser.ParseError:
+        return False
+    names = ("search_path", "role", "session_authorization")
+    open_ = False
+    for raw in statements:
+        stmt = raw.stmt
+        if isinstance(stmt, _pgast.TransactionStmt):
+            if stmt.kind in (TransactionStmtKind.TRANS_STMT_BEGIN,
+                             TransactionStmtKind.TRANS_STMT_START):
+                open_ = True
+            elif stmt.kind in (TransactionStmtKind.TRANS_STMT_COMMIT,
+                               TransactionStmtKind.TRANS_STMT_ROLLBACK):
+                open_ = bool(stmt.chain)
+            continue
+        if open_:
+            continue
+        if (isinstance(stmt, _pgast.VariableSetStmt) and stmt.is_local
+                and (stmt.name or "").lower() in names):
+            return True
+        for node in _subnodes(stmt):
+            if (isinstance(node, _pgast.FuncCall)
+                    and ast_utils.func_name_parts(node)[1] == "set_config"
+                    and len(node.args or ()) == 3
+                    and not (isinstance(node.args[2], _pgast.A_Const)
+                             and getattr(node.args[2].val, "boolval", None) is False)):
+                name = getattr(getattr(node.args[0], "val", None), "sval", None)
+                if name is None or name.lower() in names:
+                    return True
+    return False
 
 
 def _rolled_back(statements: Any) -> frozenset[int]:
@@ -1072,6 +1114,10 @@ def _transaction_state(statements: Any) -> tuple[set[int], int | None]:
     return void, start
 
 
+# The role psql connects as, named by CURRENT_USER with no SET ROLE: a grant
+# to it is no grant to PUBLIC (whose grantee is None).
+_CONNECTING_ROLE = "\0connecting role"
+
 # A role pgrls cannot name: a schema's owner it does not know (one there
 # before the SQL, or one a REASSIGN OWNED may have passed on), or the role
 # CURRENT_USER is when a \connect'ed database or role sets `role`.
@@ -1086,6 +1132,14 @@ def _may_be(owner: str | None, roles: AbstractSet[str | None]) -> bool:
         return True
     return (owner is None and any(r is not None for r in roles)) or (
         owner is not None and None in roles)
+
+
+def _schema_element_order(element: Any) -> int:
+    for rank, kind in enumerate((_pgast.CreateSeqStmt, _pgast.CreateStmt, _pgast.ViewStmt,
+                                 _pgast.IndexStmt, _pgast.CreateTrigStmt, _pgast.GrantStmt)):
+        if isinstance(element, kind):
+            return rank
+    return 6
 
 
 def _sets_for_next_session(stmt: Any) -> tuple[bool, bool]:
@@ -1375,7 +1429,8 @@ class _Resolver:
         role = self._get("role") or self._get("auth")
         if role is None or role == _SOME_ROLE:
             return
-        if (schema == "public" and (schema, None) not in self.revoked) or (
+        if (schema in ("public", "pg_catalog", "information_schema")
+                and (schema, None) not in self.revoked) or (
                 self.owners.get(schema) == role and (schema, role) not in self.revoked) or (
                 schema, role) in self.usage or (schema, None) in self.usage:
             return
@@ -1526,9 +1581,19 @@ class _Resolver:
                   getattr(p, "priv_name", None) == "usage" for p in stmt.privileges))):
             for item in stmt.objects or ():
                 schema = str(getattr(item, "sval", ""))
+                # A GRANT under a SET ROLE by one that is not the schema's
+                # owner may grant nothing (without the grant option Postgres
+                # only warns): it is credited to no one.
+                running = self._get("role") or self._get("auth")
+                if stmt.is_grant and running is not None and self.owners.get(schema) != running:
+                    continue
                 for grantee in stmt.grantees or ():
                     who = (None if grantee.roletype == RoleSpecType.ROLESPEC_PUBLIC
                            else self.role_of(grantee))
+                    if who is None and grantee.roletype != RoleSpecType.ROLESPEC_PUBLIC:
+                        # The connecting role (`TO CURRENT_USER`), which is no
+                        # PUBLIC.
+                        who = _CONNECTING_ROLE
                     (self.usage.add if stmt.is_grant else self.usage.discard)((schema, who))
                     # (An owner may revoke its own USAGE too.)
                     (self.revoked.discard if stmt.is_grant else self.revoked.add)((schema, who))

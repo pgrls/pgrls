@@ -185,7 +185,8 @@ breaking changes — they will be called out in this file.
   plain `SELECT set_config('search_path', …)`, `$user` after `SET ROLE`),
   skipping a schema not created yet, and against the tables as they stand
   at that statement; a table a policy reads resolves there too, and the
-  elements of `CREATE SCHEMA` go in it. `--schemas app` or `app,public` (and
+  elements of `CREATE SCHEMA` go in it, in the order Postgres runs them
+  (sequences, tables, views, indexes, triggers, grants). `--schemas app` or `app,public` (and
   MCP's `schemas`) moved every one into `app`, so findings named tables that
   did not exist and missed those on `public.*`. What a `ROLLBACK` (or
   `ROLLBACK TO SAVEPOINT`, or the end of the file in an open transaction)
@@ -213,7 +214,9 @@ breaking changes — they will be called out in this file.
   catalog's, an `IF EXISTS` no-op or an error, as before; `snapshot
   --migrations` gives each file a session of its own, as migration runners
   do: a file that ends inside a transaction is refused (psql rolls it
-  back, `psql -1` and `lint --migrations` commit it), a last statement with
+  back, `psql -1` and `lint --migrations` commit it), and so is one that
+  sets the search_path or role `SET LOCAL` outside a transaction it begins
+  (psql ignores it; a runner that wraps the file in one keeps it), a last statement with
   no `;` ends with its file, and a
   database's or role's `search_path` or role set by `ALTER DATABASE` /
   `ALTER ROLE … SET` (or `ALTER SYSTEM SET`) is one later files start
@@ -221,7 +224,7 @@ breaking changes — they will be called out in this file.
   that a role the SQL runs as (`SET ROLE` / `SET SESSION AUTHORIZATION`)
   may have no `USAGE` on where it holds the name (Postgres skips it; one
   the role owns and did not revoke `USAGE` on, was granted `USAGE` on
-  (under its name then, through a rename), or a `public` the SQL did not
+  (under its name then, through a rename; a GRANT made under a SET ROLE by one not its owner, which may grant nothing, credits no one, and one `TO CURRENT_USER` is no grant to PUBLIC), or a `public` the SQL did not
   drop and make again is followed), a `set_config()` of the path or the role anywhere but a
   plain `SELECT` of literals (a cursor, `PREPARE`, `ALTER … USING`, `ADD
   COLUMN … DEFAULT`, a partition bound (in a `CREATE SCHEMA` too),

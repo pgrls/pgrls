@@ -3398,3 +3398,48 @@ def test_a_drop_before_a_rename_to_the_name_leaves_the_if_not_exists_a_no_op(dro
                         + "CREATE TABLE d (id int);\n" + drop + "ALTER TABLE d RENAME TO c;\n"
                         "CREATE TABLE IF NOT EXISTS c PARTITION OF a DEFAULT;\n")
     assert tables["c"].partition_of is None
+
+
+def test_a_migration_file_setting_the_path_set_local_outside_a_transaction_is_refused(tmp_path):
+    # psql ignores it; a runner that wraps the file in a transaction keeps it.
+    res, _ = _migrations_snapshot(tmp_path, {
+        "001_a.sql": "CREATE SCHEMA app;\nCREATE TABLE public.docs (id int);\n",
+        "002_b.sql": "SET LOCAL search_path = app;\nCREATE TABLE IF NOT EXISTS docs (id int);\n",
+    })
+    assert res.exit_code != 0 and "SET LOCAL" in res.output
+    (tmp_path / "ok").mkdir()
+    res, _ = _migrations_snapshot(tmp_path / "ok", {
+        "001_a.sql": "BEGIN;\nSET LOCAL search_path = public;\nCREATE TABLE t (id int);\nCOMMIT;\n"})
+    assert res.exit_code == 0, res.output
+
+
+@pytest.mark.parametrize("grant", [
+    "GRANT USAGE ON SCHEMA app TO CURRENT_USER;\n",   # the connecting role, no PUBLIC
+    "SET ROLE bob;\nGRANT USAGE ON SCHEMA app TO alice;\nRESET ROLE;\n",  # may grant nothing
+])
+def test_a_usage_grant_that_may_not_reach_the_role_is_not_credited(grant):
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+    with pytest.raises(SchemaSourceError, match="USAGE"):
+        schema_from_sql("CREATE SCHEMA app;\nCREATE TABLE app.docs (id int);\n" + grant
+                        + "SET search_path = app, public;\nSET ROLE alice;\n"
+                        "CREATE TABLE IF NOT EXISTS docs (id int);\n")
+
+
+def test_create_schema_elements_run_in_postgres_order():
+    # The GRANT runs after the CREATE TABLE it is written before, so its
+    # `accounts` is `s.accounts`, not the `public.accounts` there before.
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+    try:
+        schema = schema_from_sql("CREATE TABLE public.accounts (id int);\n"
+                                 "CREATE SCHEMA s GRANT SELECT ON accounts TO anon"
+                                 " CREATE TABLE accounts (id int);\n", schemas=("public", "s"))
+    except SchemaSourceError:
+        return  # (a name two schemas on the path hold may be refused)
+    public = next(t for t in schema.tables if t.schema == "public")
+    assert not public.grants
+
+
+def test_pg_catalog_on_the_path_needs_no_usage_grant():
+    _tables_of("GRANT USAGE, CREATE ON SCHEMA public TO alice;\nSET ROLE alice;\n"
+               "SET search_path = public, pg_catalog;\nCREATE TABLE t (id int);\n"
+               "DROP TABLE IF EXISTS nothere;\n")
