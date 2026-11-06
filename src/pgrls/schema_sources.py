@@ -709,10 +709,12 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             )
             if p is not None
         ]
-        # (Not itself, nor one below it: an IF NOT EXISTS over another
-        # relation of its name, or over a table the SQL did not make, may
-        # have been a no-op that set no link.)
-        parents = [p for p in parents if p != key and not _is_below(tables, p, key)]
+        # (Not itself, nor — for a name nothing held before, which an IF NOT
+        # EXISTS over a table the SQL did not make may leave — one below
+        # it: that may have been a no-op that set no link. A name dropped
+        # or renamed away and made again has its link; pass 2 frees the old.)
+        parents = [p for p in parents if p != key and not (
+            key not in made.ever and _is_below(tables, p, key))]
         if parents and getattr(stmt, "partbound", None) is not None:
             builder.partition_of = parents[0]
         elif parents:
@@ -795,6 +797,13 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             _apply_rename(stmt, tables, default_schema, index)
         # Every other statement shape is skipped tolerantly.
 
+    # An IF NOT EXISTS the model could not tell was a no-op may leave a link
+    # that a rename closes into a cycle: break it rather than fail (the
+    # table then reads as standalone, which only over-reports).
+    for key, builder in tables.items():
+        if builder.partition_of is not None and _is_below(tables, builder.partition_of, key):
+            builder.partition_of = None
+        builder.inherits = [p for p in builder.inherits if not _is_below(tables, p, key)]
     # Live lint does not see a table outside the linted schemas: a partition
     # keeps its link to such a parent, and its ancestor walk stops there.
     unseen: set[tuple[str, str]] = set()
