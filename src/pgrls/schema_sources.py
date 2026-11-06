@@ -1452,16 +1452,24 @@ class _Resolver:
         after a SET ROLE / SET SESSION AUTHORIZATION, refuse one the SQL does
         not show the role may use (owns it, or was granted USAGE on it)."""
         role = self._get("role") or self._get("auth")
-        if role is None or role == _SOME_ROLE:
+        if role is None and self.inherited_role:
+            # The role a database's or role's setting gives the session, which
+            # may be no superuser: it may use only what PUBLIC may.
+            role = _SOME_ROLE
+        if role is None:
             return
         if (schema in ("public", "pg_catalog", "information_schema")
                 and (schema, None) not in self.revoked) or (
-                self.owners.get(schema) == role and (schema, role) not in self.revoked) or (
-                schema, role) in self.usage or (schema, None) in self.usage:
+                role != _SOME_ROLE and self.owners.get(schema) == role
+                and (schema, role) not in self.revoked) or (
+                role != _SOME_ROLE and (schema, role) in self.usage) or (
+                schema, None) in self.usage:
             return
+        who = "a role a database's or role's setting gives" if role == _SOME_ROLE else (
+            f"role {role!r}")
         raise SchemaSourceError(
             "bad_sql",
-            f"the SQL runs as role {role!r} and resolves a name on search_path schema "
+            f"the SQL runs as {who} and resolves a name on search_path schema "
             f"{schema!r}, which the role may have no USAGE on (Postgres then skips it); "
             f"pgrls cannot tell. Qualify the names.",
         )
@@ -1610,7 +1618,10 @@ class _Resolver:
                 # owner may grant nothing (without the grant option Postgres
                 # only warns): it is credited to no one.
                 running = self._get("role") or self._get("auth")
-                if stmt.is_grant and running is not None and self.owners.get(schema) != running:
+                if running is None and self.inherited_role:
+                    running = _SOME_ROLE
+                if stmt.is_grant and running is not None and (
+                        running == _SOME_ROLE or self.owners.get(schema) != running):
                     continue
                 for grantee in stmt.grantees or ():
                     who = (None if grantee.roletype == RoleSpecType.ROLESPEC_PUBLIC

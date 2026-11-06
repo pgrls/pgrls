@@ -226,7 +226,7 @@ breaking changes — they will be called out in this file.
   that a role the SQL runs as (`SET ROLE` / `SET SESSION AUTHORIZATION`)
   may have no `USAGE` on where it holds the name (Postgres skips it; one
   the role owns and did not revoke `USAGE` on, was granted `USAGE` on
-  (under its name then, through a rename; a GRANT made under a SET ROLE by one not its owner, which may grant nothing, credits no one, and one `TO CURRENT_USER` is no grant to PUBLIC), or a `public` the SQL did not
+  (under its name then, through a rename; a GRANT made under a SET ROLE by one not its owner, which may grant nothing, credits no one, and one `TO CURRENT_USER` is no grant to PUBLIC; a role a database's or role's setting gives the session may use only what PUBLIC may, and its GRANTs credit no one), or a `public` the SQL did not
   drop and make again is followed), a `set_config()` of the path or the role anywhere but a
   plain `SELECT` of literals (a cursor, `PREPARE`, `ALTER … USING`, `ADD
   COLUMN … DEFAULT`, a partition bound (in a `CREATE SCHEMA` too),

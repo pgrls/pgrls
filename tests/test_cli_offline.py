@@ -3504,3 +3504,17 @@ def test_reset_role_under_a_role_setting_returns_to_a_role_pgrls_cannot_name(tmp
                      "SET search_path = \"$user\", public;\n"
                      "ALTER TABLE docs ENABLE ROW LEVEL SECURITY;\n"})
     assert res.exit_code != 0
+
+
+@pytest.mark.parametrize("files", [
+    # The role a database's setting gives (bob) has no USAGE on `core`.
+    {"001_a.sql": "CREATE SCHEMA core;\nALTER DATABASE postgres SET role bob;\n",
+     "002_b.sql": "SET search_path = core, public;\nCREATE TABLE t (id int);\n"},
+    # ... nor is a GRANT it makes, owning nothing, credited.
+    {"001_a.sql": "CREATE SCHEMA s;\nALTER DATABASE postgres SET role alice;\n",
+     "002_b.sql": "GRANT USAGE ON SCHEMA s TO bob;\nSET ROLE bob;\n"
+                  "SET search_path = s, public;\nCREATE TABLE t (id int);\n"},
+])
+def test_a_role_a_setting_gives_may_use_only_what_public_may(tmp_path, files):
+    res, _ = _migrations_snapshot(tmp_path, files)
+    assert res.exit_code != 0 and "USAGE" in res.output, res.output
