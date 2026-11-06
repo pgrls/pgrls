@@ -157,7 +157,9 @@ breaking changes — they will be called out in this file.
   literals and such columns the diff keeps the COALESCE an opaque value, as
   on `main`; so does a bare string meeting another in an `IN` list or
   `ARRAY` a member types, `'1' IN (current_setting('x')::int, '01')`, which
-  the offline anon prover had proven isolated), or a cast to a text type that changes a value
+  the offline anon prover had proven isolated (an `IN` member holding a
+  column is compared alone, as Postgres does, so `'admin' IN (role,
+  'owner')` still reads exactly)), or a cast to a text type that changes a value
   (`bpchar`, `"char"`, `name`) beside a bare string literal, which then
   compares as that type (`x = ANY(ARRAY['a'::bpchar, 'b '])` holds for
   `x = 'b'`; `main` proved such a predicate isolated). In a

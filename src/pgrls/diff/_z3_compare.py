@@ -2321,8 +2321,14 @@ def _anon_any_array(
         # literals make a `text[]`, so a `char(n)` or `citext` `x` (which the
         # text may not show) compares as text there, and as itself here.
         return None
-    if _literal_kind(node.lexpr) == "bare" and any(_literal_kind(e) == "bare" for e in elements) \
-            and not all(_keeps_strings_text(e, ctx) for e in elements):
+    # Postgres types an array's elements together, and an `IN` list's
+    # members that hold no column (two or more of them) with the left side;
+    # a member holding a column it compares with the left side alone.
+    together = elements if isinstance(arr, A_ArrayExpr) else [
+        e for e in elements if not any(isinstance(n, ColumnRef) for n in _ast_nodes(e))]
+    if _literal_kind(node.lexpr) == "bare" and len(together) > 1 \
+            and any(_literal_kind(e) == "bare" for e in together) \
+            and not all(_keeps_strings_text(e, ctx) for e in together):
         # `'1' IN (current_setting('x')::int, '01')`: the members take one
         # type with the left side (int), so the two literals meet in it,
         # which Z3 would read as text (as in `_anon_coalesce`).

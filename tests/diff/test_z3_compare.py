@@ -509,6 +509,9 @@ def test_a_cast_of_a_coalesce_is_no_proof():
                   f"{t} OR '1' = ANY (ARRAY[current_setting('app.x', true)::int, '01'])",
                   f"{t} OR '01' IN ('1', (SELECT current_setting('app.x', true)::int))"):
         assert prove_anon_isolation(parse_expr(using))[0] != "isolated", using
+    # A member holding a column is compared alone, so the literals meet as
+    # text there: still a leak (`'1' = '01'` text is FALSE, `role` decides).
+    assert prove_anon_isolation(parse_expr("'admin' IN (role, 'owner')"))[0] == "leak"
     # A COALESCE of a column and a bare literal still reads exactly.
     assert prove_anon_isolation(parse_expr(f"{t} AND COALESCE(level, 0) < 3"))[0] == "isolated"
     # The session identity's cast keeps its proof.
