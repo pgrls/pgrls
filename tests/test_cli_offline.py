@@ -3363,6 +3363,17 @@ def test_a_name_made_again_as_a_partition_of_its_old_child_keeps_the_link(gone):
     assert list(tables["a"].columns) == ["id", "tenant_id"]
 
 
+def test_a_cycle_of_two_if_not_exists_links_breaks_both():
+    # `b` made by code; neither IF NOT EXISTS is known to have run.
+    tables = _tables_of(
+        "DO $$ BEGIN EXECUTE 'CREATE TABLE b (id int) PARTITION BY RANGE (id)'; END $$;\n"
+        "CREATE TABLE IF NOT EXISTS d PARTITION OF b FOR VALUES FROM (0) TO (10)"
+        " PARTITION BY RANGE (id);\n"
+        "ALTER TABLE b RENAME TO a;\n"
+        "CREATE TABLE IF NOT EXISTS a PARTITION OF d FOR VALUES FROM (0) TO (5);\n")
+    assert tables["a"].partition_of is None
+
+
 @pytest.mark.parametrize("sql, child, parent", [
     # `b` there before; `a` its new name; the IF NOT EXISTS over `a` a no-op.
     ("CREATE TABLE d PARTITION OF b FOR VALUES FROM (0) TO (10) PARTITION BY RANGE (id);\n"

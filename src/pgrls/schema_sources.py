@@ -800,7 +800,15 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     # An IF NOT EXISTS the model could not tell was a no-op may leave a link
     # that a rename closes into a cycle: break it rather than fail (the
     # table then reads as standalone, which only over-reports) — that one's
-    # first, so a real link of the cycle stays.
+    # first, so a real link of the cycle stays. When more than one such link
+    # closes a cycle, which was the no-op is not known: break every one.
+    unsure = [builder for key, builder in tables.items() if builder.unsure_link and (
+        (builder.partition_of is not None and _is_below(tables, builder.partition_of, key))
+        or any(_is_below(tables, p, key) for p in builder.inherits))]
+    if len(unsure) > 1:
+        for builder in unsure:
+            builder.partition_of = None
+            builder.inherits = []
     for key, builder in sorted(tables.items(), key=lambda item: not item[1].unsure_link):
         if builder.partition_of is not None and _is_below(tables, builder.partition_of, key):
             builder.partition_of = None
