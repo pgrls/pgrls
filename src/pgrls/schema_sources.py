@@ -536,11 +536,15 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     # The diff reads a string compared with a column by the column's type
     # (`text` and `citext` read `'a'::text` otherwise), which the passes above
     # do not follow in order; replay what changes it, and where the replay
-    # is not sure of a column's type, it is `unknown` (which decides nothing).
+    # is not sure of a column's type, the diff reads nothing by it (the
+    # declared type stays, for `generate` and `diff --apply`).
     types = _column_types_in_order(statements)
     for builder in tables.values():
-        builder.columns = [replace(c, data_type=types.get(builder.name, {}).get(c.name, "unknown"))
-                           for c in builder.columns]
+        known = types.get(builder.name, {})
+        builder.columns = [
+            replace(c, data_type=known[c.name]) if known.get(c.name, "unknown") != "unknown"
+            else replace(c, type_known=False)
+            for c in builder.columns]
     return Schema(tables=tuple(b.build() for b in tables.values()))
 
 
@@ -552,19 +556,28 @@ def _column_types_in_order(statements: Any) -> dict[str, dict[str, str]]:
     table), from its own column list and the ALTERs on it in order. A table
     left out, a column it gets from elsewhere (a parent, `LIKE`, `CREATE
     TABLE … AS`), and a type named like a built-in the SQL also defines are
-    `unknown`, which decides nothing."""
+    `unknown`, which decides nothing; so is every one after code that may
+    alter a table (a `DO` block, a `CALL`), one made `IF NOT EXISTS` (it may
+    be there already, otherwise), and one the SQL names under two schemas
+    (`ALTER TABLE IF EXISTS legacy.users` is no ALTER of `public.users`)."""
     made: dict[str, int] = {}
     first: dict[str, int] = {}
     tainted: set[str] = set()
     shadowed: set[str] = set()
+    qualifiers: dict[str, set[str | None]] = {}
     elements = [stmt for raw in statements
                 for stmt in (raw.stmt, *(getattr(raw.stmt, "schemaElts", None) or ()))]
     for index, stmt in enumerate(elements):
+        if isinstance(stmt, (_pgast.DoStmt, _pgast.CallStmt)):
+            return {}
+        for rel in (getattr(stmt, "relation", None), getattr(stmt, "view", None)):
+            if isinstance(rel, _pgast.RangeVar):
+                qualifiers.setdefault(rel.relname, set()).add(rel.schemaname or None)
         target = _made_relation(stmt)
         if target is not None:
             made[target] = made.get(target, 0) + 1
             first.setdefault(target, index)
-        if isinstance(stmt, _pgast.CreateStmt) and (stmt.inhRelations or any(
+        if isinstance(stmt, _pgast.CreateStmt) and (stmt.if_not_exists or stmt.inhRelations or any(
                 isinstance(e, _pgast.TableLikeClause) for e in stmt.tableElts or ())):
             tainted.add(stmt.relation.relname)
         if (isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None
@@ -587,6 +600,10 @@ def _column_types_in_order(statements: Any) -> dict[str, dict[str, str]]:
             # One before the name is made drops a table the input never shows.
             tainted.update(parts[-1] for parts in map(_drop_name_parts, stmt.objects or ())
                            if parts and first.get(parts[-1], index) < index)
+            for parts in map(_drop_name_parts, stmt.objects or ()):
+                if parts:
+                    qualifiers.setdefault(parts[-1], set()).add(
+                        parts[-2] if len(parts) > 1 else None)
         elif isinstance(stmt, _pgast.AlterTableStmt):
             for cmd in stmt.cmds or ():
                 if getattr(cmd, "subtype", None) in (AlterTableType.AT_AttachPartition,
@@ -605,6 +622,7 @@ def _column_types_in_order(statements: Any) -> dict[str, dict[str, str]]:
                     else getattr((names or [None])[-1], "sval", None))
             if last:
                 shadowed.add(last.lower())
+    tainted.update(name for name, seen in qualifiers.items() if len(seen) > 1)
     simple = {name for name, count in made.items() if count == 1 and name not in tainted}
 
     def typed(col: Any) -> str:

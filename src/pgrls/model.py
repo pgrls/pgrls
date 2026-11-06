@@ -311,6 +311,11 @@ class Column:
     name: str
     data_type: str
     is_nullable: bool = True
+    # False where an offline snapshot is not sure the type is the one the
+    # table has (the SQL may have changed it out of its sight): the type is
+    # still the declared one, for the emitter, but the diff reads nothing by
+    # it. Written to a snapshot only when False.
+    type_known: bool = True
 
 
 @dataclass(frozen=True)
@@ -1398,6 +1403,7 @@ def _column_from_dict(c: dict[str, Any]) -> Column:
         name=c["name"],
         data_type=data_type,
         is_nullable=c.get("is_nullable", True),
+        type_known=c.get("type_known", True) is not False,
     )
 
 
@@ -2024,6 +2030,7 @@ class Schema:
                             "name": c.name,
                             "data_type": c.data_type,
                             "is_nullable": c.is_nullable,
+                            **({} if c.type_known else {"type_known": False}),
                         }
                         for c in t.column_details
                     ],

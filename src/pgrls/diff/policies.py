@@ -102,8 +102,10 @@ def _column_types(base_table: Table, head_table: Table) -> dict[str, str] | None
     types: dict[str, str] = {}
     for table in (base_table, head_table):
         for column in table.column_details:
-            seen = types.setdefault(column.name, column.data_type)
-            if seen != column.data_type:
+            # (One an offline snapshot is not sure of is read by no type.)
+            data_type = column.data_type if column.type_known else "unknown"
+            seen = types.setdefault(column.name, data_type)
+            if seen != data_type:
                 types[column.name] = "<changed>"
     # One side's column the other lacks (dropped, or one a snapshot or the
     # offline model could not list) has no one type.

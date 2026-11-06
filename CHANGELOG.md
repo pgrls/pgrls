@@ -194,14 +194,18 @@ breaking changes — they will be called out in this file.
   or `CASE` arm (which takes the arms' common type) never matching a direct
   read of it. The offline model gives the diff a column's type only where it is
   sure of it: the table's name is made once in the input and never
-  dropped, renamed, moved or attached (so no search_path, temporary table
-  or rebuild can make the name another table, and an `ALTER` naming it,
-  however qualified, reaches it), the type is from its own column list or
+  dropped, renamed, moved or attached, nor made `IF NOT EXISTS` or named
+  under two schema qualifiers (so no search_path, temporary table or
+  rebuild can make the name another table, and an `ALTER` naming it
+  reaches it), with no `DO` block or `CALL` in the input (which may alter
+  it), the type is from its own column list or
   a later `ALTER COLUMN … TYPE` / `ADD COLUMN`, and the SQL defines (a domain, enum, range,
   composite, base or shell type, or a rename to one) no type of that name; any other (a parent's or
   `LIKE`'s column, a `CREATE TABLE … AS`, a name an `IMPORT FOREIGN SCHEMA`
-  may make, and every one in SQL with an unlimited import) is `unknown`,
-  read like a column of a snapshot with no types (one way only). A column
+  may make, and every one in SQL with an unlimited import) is read like a
+  column of a snapshot with no types (one way only); its declared type
+  stays in the snapshot for `generate` and `diff --apply`, marked
+  `"type_known": false` for the diff. A column
   one snapshot has and the other lacks has no one type either. A column's
   collation is not in the snapshots: a nondeterministic one (`text COLLATE
   ci`) compares strings otherwise, which the diff does not see, as on

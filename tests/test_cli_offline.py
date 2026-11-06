@@ -1659,7 +1659,12 @@ def test_offline_alter_column_type_is_applied():
 def test_a_column_type_is_the_one_the_statements_leave_in_order(sql, table):
     from pgrls.schema_sources import schema_from_sql
     (t,) = [t for t in schema_from_sql(sql, schemas=("public", "app")).tables if t.name == table]
-    assert {c.name: c.data_type for c in t.column_details}["role"] in ("citext", "unknown")
+    assert {c.name: _diff_type(c) for c in t.column_details}["role"] in ("citext", "unknown")
+
+
+def _diff_type(column):
+    # The type the diff reads a column by: none where pgrls is not sure.
+    return column.data_type if column.type_known else "unknown"
 
 
 @pytest.mark.parametrize("sql", [
@@ -1686,7 +1691,7 @@ def test_a_column_type_is_the_one_the_statements_leave_in_order(sql, table):
 def test_a_column_type_pgrls_cannot_tell_is_unknown(sql):
     from pgrls.schema_sources import schema_from_sql
     (t,) = [t for t in schema_from_sql(sql).tables if t.name == "c"]
-    assert {c.name: c.data_type for c in t.column_details}.get("role", "unknown") == "unknown"
+    assert {c.name: _diff_type(c) for c in t.column_details}.get("role", "unknown") == "unknown"
 
 
 def test_a_column_type_follows_a_re_create_and_reaches_children():
@@ -1696,7 +1701,7 @@ def test_a_column_type_follows_a_re_create_and_reaches_children():
     from pgrls.schema_sources import schema_from_sql
 
     def roles(sql, column="role"):
-        return {t.name: {c.data_type for c in t.column_details if c.name == column}
+        return {t.name: {_diff_type(c) for c in t.column_details if c.name == column}
                 for t in schema_from_sql(sql).tables}
 
     assert roles("CREATE TABLE t (role text); ALTER TABLE t ALTER COLUMN role TYPE citext;") == {
@@ -1706,11 +1711,19 @@ def test_a_column_type_follows_a_re_create_and_reaches_children():
     assert roles("DROP TABLE IF EXISTS t CASCADE; CREATE TABLE t (role text);"
                  " ALTER POLICY p ON t RENAME TO q; ALTER TRIGGER g ON t RENAME TO h;") == {
         "t": {"text"}}
-    # An ALTER reaches the one table of the name, however it is qualified.
-    # (The model also keeps a shell for `app.t`, with no columns.)
-    schema = schema_from_sql("CREATE SCHEMA app; SET search_path = app, public;"
-                             " CREATE TABLE t (role text); ALTER TABLE app.t ALTER COLUMN role TYPE citext;")
-    assert {c.data_type for t in schema.tables for c in t.column_details} == {"citext"}
+    # An ALTER naming the table under another qualifier than its CREATE may
+    # be of another table (`ALTER TABLE IF EXISTS legacy.t`, skipped): the
+    # type is not trusted. (The model also keeps a shell for `app.t`.)
+    for alter in ("ALTER TABLE app.t ALTER COLUMN role TYPE citext;",
+                  "ALTER TABLE IF EXISTS legacy.t ALTER COLUMN role TYPE text;"):
+        schema = schema_from_sql("CREATE SCHEMA app; SET search_path = app, public;"
+                                 " CREATE TABLE t (role citext); " + alter)
+        assert {_diff_type(c) for t in schema.tables for c in t.column_details} <= {"unknown"}
+    # Nor after code that may alter a table, or a CREATE … IF NOT EXISTS.
+    for sql in ("CREATE TABLE t (role text); DO $$ BEGIN ALTER TABLE t ALTER COLUMN role TYPE citext;"
+                " END $$;",
+                "CREATE TABLE IF NOT EXISTS t (role text);"):
+        assert roles(sql) == {"t": {"unknown"}}, sql
     for sql, column in (
         ("CREATE TABLE t (role text); DROP TABLE t; CREATE TABLE t (role citext);", "role"),
         ("CREATE TABLE t (role text); CREATE TABLE IF NOT EXISTS t (role citext);", "role"),
@@ -1925,3 +1938,18 @@ def test_offline_constraint_before_a_rebuild_does_not_reach_the_new_table():
         " DROP TABLE docs; CREATE TABLE docs (id int, tenant_id uuid);"
     )
     assert {c.name: c.is_nullable for c in t.column_details}["tenant_id"] is True
+
+
+def test_a_type_the_diff_does_not_trust_stays_the_declared_one():
+    # `generate` casts by it and `diff --apply` makes the table with it.
+    import json
+    from pgrls.model import Schema
+    from pgrls.schema_sources import schema_from_sql
+    schema = schema_from_sql("CREATE TABLE IF NOT EXISTS d (tenant_id uuid);\n"
+                             "CREATE TABLE IF NOT EXISTS d (tenant_id uuid);\n")
+    (col,) = schema.tables[0].column_details
+    assert (col.data_type, col.type_known) == ("uuid", False)
+    assert "uuid" in schema.to_sql() and "unknown" not in schema.to_sql()
+    # The snapshot carries it to the diff.
+    again = Schema.from_snapshot(json.loads(json.dumps(schema.to_snapshot())))
+    assert not again.tables[0].column_details[0].type_known
