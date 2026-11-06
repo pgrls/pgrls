@@ -3169,6 +3169,90 @@ def test_alter_system_search_path_is_not_followed_in_later_files(tmp_path):
     })
     assert res.exit_code != 0 and "search_path" in res.output
 
+_AUTH_UID = ("CREATE SCHEMA auth;\n"
+             "CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ SELECT NULL::uuid $$;\n"
+             "CREATE TABLE public.docs (id int, owner_id uuid);\n"
+             "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;\n")
+
+
+def _policy_using(sql):
+    from pgrls.schema_sources import schema_from_sql
+    (docs,) = [t for t in schema_from_sql(sql).tables if t.name == "docs"]
+    return docs.policies[0].using_sql
+
+
+def test_an_unqualified_policy_call_names_the_function_the_path_finds(tmp_path):
+    # As `pg_get_expr` writes it live: `auth.uid()`, which SEC004 / SEC038 /
+    # PERF001 / SEC030 key on.
+    import json
+    from click.testing import CliRunner
+    from pgrls.cli import main
+    sql = (_AUTH_UID + "SET search_path = public, auth;\n"
+           "CREATE POLICY p ON docs FOR SELECT TO anon USING (uid() IS NULL OR owner_id = uid());\n")
+    assert _policy_using(sql) == "auth.uid() IS NULL OR owner_id = auth.uid()"
+    path = tmp_path / "s.sql"
+    path.write_text(sql)
+    res = CliRunner().invoke(main, ["lint", "--sql-file", str(path), "--format", "json"])
+    found = {v["rule_id"] for v in json.loads(res.stdout)["violations"]}
+    assert {"SEC004", "SEC038", "PERF001", "SEC030"} <= found, res.output
+
+
+@pytest.mark.parametrize("sql", [
+    # A built-in of the name is searched first.
+    "CREATE FUNCTION auth.now() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;\n"
+    "SET search_path = public, auth;\n"
+    "CREATE POLICY p ON docs USING (now() IS NOT NULL);\n",
+    # Two schemas on the path hold one (the arguments decide which).
+    "CREATE SCHEMA app;\nCREATE FUNCTION app.uid() RETURNS uuid LANGUAGE sql AS $$ SELECT NULL::uuid $$;\n"
+    "SET search_path = app, auth;\nCREATE POLICY p ON public.docs USING (owner_id = uid());\n",
+    # Not on the path, made after the policy, or dropped before it.
+    "CREATE POLICY p ON docs USING (owner_id = uid());\n",
+    "SET search_path = public, auth;\nDROP FUNCTION auth.uid();\n"
+    "CREATE POLICY p ON docs USING (owner_id = uid());\n",
+    # An extension or a DO block may make one pgrls does not see.
+    "CREATE EXTENSION IF NOT EXISTS pgcrypto;\nSET search_path = public, auth;\n"
+    "CREATE POLICY p ON docs USING (owner_id = uid());\n",
+    "DO $$ BEGIN END $$;\nSET search_path = public, auth;\n"
+    "CREATE POLICY p ON docs USING (owner_id = uid());\n",
+    # A function it runs may make one (with EXECUTE), as may a range type.
+    "CREATE FUNCTION public.setup() RETURNS void LANGUAGE sql AS $$ SELECT $$;\n"
+    "SELECT public.setup();\nSET search_path = public, auth;\n"
+    "CREATE POLICY p ON docs USING (owner_id = uid());\n",
+    "SELECT pg_catalog.query_to_xml('SELECT 1', true, false, '');\nSET search_path = public, auth;\n"
+    "CREATE POLICY p ON docs USING (owner_id = uid());\n",
+    "CREATE MATERIALIZED VIEW mv AS SELECT 1 WITH NO DATA;\nREFRESH MATERIALIZED VIEW mv;\n"
+    "SET search_path = public, auth;\nCREATE POLICY p ON docs USING (owner_id = uid());\n",
+    "CREATE TYPE public.r AS RANGE (subtype = int, multirange_type_name = public.uid);\n"
+    "SET search_path = public, auth;\nCREATE POLICY p ON docs USING (owner_id = uid());\n",
+])
+def test_an_unqualified_policy_call_stays_as_written_where_unsure(sql):
+    assert "auth" not in _policy_using(_AUTH_UID + sql)
+
+
+def test_a_drop_before_a_functions_create_leaves_it_followed():
+    # The idempotent migration: DROP … IF EXISTS, then CREATE.
+    sql = ("CREATE SCHEMA auth;\nDROP FUNCTION IF EXISTS auth.uid();\n"
+           "CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ SELECT NULL::uuid $$;\n"
+           "CREATE TABLE public.docs (id int, owner_id uuid);\n"
+           "SET search_path = public, auth;\n"
+           "CREATE POLICY p ON docs USING (owner_id = uid());\n")
+    assert _policy_using(sql) == "owner_id = auth.uid()"
+
+
+def test_a_built_in_run_leaves_the_policy_calls_followed():
+    # pg_dump's `SELECT pg_catalog.set_config(…)` runs no user code.
+    sql = (_AUTH_UID + "SELECT pg_catalog.set_config('search_path', 'public, auth', false);\n"
+           "CREATE POLICY p ON docs USING (owner_id = uid());\n")
+    assert _policy_using(sql) == "owner_id = auth.uid()"
+
+
+def test_a_policy_call_on_the_default_path_stays_unqualified():
+    # `pg_get_expr` leaves `public.uid()` unqualified on the default path.
+    sql = ("CREATE FUNCTION public.uid() RETURNS uuid LANGUAGE sql AS $$ SELECT NULL::uuid $$;\n"
+           "CREATE TABLE public.docs (id int, owner_id uuid);\n"
+           "CREATE POLICY p ON docs USING (owner_id = uid());\n")
+    assert _policy_using(sql) == "owner_id = uid()"
+
 
 def test_what_the_sql_did_to_a_table_renamed_away_before_a_drop_stays():
     from pgrls.schema_sources import schema_from_sql

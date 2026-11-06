@@ -93,6 +93,27 @@ breaking changes — they will be called out in this file.
     does not follow `ALTER TABLE … INHERIT`.
 
 ### Fixed
+- **Offline: an unqualified function call in a policy names the function
+  the search path finds.** Live, `pg_get_expr` writes a call to a function
+  off the default path qualified (`auth.uid()`); offline the call stayed as
+  written (`uid()` under `SET search_path = public, auth`), so SEC004,
+  SEC038, PERF001 and SEC030's tenant binding did not see the auth
+  function. A call is now qualified where it is certain: no `pg_catalog`
+  function has the name (searched first; the names are those of PG 15-18),
+  and the SQL has made one, as it runs up to the policy, in exactly one
+  schema on the path (other schemas are taken to have none, as for
+  tables). A name the SQL drops, renames or moves, or one of an aggregate,
+  is not followed, nor is any after an extension (made, altered, moved or
+  dropped), a `DO` block, a `CALL`, an `EXECUTE`, a statement that runs a
+  function that may be no built-in (`SELECT setup()`, whose body may make
+  one) or a built-in that runs SQL text (`query_to_xml`, `ts_stat`), a
+  `REFRESH MATERIALIZED VIEW`, an event trigger, a range type (its
+  constructors) or `DROP OWNED`; a trigger a write fires, a DEFAULT it
+  fills, a view a read runs, a domain's CHECK or a cast an `ALTER … TYPE`
+  runs, and a user operator are taken to make none. A drop of a function
+  it has not seen made (`DROP FUNCTION IF EXISTS` before the CREATE) leaves
+  the name followed. A call it cannot settle
+  stays as written.
 - **Offline: a table made under a name the SQL used before is a table of
   its own.** A name dropped (with its schema too), or renamed away, and
   made again — by `CREATE TABLE`, `CREATE TABLE … AS` or `SELECT … INTO` —
