@@ -1846,3 +1846,12 @@ def test_an_in_list_of_typed_members_types_its_column_with_them():
         # A text column reads them alike.
         assert compare_predicates(base, head, column_types={"code": "text"}) == (
             "semantic_equivalent")
+    # In a sub-select every member is typed with the left side (its columns
+    # are the outer query's), and a COALESCE of the column reads so too.
+    for base, head in (("code IN (a, 'x '::text)", "(SELECT code IN (a, 'x '::text))"),
+                       ("code IN ('q', 'r', s2)", "(SELECT code IN ('q', 'r', s2))"),
+                       ("COALESCE(code, ''::text) = 'x '::text OR COALESCE(code, ''::text) = 'y'::text",
+                        "COALESCE(code, ''::text) IN ('x '::text, 'y'::text)")):
+        for types in (None, {"code": "unknown", "a": "unknown", "s2": "unknown"}):
+            assert compare_predicates(base, head, column_types=types) not in (
+                "unchanged", "semantic_equivalent", "semantic_tightened"), (head, types)

@@ -204,7 +204,8 @@ breaking changes — they will be called out in this file.
   `IN` list with two or more typed members that hold no column (`code IN
   ('a '::text, 'b'::text)`) is a read of its own: Postgres types the column
   with them, so a `char(n)` one compares as char there, as text in `code =
-  'a '::text`. A column of no
+  'a '::text` (in a sub-select every member is, its columns being the outer
+  query's; a COALESCE of the column reads so too). A column of no
   known type beside a literal cast to a string type (`COALESCE(code, 'a
   '::text) = 'a'`) decides nothing either: a `char(n)` one makes the two
   literals compare as `char`. A column

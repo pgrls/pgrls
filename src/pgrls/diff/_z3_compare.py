@@ -593,7 +593,7 @@ def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any], *,
         if any(_has_typed_arm(v) for v in values):
             # `COALESCE(x, 'a'::citext)` takes a type its arm may decide.
             kind = "arm " + kind
-    if in_list and kind in ("typed", "as text", "as name"):
+    if in_list and kind.removeprefix("arm ") in ("typed", "as text", "as name"):
         kind = "in-list " + kind
     for value in values:
         for n in _ast_nodes(value):
@@ -2374,8 +2374,19 @@ def _anon_any_array(
         return None
     # The list is read as a whole: its members take one common type, which
     # a typed member may decide.
-    _note_string_read(ctx, node.lexpr, elements, in_list=node.kind == A_Expr_Kind.AEXPR_IN and sum(
-        not any(isinstance(n, ColumnRef) for n in _ast_nodes(e)) for e in elements) > 1)
+    if node.kind == A_Expr_Kind.AEXPR_IN and len(together) > 1:
+        # The members typed together with the left side are one read; each
+        # member Postgres splits off (one holding a column of the IN's own
+        # query) is compared alone, as `=` would.
+        _note_string_read(ctx, node.lexpr, together, in_list=True)
+        for e in elements:
+            if not any(e is t for t in together):
+                _note_string_read(ctx, node.lexpr, [e])
+    elif node.kind == A_Expr_Kind.AEXPR_IN:
+        for e in elements:
+            _note_string_read(ctx, node.lexpr, [e])
+    else:
+        _note_string_read(ctx, node.lexpr, elements)
     acc: _TV | None = None
     for elem in elements:
         cmp_node = A_Expr(
