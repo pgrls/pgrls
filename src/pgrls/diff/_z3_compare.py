@@ -544,6 +544,11 @@ def _rounds_its_kin(node: Any, ctx: _Context) -> bool:
                for n in _ast_nodes(node))
 
 
+# Literals cast to a string type: in a diff a column beside one may be a
+# `char(n)` one, which makes the pair compare as `char` (`'a '` = `'a'`).
+_STRING_CASTS = frozenset({"as text", "as varchar", "as bpchar", "as name"})
+
+
 def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any]) -> None:
     """In a diff, note how `left` compared with each of `rights` (one, or an
     `IN` list's members, which take one type) reads each column the operands
@@ -2140,7 +2145,8 @@ def _anon_coalesce(
         # gives a citext or char(n) column its own, comparing it otherwise
         # (the diff path reads it by the column's type, `_note_string_read`).
         return None
-    if any(_literal_kind(a) == "bare" for a in args) and not all(
+    if any(_literal_kind(a) == "bare" or ctx.any_session and _literal_kind(a) in _STRING_CASTS
+           for a in args) and not all(
             _keeps_strings_text(a, ctx) for a in args):
         # A bare string takes the type of the values beside it, so on a NULL
         # row two literals meet in it (`COALESCE(price, '0') = '0.00'` is
@@ -2338,7 +2344,9 @@ def _anon_any_array(
     together = elements if isinstance(arr, A_ArrayExpr) or ctx.subselect_depth else [
         e for e in elements if not any(isinstance(n, ColumnRef) for n in _ast_nodes(e))]
     if _literal_kind(node.lexpr) == "bare" and len(together) > 1 \
-            and any(_literal_kind(e) == "bare" for e in together) \
+            and any(_literal_kind(e) == "bare"
+                    or ctx.any_session and _literal_kind(e) in _STRING_CASTS
+                    for e in together) \
             and not all(_keeps_strings_text(e, ctx) for e in together):
         # `'1' IN (current_setting('x')::int, '01')`: the members take one
         # type with the left side (int), so the two literals meet in it,

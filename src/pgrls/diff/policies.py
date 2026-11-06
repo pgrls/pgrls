@@ -105,7 +105,10 @@ def _column_types(base_table: Table, head_table: Table) -> dict[str, str] | None
             # (One an offline snapshot is not sure of is read by no type.)
             data_type = column.data_type if column.type_known else "unknown"
             seen = types.setdefault(column.name, data_type)
-            if seen != data_type:
+            if "unknown" in (seen, data_type):
+                # (Trusted on one side only: read it by no type, one way.)
+                types[column.name] = "unknown"
+            elif seen != data_type:
                 types[column.name] = "<changed>"
     # One side's column the other lacks (dropped, or one a snapshot or the
     # offline model could not list) has no one type.

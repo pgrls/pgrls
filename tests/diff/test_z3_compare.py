@@ -1804,3 +1804,27 @@ def test_a_leaking_row_is_an_integer_one() -> None:
     cx = counterexample(parse_expr("price > 5.0"), parse_expr("price > 0.0"))
     assert cx is not None
     assert isinstance(cx["price"], int) and 0 < cx["price"] <= 5
+
+
+def test_a_string_cast_beside_a_column_of_no_known_type_is_no_exact_reading():
+    # A `char(n)` `code` makes `'a '::text` and `'a'` compare as char (equal).
+    from pgrls.diff.ast_compare import compare_predicates
+    for head in ("(team = 'a' OR COALESCE(code, 'a '::text) = 'a') AND code IS NULL",
+                 "(team = 'a' OR (SELECT 'a' IN (code, 'a '::varchar))) AND code IS NULL"):
+        assert compare_predicates("team = 'a' AND code IS NULL", head) not in (
+            "unchanged", "semantic_equivalent", "semantic_tightened"), head
+
+
+def test_a_column_trusted_on_one_side_only_is_read_by_no_type():
+    from pgrls.diff.policies import _column_types
+    from pgrls.model import Column, Table
+
+    def table(type_known):
+        return Table(schema="public", name="t", rls_enabled=True, force_rls=False, policies=(),
+                     column_details=(Column("role", "text", type_known=type_known),))
+
+    assert _column_types(table(True), table(False)) == {"role": "unknown"}
+    # A widening still reads as one.
+    from pgrls.diff.ast_compare import compare_predicates
+    assert compare_predicates("role = 'admin'", "role IN ('admin', 'owner')",
+                              column_types={"role": "unknown"}) == "semantic_loosened"

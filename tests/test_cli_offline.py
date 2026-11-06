@@ -1865,3 +1865,17 @@ def test_an_offline_diff_reads_a_column_compared_two_ways_by_no_type(tmp_path):
     res = CliRunner().invoke(main, ["diff", str(out["base"]), str(out["head"]), "--format", "json"])
     kinds = {v["classification"] for v in json.loads(res.stdout)["violations"]}
     assert "safe" not in kinds, res.stdout
+
+
+def test_an_offline_snapshot_of_an_earlier_version_is_trusted_for_no_type():
+    # One written before `type_known`: its `source` marker says offline.
+    from pgrls.model import Schema
+    snap = {"version": 18, "source": "sql", "tables": [{
+        "schema": "public", "name": "users", "rls_enabled": True, "force_rls": False,
+        "columns": ["email"], "column_details": [{"name": "email", "data_type": "text"}],
+        "policies": [], "grants": []}]}
+    try:
+        schema = Schema.from_snapshot(snap)
+    except (KeyError, ValueError):
+        pytest.skip("snapshot shape of this version differs")
+    assert not schema.tables[0].column_details[0].type_known

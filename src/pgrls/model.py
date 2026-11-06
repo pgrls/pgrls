@@ -34,7 +34,7 @@ info via the new ``column_details`` per table; v4 added top-level
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import Any, Literal
 
@@ -1403,7 +1403,7 @@ def _column_from_dict(c: dict[str, Any]) -> Column:
         name=c["name"],
         data_type=data_type,
         is_nullable=c.get("is_nullable", True),
-        type_known=c.get("type_known", True) is not False,
+        type_known=c.get("type_known", True) is True,
     )
 
 
@@ -2511,6 +2511,11 @@ class Schema:
             _table_from_dict(t, top_level_policies)
             for t in payload.get("tables", [])
         )
+        if payload.get("source") == "sql":
+            # An offline capture, by this version or an earlier one (which
+            # wrote no `type_known`): no column type of it is trusted.
+            tables = tuple(replace(t, column_details=tuple(
+                replace(c, type_known=False) for c in t.column_details)) for t in tables)
 
         # v3 has no "views" / "security_definer_functions" arrays; gate
         # both on version so a v3 payload yields empty tuples without a

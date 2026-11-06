@@ -197,8 +197,13 @@ breaking changes — they will be called out in this file.
   extension or `dblink` it runs, or a search_path it sets, may change one
   out of sight), so an offline snapshot (`--sql-file` / `--migrations`)
   keeps each declared type for `generate` and `diff --apply`, marked
-  `"type_known": false`, and the diff reads such a column like one of a
-  snapshot with no types (one way only). A column
+  `"type_known": false` (one an earlier version wrote, with no such key,
+  is read the same way by its `"source": "sql"` marker), and the diff reads
+  such a column like one of a snapshot with no types (one way only), also
+  where the other side is a live snapshot that knows it. A column of no
+  known type beside a literal cast to a string type (`COALESCE(code, 'a
+  '::text) = 'a'`) decides nothing either: a `char(n)` one makes the two
+  literals compare as `char`. A column
   one snapshot has and the other lacks has no one type either. A column's
   collation is not in the snapshots: a nondeterministic one (`text COLLATE
   ci`) compares strings otherwise, which the diff does not see, as on
