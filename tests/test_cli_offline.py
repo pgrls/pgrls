@@ -3413,6 +3413,10 @@ def test_a_partition_made_again_after_code_takes_the_new_parent_of_its_name():
     # An IF NOT EXISTS over a table the SQL did not make set no link.
     "CREATE TABLE IF NOT EXISTS b PARTITION OF a FOR VALUES FROM (0) TO (1);\n"
     "CREATE TABLE a PARTITION OF b DEFAULT;\n",
+    # ... nor one over a view, which a rename then closes into a cycle.
+    "CREATE VIEW b AS SELECT 1 AS id;\nDROP TABLE IF EXISTS x;\n"
+    "CREATE TABLE IF NOT EXISTS b PARTITION OF c FOR VALUES FROM (0) TO (5);\n"
+    "ALTER TABLE b RENAME TO c;\n",
 ])
 def test_valid_sql_makes_no_partition_cycle(sql, tmp_path):
     from click.testing import CliRunner
@@ -3421,3 +3425,15 @@ def test_valid_sql_makes_no_partition_cycle(sql, tmp_path):
     path.write_text(sql)
     res = CliRunner().invoke(main, ["lint", "--sql-file", str(path)])
     assert res.exit_code != 2, res.output
+
+
+@pytest.mark.parametrize("gone", ["ALTER TABLE a DETACH PARTITION b;\nDROP TABLE a;\n",
+                                  "ALTER TABLE a RENAME TO z;\n"])
+def test_a_name_made_again_as_a_partition_of_its_old_child_keeps_the_link(gone):
+    # The new `a` is a partition of `b`, which was the old `a`'s.
+    tables = _tables_of("CREATE TABLE a (id int, tenant_id int) PARTITION BY RANGE (id);\n"
+                        "CREATE TABLE b PARTITION OF a FOR VALUES FROM (0) TO (10)"
+                        " PARTITION BY RANGE (id);\n" + gone
+                        + "CREATE TABLE a PARTITION OF b FOR VALUES FROM (0) TO (5);\n")
+    assert tables["a"].partition_of == ("public", "b")
+    assert list(tables["a"].columns) == ["id", "tenant_id"]
