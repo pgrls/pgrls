@@ -693,6 +693,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             current.inherits = [p for p in new_inherits if not _is_below(tables, p, key)]
             continue
         builder = _TableBuilder(schema=key[0], name=key[1], created_at=index)
+        builder.unsure_link = bool(stmt.if_not_exists)
         builder.partitioned = getattr(stmt, "partspec", None) is not None
         place(key, builder, index)
         # Declarative partition child (`PARTITION OF parent`) and classic
@@ -798,8 +799,9 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
 
     # An IF NOT EXISTS the model could not tell was a no-op may leave a link
     # that a rename closes into a cycle: break it rather than fail (the
-    # table then reads as standalone, which only over-reports).
-    for key, builder in tables.items():
+    # table then reads as standalone, which only over-reports) — that one's
+    # first, so a real link of the cycle stays.
+    for key, builder in sorted(tables.items(), key=lambda item: not item[1].unsure_link):
         if builder.partition_of is not None and _is_below(tables, builder.partition_of, key):
             builder.partition_of = None
         builder.inherits = [p for p in builder.inherits if not _is_below(tables, p, key)]
@@ -1872,6 +1874,9 @@ class _TableBuilder:
         # The CREATE that made it: `created_at` advances to one merged into
         # it, this does not.
         self.made_at = created_at
+        # Made by an IF NOT EXISTS, which may have been a no-op the model
+        # could not tell (its parent link then not real).
+        self.unsure_link = False
         self.rls_enabled = False
         self.force_rls = False
         self.columns: list[Column] = []

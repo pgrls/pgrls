@@ -3361,3 +3361,19 @@ def test_a_name_made_again_as_a_partition_of_its_old_child_keeps_the_link(gone):
                         + "CREATE TABLE a PARTITION OF b FOR VALUES FROM (0) TO (5);\n")
     assert tables["a"].partition_of == ("public", "b")
     assert list(tables["a"].columns) == ["id", "tenant_id"]
+
+
+@pytest.mark.parametrize("sql, child, parent", [
+    # `b` there before; `a` its new name; the IF NOT EXISTS over `a` a no-op.
+    ("CREATE TABLE d PARTITION OF b FOR VALUES FROM (0) TO (10) PARTITION BY RANGE (id);\n"
+     "ALTER TABLE b RENAME TO a;\n"
+     "CREATE TABLE IF NOT EXISTS a PARTITION OF d FOR VALUES FROM (0) TO (5);\n", "d", "a"),
+    ("DROP TABLE IF EXISTS c;\n"
+     "CREATE TABLE c PARTITION OF a FOR VALUES FROM (0) TO (10) PARTITION BY RANGE (id);\n"
+     "CREATE TABLE IF NOT EXISTS a PARTITION OF c FOR VALUES FROM (0) TO (5);\n"
+     "ALTER TABLE a RENAME TO d;\n", "c", "d"),
+])
+def test_a_cycle_is_broken_at_the_link_an_if_not_exists_may_not_have_made(sql, child, parent):
+    tables = _tables_of(sql)
+    assert tables[child].partition_of == ("public", parent)
+    assert tables[parent].partition_of is None
