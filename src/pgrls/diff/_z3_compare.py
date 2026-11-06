@@ -2118,14 +2118,18 @@ def _anon_coalesce(
         # (the diff path reads it by the column's type, `_note_string_read`).
         return None
     if any(_literal_kind(a) == "bare" for a in args) and not all(
-            _is_text(None if ctx.column_types is None
-                     else ctx.column_types.get(column.fields[-1].sval))
-            for a in args if isinstance(column := _unwrap_scalar_sublink(a), ColumnRef)
-            and column.fields and isinstance(column.fields[-1], String)):
-        # A bare string takes the column's type, so on a NULL row two
-        # literals meet in it (`COALESCE(price, '0') = '0.00'` is TRUE,
-        # numeric; `'A' = 'a'` citext), which Z3 reads as text: only a text
-        # column's reads exactly (the diff path keeps the rest opaque).
+            isinstance(a, A_Const) or _literal_kind(a) in ("as text", "as varchar")
+            or isinstance(column := _unwrap_scalar_sublink(a), ColumnRef)
+            and column.fields and isinstance(column.fields[-1], String)
+            and _is_text(None if ctx.column_types is None
+                         else ctx.column_types.get(column.fields[-1].sval))
+            for a in args):
+        # A bare string takes the type of the values beside it, so on a NULL
+        # row two literals meet in it (`COALESCE(price, '0') = '0.00'` is
+        # TRUE, numeric; `'A' = 'a'` citext; `COALESCE(length(s), '1') =
+        # '01'`, integer), which Z3 reads as text: only beside text columns
+        # and literals does it read exactly (the diff path keeps the rest
+        # opaque).
         return None
     # Its arguments take one type, a column's beside a literal.
     with ctx.unifying(not all(_is_constant(a) for a in args)):

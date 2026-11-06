@@ -425,6 +425,13 @@ def test_a_string_compared_with_a_column_reads_by_the_columns_type():
         assert compare_predicates(base, head) == "requires_review", head
     assert diff("status = 'x'", "COALESCE(status, 'active') = 'x'", status="text") == (
         "semantic_equivalent")
+    # ... and not beside a value of another type, a column's or not.
+    for arm in ("length(s)", "abs(i)", "(SELECT abs(i))", "CASE WHEN b THEN i END",
+                "length(current_setting('x.n', true))"):
+        assert diff(f"COALESCE({arm}, '0') = '00' AND {arm} IS NOT NULL",
+                    f"COALESCE({arm}, '0') = '00' AND ({arm} IS NOT NULL OR s IS NULL)",
+                    s="text", i="int", b="boolean") in (
+                        "requires_review", "semantic_loosened"), arm
     # An arm that is no literal (`auth.email()`, text) types the COALESCE.
     for base, head in (("COALESCE(e, auth.email()) = 'A' AND t = 1",
                         "(COALESCE(e, auth.email()) = 'A' OR e = 'A') AND t = 1"),

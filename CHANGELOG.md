@@ -152,8 +152,10 @@ breaking changes — they will be called out in this file.
   string literal reads exactly only for a `text` / `varchar` column the
   diff knows the type of — on a NULL row two literals meet in the
   column's type, so `COALESCE(price, '0') = '0.00'` holds for a numeric
-  `price` and `COALESCE(e, 'A') = 'a'` for a citext `e`; otherwise the
-  diff keeps the COALESCE an opaque value, as on `main`), or a cast to a text type that changes a value
+  `price`, `COALESCE(e, 'A') = 'a'` for a citext `e` and
+  `COALESCE(length(s), '1') = '01'` for any `s`, so beside anything but
+  literals and such columns the diff keeps the COALESCE an opaque value, as
+  on `main`), or a cast to a text type that changes a value
   (`bpchar`, `"char"`, `name`) beside a bare string literal, which then
   compares as that type (`x = ANY(ARRAY['a'::bpchar, 'b '])` holds for
   `x = 'b'`; `main` proved such a predicate isolated). In a
