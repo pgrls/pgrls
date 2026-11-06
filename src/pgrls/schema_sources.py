@@ -614,6 +614,12 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         key = _relation_key(stmt.relation, default_schema)
         if key is None:
             continue
+        if key in tables and _dropped_between(
+                statements, key, tables[key].created_at, index, default_schema) and not (
+                _renamed_between(statements, key, tables[key].created_at, index, default_schema)):
+            # Dropped and made again: a table of its own, with this CREATE's
+            # columns and links.
+            del tables[key]
         if key in tables:
             # A second CREATE for the same relation: `IF NOT EXISTS` (a no-op
             # in Postgres), a re-CREATE after an intervening DROP, or DDL that
@@ -739,13 +745,19 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
 
     def before_last_drop(relation: Any, index: int) -> bool:
         key = _relation_key(relation, default_schema) if relation is not None else None
-        return key is not None and index < last_drop.get(key, -1)
+        # (Not one renamed away first: the SQL did it to that table.)
+        return key is not None and index < last_drop.get(key, -1) and not _renamed_between(
+            statements, key, index, last_drop[key], default_schema)
 
     # Pass 2: ALTER TABLE (RLS toggles), CREATE POLICY, GRANT, RENAME.
     for index, raw in enumerate(statements):
         stmt = raw.stmt
         kind = type(stmt).__name__
-        if kind in ("AlterTableStmt", "CreatePolicyStmt", "AlterPolicyStmt") and \
+        if kind in ("AlterTableStmt", "CreatePolicyStmt", "AlterPolicyStmt") and not (
+                # A DETACH frees a partition that outlives its parent's drop.
+                kind == "AlterTableStmt" and any(
+                    getattr(c, "subtype", None) == AlterTableType.AT_DetachPartition
+                    for c in stmt.cmds or ())) and \
                 before_last_drop(getattr(stmt, "relation", None) or getattr(stmt, "table", None),
                                  index):
             continue
@@ -1241,7 +1253,7 @@ class _Resolver:
                 "bad_sql",
                 "the SQL connects to a database or as a role that sets "
                 "search_path (a \\connect, or a later migration file's session "
-                "after an ALTER DATABASE / ALTER ROLE … SET); pgrls cannot tell "
+                "after an ALTER DATABASE / ALTER ROLE / ALTER SYSTEM … SET); pgrls cannot tell "
                 "which schema an unqualified name is in. Set it after, or "
                 "qualify the names.",
             )

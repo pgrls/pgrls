@@ -93,15 +93,18 @@ breaking changes — they will be called out in this file.
     does not follow `ALTER TABLE … INHERIT`.
 
 ### Fixed
+- **Offline: a table dropped and made again is a table of its own.** Its
+  columns are the new CREATE's, and the RLS flags, policies and grants the
+  SQL gave the one before (by that name, not renamed away first) are gone
+  with it: they carried over, hiding SEC001 on a rebuild migration. `DROP
+  SCHEMA` takes its tables. Not yet followed: a parent's drop taking its
+  partitions (or, with CASCADE, its children) and a table made under a name
+  renamed away before.
 - **Offline analysis says that an extension's tables are not seen.** pg_dump
   writes them as `CREATE EXTENSION` alone (PostGIS's `public.spatial_ref_sys`
   has RLS off), so `--sql-file` lint and MCP `sql=` cannot report on them,
   and drop a `GRANT` on one; the offline warnings now say so.
-- A table dropped (or its schema dropped) and made again is a table of
-  its own: the RLS flags, policies and grants of the one before are gone
-  with it (they carried over, hiding SEC001), and `DROP SCHEMA` takes its
-  tables. `SET search_path = ''` names no schema, as the `set_config()`
-  spelling already did. **`--sql-file` / `pgrls pr` read `pg_dump --schema-only` output.** A
+- **`--sql-file` / `pgrls pr` read `pg_dump --schema-only` output.** A
   dump from `pg_dump` since the August 2025 minor releases (13.22, 14.19,
   15.14, 16.10, 17.6) opens with a `\restrict <key>` psql meta-command,
   which is not SQL, so the whole file failed to parse. psql meta-command
@@ -197,7 +200,7 @@ breaking changes — they will be called out in this file.
   entry pgrls cannot follow. A search path pgrls
   cannot follow is refused: one a `\connect`ed database or role may set,
   `pg_temp` on it ahead of the schema that holds a name, no schema on it at
-  all where a relation is created (a dump's empty search_path over SQL after
+  all (`SET search_path = ''` names none) where a relation is created (a dump's empty search_path over SQL after
   it in one session: Postgres errors; a name looked up there is a
   catalog's, an `IF EXISTS` no-op or an error, as before; `snapshot
   --migrations` gives each file a session of its own, as migration runners
