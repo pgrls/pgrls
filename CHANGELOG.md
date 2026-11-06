@@ -93,6 +93,11 @@ breaking changes — they will be called out in this file.
     does not follow `ALTER TABLE … INHERIT`.
 
 ### Fixed
+- **Offline: a child made after its parent's rename takes its columns.** A
+  table created `INHERITS (p)` or `PARTITION OF p` after `ALTER TABLE … RENAME TO
+  p` had no columns offline (the parent was looked up under its new name
+  before the rename was applied), so SEC030 missed a nullable tenant column
+  and HYG001 / SEC005 fired falsely.
 - **Offline analysis says that an extension's tables are not seen.** pg_dump
   writes them as `CREATE EXTENSION` alone (PostGIS's `public.spatial_ref_sys`
   has RLS off), so `--sql-file` lint and MCP `sql=` cannot report on them,

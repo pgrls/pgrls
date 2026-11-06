@@ -678,7 +678,9 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         # already populated. Without this a partition child modelled offline
         # has zero columns and every column-keyed rule silently skips it.
         for parent_key in parents:
-            parent = tables.get(parent_key)
+            # Pass 1 holds a table under the name it was made with: a parent
+            # renamed before this CREATE is found under that one.
+            parent = tables.get(_made_as(statements, parent_key, index, default_schema))
             if parent is None:
                 continue
             for col in parent.columns:
@@ -2165,6 +2167,23 @@ def _drops(stmt: Any, key: tuple[str, str], default_schema: str) -> bool:
     return stmt.removeType == ObjectType.OBJECT_TABLE and any(
         _drop_table_key(_drop_name_parts(n), default_schema) == key
         for n in stmt.objects or () if _drop_name_parts(n))
+
+
+def _made_as(statements: Any, key: tuple[str, str], index: int,
+             default_schema: str) -> tuple[str, str]:
+    """The name the relation called `key` at statement `index` was made
+    with: followed back through the renames to it, to its CREATE."""
+    for raw in reversed(statements[:index]):
+        stmt = raw.stmt
+        if any(creates and _relation_key(rel, default_schema) == key
+               for rel, creates in _named_relations(stmt)):
+            break
+        if (isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None
+                and stmt.renameType in _RELATION_KINDS and stmt.newname
+                and (old := _relation_key(stmt.relation, default_schema)) is not None
+                and (old[0], stmt.newname) == key):
+            key = old
+    return key
 
 
 def _renamed_between(statements: Any, key: tuple[str, str], after: int, before: int,

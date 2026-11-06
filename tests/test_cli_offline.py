@@ -3168,3 +3168,28 @@ def test_alter_system_search_path_is_not_followed_in_later_files(tmp_path):
         "002_b.sql": "CREATE TABLE t (id int);\n",
     })
     assert res.exit_code != 0 and "search_path" in res.output
+
+@pytest.mark.parametrize("child", [
+    "CREATE TABLE app.rc (x int) INHERITS (app.renamed);\n",
+    "CREATE TABLE app.rc PARTITION OF app.renamed FOR VALUES IN (1);\n",
+])
+def test_a_child_made_after_its_parents_rename_takes_its_columns(child):
+    from pgrls.schema_sources import schema_from_sql
+    partitioned = " PARTITION BY LIST (id)" if "PARTITION OF" in child else ""
+    schema = schema_from_sql(
+        "CREATE SCHEMA app;\n"
+        f"CREATE TABLE app.old (id int, tenant_id int){partitioned};\n"
+        "ALTER TABLE app.old RENAME TO renamed;\n" + child, schemas=("app",))
+    rc = next(t for t in schema.tables if t.name == "rc")
+    assert {"id", "tenant_id"} <= set(rc.columns)
+
+
+def test_a_child_takes_the_columns_of_the_table_its_parents_name_holds_then():
+    # `a` renamed to `b`, `b` dropped and made again: the child's parent is
+    # the new `b`, not the old `a`.
+    from pgrls.schema_sources import schema_from_sql
+    schema = schema_from_sql(
+        "CREATE TABLE a (old_col int);\nALTER TABLE a RENAME TO b;\nDROP TABLE b;\n"
+        "CREATE TABLE b (new_col int);\nCREATE TABLE c () INHERITS (b);\n")
+    c = next(t for t in schema.tables if t.name == "c")
+    assert list(c.columns) == ["new_col"]
