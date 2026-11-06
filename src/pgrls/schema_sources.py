@@ -1828,9 +1828,6 @@ class _TableBuilder:
         # Index of the statement that created this table, so a `DROP TABLE`
         # appearing EARLIER in the input cannot remove a LATER re-CREATE.
         self.created_at = created_at
-        # The CREATE that made it (and its columns): `created_at` advances
-        # to a CREATE merged into it, this does not.
-        self.columns_from = created_at
         self.rls_enabled = False
         self.force_rls = False
         self.columns: list[Column] = []
