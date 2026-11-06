@@ -2414,17 +2414,48 @@ def _migrations_snapshot(tmp_path, files):
     return res, (json.loads(out.read_text()) if res.exit_code == 0 else None)
 
 
-@pytest.mark.parametrize("later", [
-    "CREATE TABLE g (id int);\n",
-    "CREATE TABLE g (id int);\nBEGIN;\nCREATE TABLE h (id int);\nROLLBACK;\n",
-])
-def test_a_transaction_a_migration_file_leaves_open_ends_with_it(tmp_path, later):
-    res, snap = _migrations_snapshot(tmp_path, {
+def test_a_migration_file_ending_inside_a_transaction_is_refused(tmp_path):
+    # psql rolls it back, `psql -1` and `lint --migrations` commit it; it no
+    # longer voids the files after it either.
+    res, _ = _migrations_snapshot(tmp_path, {
         "001_a.sql": "CREATE TABLE a1 (id int);\nBEGIN;\nCREATE TABLE e (id int);\n",
-        "002_b.sql": later,
+        "002_b.sql": "CREATE TABLE g (id int);\n",
+    })
+    assert res.exit_code != 0
+    assert "ends inside a transaction" in res.output
+
+
+def test_migration_files_ending_their_transactions_are_read_apart(tmp_path):
+    # A bare BEGIN at the end changes nothing; a last statement with no `;`
+    # ends with its file.
+    res, snap = _migrations_snapshot(tmp_path, {
+        "001_a.sql": "CREATE TABLE a1 (id int);\nBEGIN;\n",
+        "002_b.sql": "BEGIN;\nCREATE TABLE h (id int);\nROLLBACK;\nCREATE TABLE g (id int)",
+        "003_c.sql": "CREATE TABLE k (id int);\n",
     })
     assert res.exit_code == 0, res.output
-    assert {t["name"] for t in snap["tables"]} == {"a1", "g"}
+    assert {t["name"] for t in snap["tables"]} == {"a1", "g", "k"}
+
+
+def test_a_lookup_looks_on_past_pg_catalog():
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+    (t,) = schema_from_sql("SET search_path = pg_catalog, public;\n"
+                           "CREATE POLICY p ON t FOR SELECT USING (true);\n"
+                           "ALTER TABLE t ENABLE ROW LEVEL SECURITY;\n").tables
+    assert (t.schema, t.name, t.rls_enabled, len(t.policies)) == ("public", "t", True, 1)
+    # A CREATE there is Postgres's "permission denied to create".
+    with pytest.raises(SchemaSourceError, match="pg_catalog first"):
+        schema_from_sql("SET search_path = pg_catalog, public;\nCREATE TABLE u (id int);\n")
+
+
+def test_a_rename_of_a_name_found_nowhere_makes_no_temporary_table():
+    from pgrls.schema_sources import schema_from_sql
+    (u,) = schema_from_sql(
+        "CREATE TABLE public.u (id int);\nALTER TABLE public.u ENABLE ROW LEVEL SECURITY;\n"
+        "SELECT pg_catalog.set_config('search_path', '', false);\n"
+        "ALTER TABLE IF EXISTS t RENAME TO u;\n"
+        "SET search_path = public;\nALTER TABLE u DISABLE ROW LEVEL SECURITY;\n").tables
+    assert not u.rls_enabled
 
 
 def test_a_role_setting_a_migration_makes_is_not_followed_in_later_files(tmp_path):

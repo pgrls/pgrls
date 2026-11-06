@@ -872,9 +872,33 @@ def _truncated(name: str) -> str:
     return raw[:_NAME_BYTES].decode(errors="ignore")
 
 
+def ends_in_transaction(sql: str) -> bool:
+    """Whether `sql` (a migration file) leaves a transaction open over a
+    statement, which migration runners end otherwise: psql rolls it back,
+    `psql -1` and a driver's `with` block (`lint --migrations`) commit it.
+    False for SQL that does not parse (reading it all reports that)."""
+    sql, _ = _split_psql_meta_commands(sql)
+    try:
+        statements = pglast.parse_sql(sql)
+    except pglast.parser.ParseError:
+        return False
+    start = _transaction_state(statements)[1]
+    return start is not None and start < len(statements) - 1
+
+
 def _rolled_back(statements: Any) -> frozenset[int]:
     """The indexes of the statements a `ROLLBACK` (or `ROLLBACK TO
     SAVEPOINT`, or the end of the input in an open transaction) undoes."""
+    void, start = _transaction_state(statements)
+    if start is not None:
+        # psql's session ends, and Postgres rolls the open transaction back.
+        void |= set(range(start, len(statements)))
+    return frozenset(void)
+
+
+def _transaction_state(statements: Any) -> tuple[set[int], int | None]:
+    """What the `ROLLBACK`s undo, and where a transaction still open at the
+    end began."""
     void: set[int] = set()
     start: int | None = None
     savepoints: list[tuple[str, int]] = []
@@ -914,10 +938,7 @@ def _rolled_back(statements: Any) -> frozenset[int]:
                 "the SQL prepares a transaction (PREPARE TRANSACTION), whose "
                 "effects pgrls cannot tell apart.",
             )
-    if start is not None:
-        # psql's session ends, and Postgres rolls the open transaction back.
-        void.update(range(start, len(statements)))
-    return frozenset(void)
+    return void, start
 
 
 # A role pgrls cannot name: a schema's owner it does not know (one there
@@ -1232,17 +1253,28 @@ class _Resolver:
     def create_schema(self, *, looking_up: bool = False) -> str:
         """Where an unqualified CREATE puts its relation (or where a name
         not found would be, `looking_up`)."""
-        first: str | None = next(iter(self._entries()), None)
-        if (first is None or first == "pg_catalog") and looking_up:
-            # Not one the SQL made: a catalog's (pg_dump leaves `pg_roles`
-            # unqualified under its empty path), an IF EXISTS no-op, or an
-            # error.
+        # (Only as far as the first entry: Postgres goes no further.)
+        entries = iter(self._entries())
+        if looking_up:
+            # Postgres looks on past the catalog; with nothing else on the
+            # path the name is not one the SQL made: a catalog's (pg_dump
+            # leaves `pg_roles` unqualified under its empty path), an IF
+            # EXISTS no-op, or an error.
+            entries = (entry for entry in entries if entry != "pg_catalog")
+        first: str | None = next(entries, None)
+        if first is None and looking_up:
             return _NOWHERE
-        if first is None or first == "pg_catalog":
-            # "no schema has been selected to create in", or a catalog
-            # Postgres refuses to create in: the statement errors, which
-            # pgrls cannot model as succeeding (a dump's empty search_path
-            # left in force over SQL after it, say).
+        if first == "pg_catalog":
+            raise SchemaSourceError(
+                "bad_sql",
+                "the SQL creates a relation with pg_catalog first on search_path "
+                "(Postgres refuses: permission denied to create in pg_catalog); "
+                "qualify the names.",
+            )
+        if first is None:
+            # "no schema has been selected to create in": the statement
+            # errors, which pgrls cannot model as succeeding (a dump's empty
+            # search_path left in force over SQL after it, say).
             raise SchemaSourceError(
                 "bad_sql",
                 "the SQL creates a relation with no schema on search_path to "
@@ -1290,7 +1322,7 @@ class _Resolver:
             )
         if holders:
             return holders[0], True
-        entries = list(self._entries())
+        entries = [entry for entry in self._entries() if entry != "pg_catalog"]
         if len(entries) == 1:
             return entries[0], False  # the one place it can be (else it errors)
         return self.create_schema(looking_up=True), False
@@ -1424,7 +1456,8 @@ class _Resolver:
             if old in self.relations:
                 self.relations.discard(old)
                 self.relations.add((old[0], stmt.newname))
-            if old[0] == _NOWHERE:
+            if old[0] == _NOWHERE and old[1] in self.temp:
+                # (Not a name found nowhere: an IF EXISTS no-op.)
                 self.temp.discard(old[1])
                 self.temp.add(stmt.newname)
                 if old[1] in self.commit_drop:

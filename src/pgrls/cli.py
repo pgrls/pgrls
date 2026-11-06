@@ -128,6 +128,7 @@ from pgrls.schema_sources import (
     SchemaSource,
     SchemaSourceError,
     WarnCommand,
+    ends_in_transaction,
     inert_rule_ids,
     reparse_policy_asts,
     resolve_schema,
@@ -1016,12 +1017,20 @@ def _resolve_offline_schema(
                     f"{_OFFLINE_MAX_BYTES // (1024 * 1024)} MiB; split it or "
                     "lint against a live database."
                 )
+            if migrations and ends_in_transaction(chunk):
+                raise ToolError(
+                    f"--migrations file {entry!r} ends inside a transaction "
+                    "(a BEGIN with no COMMIT or ROLLBACK): migration runners end "
+                    "it otherwise (psql rolls it back; `psql -1` and `pgrls lint "
+                    "--migrations` commit it), so pgrls cannot tell what it "
+                    "leaves. End the transaction in the file."
+                )
             parts.append(chunk)
         # A migration runner applies each file in a session of its own (the
         # Supabase CLI resets each one), so a baseline dump's empty
-        # search_path does not reach the files after it, and a transaction
-        # a file leaves open ends with it, rolled back.
-        sql_text = ("\nROLLBACK;\nDISCARD ALL;\n" if migrations else "\n").join(parts)
+        # search_path does not reach the files after it. psql runs a last
+        # statement with no `;` at the end of its file.
+        sql_text = ("\n;\nROLLBACK;\nDISCARD ALL;\n" if migrations else "\n").join(parts)
     try:
         schema, source, snapshot_version = resolve_schema(
             sql=sql_text, snapshot=snapshot, schemas=schemas
@@ -2263,7 +2272,7 @@ def _offline_migration_options(func: Callable[..., Any]) -> Callable[..., Any]:
         help=(
             "Build the snapshot OFFLINE from a migration directory (or a single "
             ".sql file): its layout-ordered files are parsed in order, each as a session of "
-            "its own (a transaction it leaves open is rolled back) — no database, no Docker (unlike `lint --migrations`, which "
+            "its own (one that ends inside a transaction is refused) — no database, no Docker (unlike `lint --migrations`, which "
             "provisions an ephemeral Postgres). Mutually exclusive with "
             "--sql-file / --snapshot / --database-url."
         ),
@@ -2324,7 +2333,8 @@ def snapshot(
 
     if migrations_path is not None:
         # Static/offline migration-directory read: resolve the layout to an
-        # ordered file list and build the schema from their concatenated DDL —
+        # ordered file list and build the schema from their DDL, each file a
+        # session of its own —
         # no database, no Docker (distinct from `lint --migrations`, which
         # provisions an ephemeral Postgres). Feed the ordered files through the
         # same offline `--sql-file` path below.

@@ -197,7 +197,9 @@ breaking changes — they will be called out in this file.
   it in one session: Postgres errors; a name looked up there is a
   catalog's, an `IF EXISTS` no-op or an error, as before; `snapshot
   --migrations` gives each file a session of its own, as migration runners
-  do: a transaction a file leaves open is rolled back at its end, and a
+  do: a file that ends inside a transaction is refused (psql rolls it
+  back, `psql -1` and `lint --migrations` commit it), a last statement with
+  no `;` ends with its file, and a
   database's or role's `search_path` or role set by `ALTER DATABASE` /
   `ALTER ROLE … SET` is one later files start with, so is not followed
   there; `lint --migrations` still applies the files in one session), a schema on it
