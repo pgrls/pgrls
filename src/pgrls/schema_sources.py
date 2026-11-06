@@ -584,7 +584,8 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     # gave something before (a table dropped or renamed away, or renamed
     # in, as pass 2 will follow) waits to take that name until pass 2
     # reaches its CREATE; the first by a name takes it now, so a policy or
-    # grant before its CREATE still finds it.
+    # grant before its CREATE still finds it (unless the name was dropped or
+    # renamed before: then the policy is the old table's).
     by_made: dict[int, _TableBuilder] = {}
     unborn: dict[int, tuple[tuple[str, str], _TableBuilder]] = {}
 
@@ -697,6 +698,8 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             )
             if p is not None
         ]
+        # (Not itself: an IF NOT EXISTS over another relation of its name.)
+        parents = [p for p in parents if p != key]
         if parents and getattr(stmt, "partbound", None) is not None:
             builder.partition_of = parents[0]
         elif parents:
@@ -2185,20 +2188,21 @@ def _move_table(
     """Give the table at `old` the name `new`, and its partitions and
     children their parent's new name."""
     builder = tables.get(old)
-    if builder is None or builder.made_at > index >= 0:
-        # (Not one made after the rename: the rename was of the table there
-        # before, one the SQL did not make, or none at all.)
-        return
-    tables.pop(old)
-    builder.schema, builder.name = new
-    builder.former_names.append(new[1])
-    # A rename onto an occupied name cannot happen in valid DDL; if the input
-    # is invalid anyway, the later definition wins rather than being dropped.
-    tables[new] = builder
+    # (Not one made after the rename: the rename was of the table there
+    # before, one the SQL did not make, or none at all — whose partitions
+    # and children follow it all the same.)
+    if builder is not None and not builder.made_at > index >= 0:
+        tables.pop(old)
+        builder.schema, builder.name = new
+        builder.former_names.append(new[1])
+        # A rename onto an occupied name cannot happen in valid DDL; if the
+        # input is invalid anyway, the later definition wins rather than
+        # being dropped.
+        tables[new] = builder
     # Its partitions and children follow it to the new name — those created
     # before the rename; a later one names a new table that took the old name.
     for other in tables.values():
-        if other.created_at >= index >= 0:
+        if other.made_at >= index >= 0:
             continue
         if other.partition_of == old:
             other.partition_of = new
@@ -2370,6 +2374,14 @@ def _apply_alter_table(
         return
     builder = tables.get(key)
     if builder is None:
+        # A DETACH from a parent the SQL did not make (or whose name a table
+        # made later waits to take) still frees its partition.
+        for cmd in stmt.cmds or ():
+            if getattr(cmd, "subtype", None) == AlterTableType.AT_DetachPartition:
+                child = tables.get(_relation_key(
+                    getattr(getattr(cmd, "def_", None), "name", None), default_schema) or ("", ""))
+                if child is not None and child.partition_of == key:
+                    child.partition_of = None
         # An ALTER on a table we never saw a CREATE for (e.g. the agent pasted
         # only the ALTER). Create a shell so the RLS toggle still records — a
         # table with RLS on and no columns/policies is a legitimate (if
