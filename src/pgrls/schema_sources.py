@@ -3013,10 +3013,41 @@ def _deparse_or_none(node: Any, written: str | None = None) -> str | None:
         return exact
     if written and ast_utils._same_tree(written, node):
         return written
+    if written and (qualified := _qualified_written(written, node)) is not None:
+        return qualified
     try:
         return ast_utils.faithful_sql(node)
     except ValueError:
         return None
+
+
+def _qualified_written(written: str, node: Any) -> str | None:
+    """`written` with the schema the search path resolved each table it
+    reads to (`_Resolver._qualify_policy`, which qualified `node` in place)
+    written in, when that parses back to `node`; else None."""
+    prefix = "SELECT ("
+    try:
+        parsed = pglast.parse_sql(f"{prefix}{written}) AS _expr")[0].stmt
+    except pglast.parser.ParseError:
+        return None
+    mine = [n for n in _subnodes(parsed) if isinstance(n, _pgast.RangeVar)]
+    theirs = [n for n in _subnodes(node) if isinstance(n, _pgast.RangeVar)]
+    if len(mine) != len(theirs):
+        return None
+    edits = []
+    for a, b in zip(mine, theirs):
+        if a.relname != b.relname:
+            return None
+        if not a.schemaname and b.schemaname:
+            if a.location is None or a.location < len(prefix):
+                return None
+            edits.append((a.location - len(prefix), '"' + b.schemaname.replace('"', '""') + '".'))
+    if not edits:
+        return None
+    text = written
+    for at, schema in sorted(edits, reverse=True):
+        text = text[:at] + schema + text[at:]
+    return text if ast_utils._same_tree(text, node) else None
 
 
 def _clause_source(source: str) -> dict[str, str]:

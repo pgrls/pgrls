@@ -2924,6 +2924,28 @@ def test_offline_policy_keeps_the_parentheses_its_predicate_needs():
     assert parse_expr(schema.tables[0].policies[0].using_sql) == parse_expr(source)
 
 
+def test_an_unprintable_clause_keeps_the_schema_its_tables_resolve_to(monkeypatch):
+    # The resolver qualifies a table the policy reads on the search path, so
+    # the clause as written no longer parses back to the tree; the schema is
+    # written into it rather than the clause dropped.
+    import pgrls.ast_utils
+    from pgrls.ast_utils import parse_expr
+    from pgrls.schema_sources import schema_from_sql
+
+    def broken(node):
+        raise TypeError("printer failed")
+
+    monkeypatch.setattr(pgrls.ast_utils, "_render", broken)
+    schema = schema_from_sql(
+        "CREATE SCHEMA app; CREATE TABLE app.m (uid int); CREATE TABLE public.t (owner int);"
+        " SET search_path = public, app;"
+        " CREATE POLICY p ON t USING (owner OPERATOR(pg_catalog.=) ANY (SELECT uid FROM m) OR true);",
+        schemas=("public", "app"))
+    (policy,) = [p for t in schema.tables for p in t.policies]
+    assert parse_expr(policy.using_sql) == parse_expr(
+        'owner OPERATOR(pg_catalog.=) ANY (SELECT uid FROM app.m) OR true')
+
+
 def test_offline_policy_pglast_cannot_print_keeps_the_clause_it_wrote(monkeypatch):
     # pglast 7's printer raises on `x OPERATOR(s.op) ANY (…)`, which pg_dump
     # writes; the clause was then dropped, so the rules (and `pgrls pr`) saw
