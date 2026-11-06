@@ -21,6 +21,7 @@ that returns None the comparator falls through to ``requires_review``.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from pglast.ast import BoolExpr
@@ -66,6 +67,7 @@ def compare_predicates(
     *,
     location: str | None = None,
     clause: str | None = None,
+    column_types: Mapping[str, str] | None = None,
 ) -> Literal[
     "unchanged",
     "tightened_and",
@@ -94,6 +96,12 @@ def compare_predicates(
     clause:
         Optional clause label (e.g. ``"USING"`` or ``"WITH CHECK"``).
         Forwarded to ``parse_expr`` alongside ``location``.
+    column_types:
+        Optional ``{column: data_type}`` of the policy's table. Z3 reads a
+        string compared with a column by the column's type: a ``text`` one
+        alike in every spelling, a ``citext`` or ``char(n)`` one not at all.
+        Without it, a column compared both with a bare literal and with
+        anything else (a typed string, another column) decides nothing.
 
     Returns
     -------
@@ -136,8 +144,13 @@ def compare_predicates(
         return "requires_review"
 
     # Canonicalize and compare.
-    base_canon = _canon(base_node)
-    head_canon = _canon(head_node)
+    try:
+        base_canon = _canon(base_node)
+        head_canon = _canon(head_node)
+    except RecursionError:
+        # Nested past the stack (Postgres takes it).
+        same = base_sql is head_sql or (isinstance(base_sql, str) and base_sql == head_sql)
+        return "unchanged" if same else "requires_review"
 
     if base_canon == head_canon:
         return "unchanged"
@@ -168,7 +181,7 @@ def compare_predicates(
     # then falls back to ``requires_review``.
     from pgrls.diff._z3_compare import classify_via_z3
 
-    z3_result = classify_via_z3(base_node, head_node)
+    z3_result = classify_via_z3(base_node, head_node, column_types=column_types)
     if z3_result is not None:
         return z3_result
 
@@ -181,6 +194,7 @@ def counterexample_for(
     *,
     location: str | None = None,
     clause: str | None = None,
+    column_types: Mapping[str, str] | None = None,
 ) -> dict[str, object] | None:
     """Leaking-row counterexample for a loosened predicate change, or None.
 
@@ -206,4 +220,4 @@ def counterexample_for(
         return None
     from pgrls.diff._z3_compare import counterexample
 
-    return counterexample(base_node, head_node)
+    return counterexample(base_node, head_node, column_types=column_types)

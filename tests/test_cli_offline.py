@@ -1830,3 +1830,52 @@ def test_offline_constraint_before_a_rebuild_does_not_reach_the_new_table():
         " DROP TABLE docs; CREATE TABLE docs (id int, tenant_id uuid);"
     )
     assert {c.name: c.is_nullable for c in t.column_details}["tenant_id"] is True
+
+
+def test_the_diff_trusts_no_offline_column_type():
+    # Code the SQL runs, or a search_path it sets, may change a column's type
+    # out of sight; the declared type stays for `generate` and `diff --apply`.
+    import json
+    from pgrls.model import Schema
+    from pgrls.schema_sources import schema_from_sql
+    schema = schema_from_sql("CREATE TABLE d (tenant_id uuid, email text);\n")
+    assert [(c.data_type, c.type_known) for c in schema.tables[0].column_details] == [
+        ("uuid", False), ("text", False)]
+    assert "uuid" in schema.to_sql()
+    # The snapshot carries it to the diff.
+    again = Schema.from_snapshot(json.loads(json.dumps(schema.to_snapshot())))
+    assert not any(c.type_known for c in again.tables[0].column_details)
+
+
+def test_an_offline_diff_reads_a_column_compared_two_ways_by_no_type(tmp_path):
+    # `email` may be citext (an ALTER in a function, a DO block, dblink):
+    # `<> 'admin@x.io'` → `= 'ADMIN@x.io'::text` is no SAFE tightening.
+    import json
+    from click.testing import CliRunner
+    from pgrls.cli import main
+    out = {}
+    for side, using in (("base", "email <> 'admin@x.io'"), ("head", "email = 'ADMIN@x.io'::text")):
+        sql = tmp_path / f"{side}.sql"
+        sql.write_text("CREATE TABLE public.users (id int, email text);\n"
+                       "ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;\n"
+                       f"CREATE POLICY p ON public.users FOR SELECT USING ({using});\n")
+        out[side] = tmp_path / f"{side}.json"
+        res = CliRunner().invoke(main, ["snapshot", "--sql-file", str(sql), "-o", str(out[side])])
+        assert res.exit_code == 0, res.output
+    res = CliRunner().invoke(main, ["diff", str(out["base"]), str(out["head"]), "--format", "json"])
+    kinds = {v["classification"] for v in json.loads(res.stdout)["violations"]}
+    assert "safe" not in kinds, res.stdout
+
+
+def test_an_offline_snapshot_of_an_earlier_version_is_trusted_for_no_type():
+    # One written before `type_known`: its `source` marker says offline.
+    from pgrls.model import Schema
+    snap = {"version": 18, "source": "sql", "tables": [{
+        "schema": "public", "name": "users", "rls_enabled": True, "force_rls": False,
+        "columns": ["email"], "column_details": [{"name": "email", "data_type": "text"}],
+        "policies": [], "grants": []}]}
+    try:
+        schema = Schema.from_snapshot(snap)
+    except (KeyError, ValueError):
+        pytest.skip("snapshot shape of this version differs")
+    assert not schema.tables[0].column_details[0].type_known

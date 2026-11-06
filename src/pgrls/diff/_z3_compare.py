@@ -1,4 +1,4 @@
-"""SAT-based predicate implication via Z3 (Phases 1, 3, and 4).
+"""SAT-based predicate implication via Z3.
 
 Z3 (``z3-solver``) is a core dependency as of 0.16.0, so this path runs
 on a plain ``pip install pgrls``. The ``Z3_AVAILABLE`` guard is retained
@@ -26,105 +26,43 @@ re-checked via implication:
 Implication is decided by checking unsatisfiability of the negation:
 ``base → head`` is valid iff ``base AND NOT head`` is UNSAT.
 
-Phase 1 supports a deliberate subset of pglast nodes. Unsupported
-nodes return None from the translator, which propagates up to
-``classify_via_z3`` returning None.
+Both predicates are translated by the Kleene three-valued encoder below
+(``_anon_3vl``, shared with the SEC038 / verify provers), in a mode that
+assumes nothing about the session (``_Context.any_session``): every column
+and every opaque value carries a null-flag, and a predicate admits a row
+only when it is exactly TRUE — NULL hides a row just as FALSE does. So
+``a = 1 OR a <> 1`` → ``true`` is a loosening (it newly admits the rows
+where ``a`` is NULL), and ``col IS NOT NULL AND col = x`` is equivalent to
+``col = x``. A two-valued model gets both wrong: it calls the first
+equivalent, and with an ``IS NULL`` disconnected from the column's value
+it flags the second.
 
-Phase 3 (v0.4.1) extended the supported set with function calls
-(modeled as uninterpreted Z3 constants keyed by canonical shape so
-the same call in base and head reuses the same Z3 variable),
-``COALESCE`` and ``CASE`` (treated opaquely the same way), and
-``BETWEEN`` (translated to the equivalent AND-of-comparisons).
+What the encoder translates: columns, literals, comparisons and arithmetic
+(on the diff path not where Z3 and Postgres disagree — ``/`` and ``%``,
+arithmetic on anything but integers, ordering on text, which collations
+decide; a cast that may change the value, such as ``varchar(3)`` or
+``float4``, or of a function's result, is an opaque value of its own), a
+decimal literal only when a ``float4`` holds it exactly (otherwise a
+``numeric``, ``float8`` and ``float4`` column read it differently),
+AND / OR / NOT, ``IS [NOT] NULL``, ``IS [NOT] DISTINCT FROM`` and ``[NOT]
+BETWEEN`` (on the diff path), ``= ANY (ARRAY[…])`` / ``IN (…)`` over
+literals, casts, ``COALESCE``, and function calls (an opaque value per
+distinct call, shared by base and head). On the diff path a ``CASE``, or a
+``COALESCE`` it cannot model exactly, is an opaque value too. An opaque
+call, CASE or COALESCE is text:
+compared with something else it translates only through a cast; an opaque
+cast or arithmetic result takes its own type. Anything else
+returns None and the caller
+falls through to ``requires_review``.
 
-Phase 4 (v0.4.2) adds ``TypeCast`` (e.g. ``'a'::text``,
-``col::int``) — supported when the cast target's Z3 sort matches
-the inner expression's sort, otherwise opaque — and basic
-arithmetic operators (``+``, ``-``, ``*``, ``/``, ``%``) for Int
-and Real operands.
-
-Supported AST nodes (Phases 1 + 3 + 4):
-
-* ``ColumnRef`` — single-table column references resolve to Z3
-  free variables. Type is inferred from comparison context (Int
-  if compared to integer literal, String otherwise). Repeated
-  references to the same column reuse the same Z3 variable.
-* ``A_Const`` — Integer, String, Float, Boolean. Float is approximated
-  as Real.
-* ``A_Expr`` with comparison operators (``=``, ``!=``, ``<``, ``>``,
-  ``<=``, ``>=``) — translated to the matching Z3 comparison.
-* ``A_Expr`` with ``IN`` (literal RHS list) — translated to
-  Or-of-equalities. Non-literal RHS (subquery) → unsupported.
-* ``BoolExpr`` (AND, OR, NOT) — translated to ``z3.And``, ``z3.Or``,
-  ``z3.Not``.
-* ``NullTest`` (IS NULL, IS NOT NULL) — modeled as opaque Z3
-  Booleans (``is_null_<col>``) DISCONNECTED from the column's value
-  variable. Sound in the safety-critical direction — a real loosening
-  is never missed (the disconnection only ever ADDS models, so an
-  implication that should fail still fails) — but COARSE. Because the
-  marker and value var are independent, Z3 can pick a physically
-  impossible model (a column both ``IS NULL`` and equal to a concrete
-  value). So when a column carries BOTH an IS NULL test and a value
-  comparison, the classifier can OVER-report: a NULL-equivalent
-  refactor such as ``col IS NOT NULL AND col = x`` vs ``col = x`` is
-  reported ``semantic_loosened`` (a false DANGEROUS) instead of
-  ``semantic_equivalent``. This is a deliberate, known limitation.
-
-  A faithful *2-valued* linkage is impossible, not merely hard:
-  threading a ``NOT is_null`` guard onto each comparison is unsound
-  under negation. ``z3.Not`` is 2-valued, but Postgres ``NOT (col = x)``
-  is 3-valued — NULL when ``col`` is NULL — so a guarded ``col = x``
-  modelled as ``(col == x) AND NOT is_null`` makes ``NOT (col = x)``
-  evaluate TRUE on a NULL row, which Postgres rejects. The guard would
-  therefore merely trade these IS-NULL over-reports for a NEW class of
-  false alarms on ``NOT (...)`` predicates (``col != x`` vs
-  ``NOT (col = x)``, equivalent in Postgres, would split into a false
-  ``loosened``). A naive attempt also breaks arithmetic equivalence
-  (``col - 3 > 0`` vs ``col > 3``) and the counterexample
-  witness-sufficiency gate. ``test_null_limitation_*`` pins both the
-  over-report and the safety invariants a real fix must keep.
-
-  A correct fix needs a full Kleene three-valued re-encoding of the diff
-  path (a truth flag AND a null flag per node, with
-  ``NOT(unknown) = unknown``) — like the additive SEC038 ``anon_read``
-  encoder but adapted to bidirectional implication. That is a larger
-  rework, deferred. The over-report is the SAFE failure mode (it flags a
-  safe change for review; it never passes a dangerous one), so the coarse
-  model is retained rather than risk the verifier's soundness for a false
-  alarm.
-* ``A_Expr`` with ``BETWEEN`` / ``NOT BETWEEN`` (Phase 3) —
-  translated to the equivalent AND/OR of inequalities. Symmetric
-  variants (``BETWEEN SYMMETRIC``) currently abort.
-* ``FuncCall`` (Phase 3) — translated to a fresh Z3 String constant
-  keyed by ``<funcname>(<canonical-args>)``. Repeated identical
-  calls reuse the same Z3 variable across base and head, so two
-  predicates that reference the same function call (e.g.
-  ``auth.uid()``, ``current_setting('app.tenant')``) can be
-  compared via implication. Aggregates and window functions abort.
-* ``CoalesceExpr`` and ``CaseExpr`` (Phase 3) — treated as opaque
-  uninterpreted Z3 String constants, keyed by their
-  ``canonical_key``. Two predicates with ``COALESCE(col, 'x')``
-  on each side reuse the same Z3 variable; nuanced reasoning about
-  the WHEN/ELSE branches is deferred to a later phase. Sound but
-  coarse: predicates that differ only inside the COALESCE/CASE
-  fall through to ``requires_review`` because the canonical strings
-  differ and Z3 sees two unrelated free variables.
-* ``TypeCast`` (Phase 4) — ``'a'::text``, ``col::int`` etc. The
-  target type name (last segment of ``pg_catalog.<type>``-style
-  qualified names) is mapped to a Z3 sort via a small table:
-  ``text``/``varchar``/``uuid`` → String, ``int``/``bigint`` → Int,
-  ``numeric``/``float`` → Real, ``bool`` → Bool. When the resolved
-  sort matches the inner expression's sort, the cast is a no-op
-  and the inner translation is returned; otherwise the cast is
-  treated as opaque (keyed by its full canonical rendering, so
-  identical casts on base and head reuse the same Z3 variable).
-* ``A_Expr(AEXPR_OP)`` with arithmetic operators (Phase 4) —
-  ``+``, ``-``, ``*``, ``/``, ``%``. Translated to the matching
-  Z3 op. Type inference flows through the non-column operand,
-  same as comparisons. ``col + col`` two-column arithmetic
-  defaults both columns to String for type-inference reasons,
-  which Z3 then refuses, so the translator falls through to None
-  for that shape — fine in practice because real RLS predicates
-  use ``col + literal``, not ``col + col``.
+A column's type is inferred from what it is compared with: against an
+integer literal it is an integer, so ``a >= 2`` and ``a > 1`` are
+equivalent — wrong for a ``numeric`` column, where 1.5 passes only the
+second, or a ``float4`` one, whose ``IN`` list rounds ``16777217`` to a
+single; and against a text literal it is text, so ``c = 'true'`` and
+``c <> 't'`` can both hold — wrong for a ``bool`` column (or ``uuid``,
+where case does not matter). The diff compares policy text and does not see
+column types.
 
 Type unification per column: the first comparison fixes the type.
 A subsequent reference with a conflicting type (e.g. ``col = 5``
@@ -134,12 +72,20 @@ so this is a defensive guardrail rather than a real limitation.
 """
 from __future__ import annotations
 
+import contextlib
+import ctypes
+import dataclasses
+import fractions
+import functools
+import inspect
 import math
+import re
+import struct
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar, cast
 
 try:
     import z3
@@ -164,6 +110,7 @@ from pglast.ast import (
     Float,
     FuncCall,
     Integer,
+    MinMaxExpr,
     NullTest,
     ResTarget,
     SelectStmt,
@@ -180,15 +127,20 @@ from pglast.enums import (
     SubLinkType,
 )
 
-from pgrls.ast_utils import canonical_key, func_name_parts, is_never_null_current_setting
+from pgrls.ast_utils import (
+    canonical_key,
+    func_name_parts,
+    has_literal_setting_arguments,
+    is_never_null_current_setting,
+)
 
 
 # Comparison operator strings appearing in `A_Expr.name[0].sval` for
 # the supported subset. Each maps to a Z3 lambda the translator
 # applies to the (left, right) pair. Equality and inequality work
 # across all supported types; ordered comparisons (`<`, `>`, etc.)
-# work for Int and Real but not Bool — we defer the type check to
-# Z3 itself, which raises if the operands' sorts disagree.
+# work for Int and Real but not Bool — Z3 raises on two Bools, but coerces
+# a Bool against a number to 0 / 1, which `_unlike_sql` catches first.
 _COMPARISON_OPS: dict[str, Any] = {
     "=":  lambda a, b: a == b,
     "!=": lambda a, b: a != b,
@@ -220,6 +172,9 @@ _ARITHMETIC_OPS: dict[str, Any] = {
     "%": lambda a, b: a % b,
 }
 
+# JSON field and path reads, which the diff path keeps as opaque values.
+_JSON_OPS = frozenset({"->", "->>", "#>", "#>>"})
+
 # Postgres type-name (last segment of `pg_catalog.<type>`-style
 # qualified names) → Z3 sort, for Phase 4 TypeCast resolution.
 # Coarse on purpose: numeric / decimal collapse to Real, the
@@ -239,13 +194,12 @@ _REAL_TYPES = frozenset({
 })
 _BOOL_TYPES = frozenset({"bool", "boolean"})
 
-# Z3 decl-name prefixes for the synthetic vars the context mints: the
-# NULL marker (`null_marker`), opaque-expression vars (`opaque`), and the
-# SEC038 Kleene null-flag (`null_flag`). A REAL column is bound via
-# `column()` under its verbatim key, and Z3 identifies a constant by
-# name+sort — so a real column literally named `_isnull__x` (legal: a
-# double-quoted identifier may contain anything but NUL) would alias the
-# NULL marker synthesized for column `x` in the implication query, making
+# Z3 decl-name prefixes for the synthetic vars the context mints:
+# opaque-expression vars (`opaque`) and the Kleene null-flag (`null_flag`).
+# A REAL column is bound via `column()` under its verbatim key, and Z3
+# identifies a constant by name+sort — so a real column literally named
+# `_nullflag__x` (legal: a double-quoted identifier may contain anything
+# but NUL) would alias the null-flag minted for column `x`, making
 # distinct predicates look `semantic_equivalent` (a silently-suppressed
 # diff Change, and by symmetry a missed DANGEROUS loosening). Embedding a
 # NUL in the prefix does NOT help — Z3 truncates decl names at NUL — so
@@ -253,8 +207,15 @@ _BOOL_TYPES = frozenset({"bool", "boolean"})
 # with these prefixes (it returns "" → the predicate degrades to
 # requires_review, the safe direction). Single source of truth so the
 # minting sites and that guard cannot drift. (R15 #3)
-_NULL_MARKER_PREFIX = "_isnull__"
 _OPAQUE_PREFIX = "_opaque__"
+# Built-in VOLATILE calls (PERF002's set and kin): each call returns its own
+# value, so two of the same text are not one value. A user function's
+# volatility is not known here: it is taken to be STABLE.
+_VOLATILE_CALL = re.compile(
+    r"(?<![\w.\"])(?:pg_catalog\.)?(?:random|random_normal|clock_timestamp|timeofday"
+    r"|nextval|setval|currval|lastval|gen_random_uuid|uuidv4|uuidv7|pg_backend_pid"
+    r"|array_shuffle|array_sample)\s*\(",
+    re.IGNORECASE)
 _NULLFLAG_PREFIX = "_nullflag__"
 # Cross-tenant verifier (`prove_cross_tenant_isolation`) only: the free,
 # NON-NULL symbol that stands for an authenticated session's own tenant
@@ -264,7 +225,6 @@ _NULLFLAG_PREFIX = "_nullflag__"
 # reserved set and `_column_key` refuses to bind it.
 _SESSION_PREFIX = "_session__"
 _RESERVED_MARKER_PREFIXES: tuple[str, ...] = (
-    _NULL_MARKER_PREFIX,
     _OPAQUE_PREFIX,
     _NULLFLAG_PREFIX,
     _SESSION_PREFIX,
@@ -282,20 +242,40 @@ class _Context:
 
     def __init__(self) -> None:
         self._vars: dict[str, Any] = {}  # column-key → z3.ExprRef
-        self._null_vars: dict[str, Any] = {}  # column-key → z3.BoolRef
+        # Integer literals and numeric columns as integers (see
+        # `_const_to_z3`).
+        self.integers = False
+        # The diff's column types, where the snapshots give them.
+        self.column_types: Mapping[str, str] | None = None
+        # How deep the translation is among values Postgres gives one type
+        # (see `_real_integer`).
+        self.unified = 0
+        # Inside a list one of whose members rounds the others (off the diff
+        # path), so no comparison in it is read exactly.
+        self.kin_rounded = 0
+        # How many scalar sub-selects deep the translation is: a column there
+        # is the outer query's, which Postgres's IN takes for no column.
+        self.subselect_depth = 0
+        # Diff path: per column name, how each comparison of it with a
+        # string read the string (`bare`, `typed`, `as <type>`); see
+        # `_note_string_read`.
+        self.string_reads: dict[str, set[str]] = {}
+        self.value_reads: dict[tuple[str, str | None], set[str]] = {}
+        self.list_members: set[int] = set()
+        # A column's last name → how it is spelled (see `_column_key`).
+        self.spellings: dict[str, tuple[str, ...]] = {}
         # Phase 3 — opaque expressions (function calls,
         # COALESCE, CASE) keyed by their canonical-string shape.
         # Same key on both sides of the diff yields the same Z3
         # variable, enabling implication checks across predicates
         # that reference identical opaque expressions.
         self._opaque_vars: dict[str, Any] = {}
-        # H2 (SEC038) — Kleene three-valued null-flags, keyed per
-        # column / opaque-expr. SEPARATE namespace + dict from
-        # `_null_vars` (the 2-valued path's disconnected marker) so the
-        # diff path stays byte-for-byte untouched. Decl names are
+        self._volatile_calls = 0
+        # Kleene three-valued null-flags, keyed per column / opaque-expr.
+        # Decl names are
         # prefixed `_nullflag__` and never land in `_vars`, so
         # `is_real_column` excludes them and `_decode_model` drops them
-        # from the witness exactly like `_isnull__*` / `_opaque__*`.
+        # from the witness exactly like `_opaque__*`.
         self._nullflag_vars: dict[str, Any] = {}
         # Cross-tenant verifier only. `session_mode` flips the anon-NULL
         # leaf (every auth call NULL) to a free NON-NULL *session symbol*
@@ -325,6 +305,14 @@ class _Context:
         # that value, not the unset-GUC raise; a `None` value means the GUC
         # is set but its value was not captured, so it stays opaque.
         self.set_gucs: dict[str, str | None] = {}
+        # Diff path only (`classify_via_z3` / `counterexample`). The two
+        # predicates are compared over EVERY session, not an anonymous one:
+        # a read of a custom GUC is a free value (any session may have set
+        # it), never the unset-GUC raise the anon prover models.
+        self.any_session: bool = False
+        # Diff path: columns tested for NULL. One that is never compared
+        # binds no value variable, yet a witness row may need it NULL.
+        self.null_tested: set[str] = set()
         self._session_vars: dict[str, Any] = {}
         self.tenant_pairs: list[tuple[Any, Any]] = []
         # Session identities the predicate tests for NULL (`auth.role() IS
@@ -338,12 +326,27 @@ class _Context:
         # `_session_null_tests_offaxis`.
         self.session_null_tests: set[str] = set()
 
+    @contextlib.contextmanager
+    def unifying(self, unified: bool) -> Any:
+        """Translate among values Postgres gives one type, when `unified`."""
+        self.unified += unified
+        try:
+            yield
+        finally:
+            self.unified -= unified
+
     def column(self, key: str, sort: Any) -> Any:
         """Return the Z3 variable for `key`, binding it on first use.
 
         On a subsequent call with a different `sort`, returns None to
-        signal a type-conflict abort.
+        signal a type-conflict abort. A number is a real unless
+        `self.integers` (see `_const_to_z3`): compared with an integer, a
+        column may still be a `numeric` one.
         """
+        if sort == z3.IntSort() and not self.integers:
+            sort = z3.RealSort()
+        elif sort == z3.RealSort() and self.integers:
+            sort = z3.IntSort()  # the integer pass: an integer column
         existing = self._vars.get(key)
         if existing is None:
             var = z3.Const(key, sort)
@@ -353,19 +356,13 @@ class _Context:
             return existing
         return None  # type conflict — translation aborts
 
-    def null_marker(self, key: str) -> Any:
-        """Return the Z3 Bool for `<col> IS NULL` opaque marker."""
-        existing = self._null_vars.get(key)
-        if existing is None:
-            existing = z3.Bool(f"{_NULL_MARKER_PREFIX}{key}")
-            self._null_vars[key] = existing
-        return existing
-
     def opaque(self, key: str, sort: Any) -> Any:
         """Return a Z3 free variable for an opaque expression keyed by
         its canonical shape. Bound to ``sort`` on first use; subsequent
         calls with a different sort return None (type-conflict abort).
+        An expression with a volatile call gets a variable of its own.
         """
+        key = self._unshared(key)
         existing = self._opaque_vars.get(key)
         if existing is None:
             var = z3.Const(f"{_OPAQUE_PREFIX}{key}", sort)
@@ -378,13 +375,11 @@ class _Context:
     def null_flag(self, key: str) -> Any:
         """Free Kleene null-flag (a Z3 Bool) for the value keyed by ``key``.
 
-        H2 (SEC038) only. A separate namespace + dict from
-        ``null_marker`` (the 2-valued diff path's disconnected marker),
-        so the diff path is untouched. The decl name is prefixed
+        The decl name is prefixed
         ``_nullflag__`` and the var never enters ``_vars``, so
         ``is_real_column`` returns False for it and ``_decode_model``
         drops it from the witness — keeping the emitted row real-columns
-        only, exactly like ``_isnull__*`` / ``_opaque__*``.
+        only, exactly like ``_opaque__*``.
         """
         existing = self._nullflag_vars.get(key)
         if existing is None:
@@ -392,17 +387,29 @@ class _Context:
             self._nullflag_vars[key] = existing
         return existing
 
+    def opaque_null_flag(self, key: str) -> Any:
+        """``null_flag`` of the opaque expression keyed ``key`` — under the
+        reserved ``_opaque__`` prefix, so it never aliases the null-flag of a
+        column whose (quoted) name happens to equal ``key``."""
+        return self.null_flag(f"{_OPAQUE_PREFIX}{self._unshared(key)}")
+
+    def _unshared(self, key: str) -> str:
+        if _VOLATILE_CALL.search(key) is None:
+            return key
+        self._volatile_calls += 1
+        return f"{key} #volatile{self._volatile_calls}"
+
     def is_real_column(self, name: str) -> bool:
         """True iff `name` is a real column var (not a null/opaque marker).
 
         `column()` binds via ``z3.Const(key, sort)`` (the var's decl name
-        is exactly ``key``), whereas ``null_marker`` / ``opaque`` prefix
-        their decl names with ``_isnull__`` / ``_opaque__`` and live in
-        the separate ``_null_vars`` / ``_opaque_vars`` dicts. So a model
+        is exactly ``key``), whereas ``null_flag`` / ``opaque`` prefix
+        their decl names with ``_nullflag__`` / ``_opaque__`` and live in
+        the separate ``_nullflag_vars`` / ``_opaque_vars`` dicts. So a model
         decl whose name is a key of ``_vars`` is authoritatively a real
         column; everything else is a synthetic marker. Preferred over
         prefix-string matching, which a user column literally named
-        ``_isnull__x`` could otherwise spoof.
+        ``_nullflag__x`` could otherwise spoof.
         """
         return name in self._vars
 
@@ -417,8 +424,13 @@ class _Context:
         ``_decode_model`` drops it from the witness, exactly like
         ``_opaque__*``. Bound to ``sort`` on first use; a later call with a
         different sort returns None (type-conflict abort), mirroring
-        ``column`` / ``opaque``.
+        ``column`` / ``opaque``. A number is a real unless
+        ``self.integers``, as for ``column``.
         """
+        if sort == z3.IntSort() and not self.integers:
+            sort = z3.RealSort()
+        elif sort == z3.RealSort() and self.integers:
+            sort = z3.IntSort()  # the integer pass, as for ``column``
         existing = self._session_vars.get(key)
         if existing is None:
             var = z3.Const(f"{_SESSION_PREFIX}{key}", sort)
@@ -429,12 +441,14 @@ class _Context:
         return None  # type conflict — translation aborts
 
 
-def _column_key(node: ColumnRef) -> str:
+def _column_key(node: ColumnRef, ctx: _Context) -> str:
     """Render `ColumnRef.fields` as a `.`-joined identifier key.
 
     A column reference's `fields` is a tuple of `String` nodes (or
     `A_Star` for wildcards, which we don't support). Returns None
-    for unsupported shapes.
+    for unsupported shapes, and for a column `ctx` has seen spelled
+    otherwise (`t.a` and `m.a`, which `_bare_columns` leaves as they are):
+    as two variables they gave a leaking row that cannot exist.
     """
     parts = []
     for field in node.fields or ():
@@ -442,12 +456,14 @@ def _column_key(node: ColumnRef) -> str:
             parts.append(field.sval)
         else:
             return ""  # unsupported (e.g., A_Star)
+    if not parts or ctx.spellings.setdefault(parts[-1], tuple(parts)) != tuple(parts):
+        return ""
     key = ".".join(parts)
     # A real column whose key collides with a synthetic marker namespace
     # would alias the marker var in the implication query (Z3 keys a
     # constant by name+sort), silently making distinct predicates look
     # equivalent. Such a column name is pathological but legal (a quoted
-    # identifier may be literally `_isnull__x`), so refuse to bind it:
+    # identifier may be literally `_nullflag__x`), so refuse to bind it:
     # return "" and the caller degrades the predicate to requires_review
     # (the safe direction). See `_RESERVED_MARKER_PREFIXES`.
     if key.startswith(_RESERVED_MARKER_PREFIXES):
@@ -455,21 +471,37 @@ def _column_key(node: ColumnRef) -> str:
     return key
 
 
-def _const_to_z3(node: A_Const) -> Any:
-    """Translate an A_Const literal to a Z3 expression. Returns None for unsupported."""
+def _const_to_z3(node: A_Const, ctx: _Context) -> Any:
+    """Translate an A_Const literal to a Z3 expression. Returns None for unsupported.
+
+    An integer is a real unless `ctx.integers`: the column it is compared
+    with may be a `numeric` or a `float8` (`score >= 1` and `score > 0`
+    differ at 0.5), which the policy text does not say unless a cast does;
+    read as a real it is what every numeric type agrees on (a float4 holds
+    it exactly). The integer reading only refines a verdict (see
+    `_integers_agree`)."""
     val = node.val
     if isinstance(val, Integer):
-        return z3.IntVal(val.ival)
+        return _integer(val.ival, ctx)
     if isinstance(val, String):
-        return z3.StringVal(val.sval)
+        return _z3_string(val.sval)
     if isinstance(val, Boolean):
         return z3.BoolVal(val.boolval)
     if isinstance(val, Float):
-        # pglast keeps Float values as a string; parse to Python float.
+        # pglast keeps a Float as its text — an integer too big for an int4
+        # among them, which is read exactly (through a Python float, two
+        # past double precision became one value).
+        text = val.fval or ""
         try:
-            return z3.RealVal(float(val.fval))
-        except (ValueError, TypeError):
+            if re.fullmatch(r"[+-]?\d+", text):
+                return _integer(int(text), ctx)
+        except (ValueError, TypeError, z3.Z3Exception):
             return None
+        # A decimal reads differently against a `numeric` (exactly), a
+        # `float8` (rounded to a double) and, in an `IN` list, a `float4`
+        # (rounded to a single), and pgrls does not see which: it is
+        # translated only when all three agree.
+        return _exact_real(text)
     # Anything else (NULL literal, BitString, etc.) — out of scope.
     # In particular, `col = NULL` is always-false in Postgres but
     # users express that with `IS NULL` instead; if we see a literal
@@ -478,237 +510,369 @@ def _const_to_z3(node: A_Const) -> Any:
     return None
 
 
-def _infer_sort(node: Any) -> Any:
-    """Infer a Z3 sort from a literal or expression. Returns None if unknown."""
-    if isinstance(node, A_Const):
-        val = node.val
-        if isinstance(val, Integer):
-            return z3.IntSort()
-        if isinstance(val, String):
-            return z3.StringSort()
-        if isinstance(val, Boolean):
-            return z3.BoolSort()
-        if isinstance(val, Float):
-            return z3.RealSort()
+def _is_constant(node: Any) -> bool:
+    """A literal, through casts that keep its type's value (`1::real` gives
+    its neighbours the float4 type)."""
+    while isinstance(node, TypeCast):
+        if not _exact_cast(node.typeName):
+            return False
+        node = node.arg
+    return isinstance(node, A_Const)
+
+
+def _integer(number: int, ctx: _Context) -> Any:
+    """An integer literal: as a real (`_real_integer`), or in the integer
+    pass as an integer."""
+    return z3.IntVal(number) if ctx.integers else _real_integer(number, ctx)
+
+
+def _has_lossy_cast(node: Any) -> bool:
+    """Whether `node` holds a cast that may change a value anywhere in it
+    (`(SELECT 0::real)`, `0::real * 1::real` give its value that type)."""
+    return any(isinstance(n, TypeCast) and not _exact_cast(n.typeName)
+               for n in _ast_nodes(node))
+
+
+def _rounds_its_kin(node: Any, ctx: _Context) -> bool:
+    """Whether `node`, beside others given its type (a `COALESCE`, an `IN`
+    list, an array), may round them: a value-changing cast to a number type
+    (`0::real`, `1::numeric(3,1)`). In a diff, any value-changing cast — the
+    text does not say what it does to its kin; off it, a cast to `uuid`, an
+    enum or `date` keeps the literal's value and its kin's (`pg_get_expr`
+    writes `ARRAY['draft'::post_status, …]`)."""
+    if ctx.any_session:
+        return _has_lossy_cast(node)
+    return any(isinstance(n, TypeCast) and not _exact_cast(n.typeName)
+               and _typename_last_segment(n.typeName) in _NUMBER_TYPES
+               for n in _ast_nodes(node))
+
+
+# Literals cast to a string type: in a diff a column beside one may be a
+# `char(n)` one, which makes the pair compare as `char` (`'a '` = `'a'`).
+_STRING_CASTS = frozenset({"as text", "as varchar", "as bpchar", "as name"})
+
+
+def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any], *,
+                      in_list: bool = False) -> None:
+    """In a diff, note how `left` compared with each of `rights` (one, or an
+    `IN` list's members, which take one type) reads each column the operands
+    yield against a string: bare (`email = 'A'`), where the literal takes
+    the column's type, or typed (`'A'::text`,
+    `(SELECT 'A')`, `COALESCE('A', '')`, a typed list member, a function's
+    result), where a `citext` or `char(n)` column compares as text. The text
+    may not show the column's type, so a column read both ways decides
+    nothing (`_diff_truths`). In an `IN` list with two or more members that
+    hold no column (`in_list`), Postgres types the left side with them, so a
+    `char(n)` one compares with `'a '::text` members as char, where `col =
+    'a '::text` compares as text: such a read is a kind of its own."""
+    if not ctx.any_session:
+        return
+    operands = [left, *rights]
+    values = [op for op in operands if _literal_kind(op) is None]
+    if not values:
+        # Literals alone: one cast that may change its value (`'x'::citext`)
+        # is a value of that type to Z3, compared as the others decide.
+        values = [op for op in operands
+                  if isinstance(inner := _unwrap_scalar_sublink(op), TypeCast)
+                  and not _exact_cast(inner.typeName)][:1]
+    literals: list[str] = [k for op in operands if op not in values
+                           and (k := _literal_kind(op)) is not None and k != "other"]
+    if len(values) > 1:
+        # A value against another (`citext_col = text_col`, `email =
+        # auth.email()`) compares in a type either may decide.
+        kind = "typed"
+    elif not values or not literals and not any(_has_typed_arm(v) for v in values):
+        return  # no string in it
+    else:
+        if all(k == "bare" for k in literals):
+            kind = "bare"
+        elif len(set(literals)) == 1 and literals[0].startswith("as "):
+            # A literal cast to one type (`'admin'::app_role`, as
+            # `pg_get_expr` writes one) reads as a bare literal does against
+            # a value of it.
+            kind = literals[0]
+        else:
+            kind = "typed"
+        if any(_has_typed_arm(v) for v in values):
+            # `COALESCE(x, 'a'::citext)` takes a type its arm may decide.
+            kind = "arm " + kind
+    if in_list and kind.removeprefix("arm ") in ("typed", "as text", "as name"):
+        kind = "in-list " + kind
+    for value in values:
+        for n in _ast_nodes(value):
+            if isinstance(n, ColumnRef) and n.fields and isinstance(n.fields[-1], String):
+                ctx.string_reads.setdefault(n.fields[-1].sval, set()).add(kind)
+        # A value that is no column (`app.current_role()`, `email::citext`) is
+        # read by its own type: a cast's, else one the text does not show;
+        # one in a COALESCE / CASE arm in the arms' common type, never as a
+        # direct read of it (Z3 reads them as one value).
+        for inner, depth in _values_within(value):
+            if not isinstance(inner, ColumnRef):
+                hint = _type_key(inner.typeName) if isinstance(inner, TypeCast) else None
+                ctx.value_reads.setdefault((_canon(inner), hint), set()).add(
+                    "arm " * depth + kind)
+
+
+def _literal_kind(node: Any) -> str | None:
+    """How `node` is typed if it is a literal: `bare` (an untyped string),
+    `as <type>` (one cast), `typed` (`(SELECT 'A')`, `COALESCE('A', '')`),
+    `other` (a number, a NULL); None for a value (a column, a function)."""
+    inner = _unwrap_scalar_sublink(node)
+    if isinstance(inner, A_Const):
+        if inner is not node:
+            return "typed"  # a select list makes a bare literal text
+        return "bare" if isinstance(getattr(inner, "val", None), String) else "other"
+    if isinstance(inner, TypeCast) and isinstance(inner.arg, A_Const):
+        return "as " + _type_key(inner.typeName)
+    arms = _arms(inner)
+    if arms is not None and arms and all(_literal_kind(arm) is not None for arm in arms):
+        return "typed"  # its literals take one type, text if all are bare
     return None
 
 
-def _to_z3(node: Any, ctx: _Context) -> Any:
-    """Translate a pglast AST node to a Z3 expression.
+def _has_typed_arm(node: Any) -> bool:
+    """Whether a COALESCE / GREATEST / LEAST / CASE of a value has an arm
+    that may decide the type it compares in: a typed literal, a value that
+    is no column (`auth.email()`, `(SELECT auth.email())`), or a second
+    value beside the first (`COALESCE(a, b)`)."""
+    arms = _arms(_unwrap_scalar_sublink(node))
+    if arms is None:
+        return False
+    values = [arm for arm in arms if _literal_kind(arm) is None]
+    return len(values) > 1 or any(
+        (k := _literal_kind(arm)) is not None and k not in ("bare", "other")
+        or k is None and not isinstance(_unwrap_scalar_sublink(arm), ColumnRef)
+        and (_arms(_unwrap_scalar_sublink(arm)) is None or _has_typed_arm(arm))
+        for arm in arms)
 
-    Returns None for unsupported nodes — the caller propagates None
-    upward, ultimately producing None from `classify_via_z3` which
-    causes `compare_predicates` to fall through to requires_review.
-    """
-    # Boolean connectives.
-    if isinstance(node, BoolExpr):
-        args = [_to_z3(a, ctx) for a in (node.args or ())]
-        if any(a is None for a in args):
-            return None
-        # z3.And/Or/Not raise z3.Z3Exception when an arg is not Bool-sorted
-        # — e.g. a bare boolean function call (translated as an opaque
-        # String marker) OR-combined with a real comparison
-        # (`tenant_id = 1 OR is_admin()`). Degrade to None (untranslatable
-        # -> requires_review) exactly like every other operator site in
-        # this module, rather than letting the sort mismatch escape and
-        # crash the whole `pgrls diff`.
-        try:
-            if node.boolop == BoolExprType.AND_EXPR:
-                if len(args) >= 2:
-                    return z3.And(*args)
-                return args[0] if args else None  # pragma: no cover
-            if node.boolop == BoolExprType.OR_EXPR:
-                if len(args) >= 2:
-                    return z3.Or(*args)
-                return args[0] if args else None  # pragma: no cover
-            if node.boolop == BoolExprType.NOT_EXPR:
-                if len(args) != 1:
-                    return None
-                return z3.Not(args[0])
-        except (z3.Z3Exception, TypeError):
-            return None
-        return None
 
-    # NULL tests — opaque Bool markers; not related to comparison
-    # variables in Phase 1. See module docstring for the trade-off.
-    if isinstance(node, NullTest):
-        if not isinstance(node.arg, ColumnRef):
-            # IS NULL on an arbitrary expression — out of scope.
-            return None
-        key = _column_key(node.arg)
-        if not key:
-            return None
-        marker = ctx.null_marker(key)
-        if node.nulltesttype == NullTestType.IS_NULL:
-            return marker
-        if node.nulltesttype == NullTestType.IS_NOT_NULL:
-            return z3.Not(marker)
-        return None
+def _values_within(node: Any, depth: int = 0) -> Any:
+    """`node` (through a scalar sub-select) and, for a COALESCE / GREATEST /
+    LEAST / CASE, the values in its arms, each with how many arms deep."""
+    inner = _unwrap_scalar_sublink(node)
+    yield inner, depth
+    for arm in _arms(inner) or ():
+        if _literal_kind(arm) is None:
+            yield from _values_within(arm, depth + 1)
 
-    # Comparison expressions.
-    if isinstance(node, A_Expr):
-        # Only handle the simple AOP_OP / IN / BETWEEN kinds.
-        if node.kind == A_Expr_Kind.AEXPR_OP:
-            return _binop_to_z3(node, ctx)
-        if node.kind == A_Expr_Kind.AEXPR_IN:
-            return _in_to_z3(node, ctx)
-        if node.kind == A_Expr_Kind.AEXPR_BETWEEN:
-            return _between_to_z3(node, ctx, negate=False)
-        if node.kind == A_Expr_Kind.AEXPR_NOT_BETWEEN:
-            return _between_to_z3(node, ctx, negate=True)
-        return None
 
-    # Phase 3 — function calls, COALESCE, CASE: each becomes an
-    # opaque Z3 variable keyed by canonical shape.
-    if isinstance(node, FuncCall):
-        return _func_call_to_z3(node, ctx)
-    if isinstance(node, (CoalesceExpr, CaseExpr)):
-        return _opaque_expression(node, ctx, sort=z3.StringSort())
-
-    # Phase 4 — TypeCast. Resolve the target type to a Z3 sort and,
-    # if it matches the inner expression's sort, return the inner
-    # translation unchanged (the cast is a no-op for our purposes).
-    # Otherwise the cast is opaque, keyed by canonical rendering.
-    if isinstance(node, TypeCast):
-        return _type_cast_to_z3(node, ctx)
-
-    # Bare ColumnRef appearing as a Boolean (e.g. `WHERE is_admin`).
-    if isinstance(node, ColumnRef):
-        key = _column_key(node)
-        if not key:
-            return None
-        var = ctx.column(key, z3.BoolSort())
-        return var
-
-    # Bare A_Const Boolean (true / false).
-    if isinstance(node, A_Const):
-        return _const_to_z3(node)
-
+def _arms(node: Any) -> list[Any] | None:
+    if isinstance(node, (CoalesceExpr, MinMaxExpr)):
+        return list(node.args or ())
+    if isinstance(node, CaseExpr):
+        return [w.result for w in node.args or ()] + (
+            [node.defresult] if node.defresult is not None else [])
     return None
 
 
-def _binop_to_z3(node: A_Expr, ctx: _Context) -> Any:
-    """Translate `A_Expr(AEXPR_OP)` — a binary comparison or arithmetic op.
+def _blanks_its_kin(members: Sequence[Any], ctx: Any) -> bool:
+    """Off the diff path, whether a member cast to a text type that changes a
+    value (`'a'::bpchar`, `'z'::"char"`, `name`) gives that type to a bare
+    string literal beside it, which then compares as that type does
+    (`'b'::text = ANY(ARRAY['a'::bpchar, 'b '])` holds: `bpchar` ignores the
+    trailing space). A list `pg_get_expr` writes casts every member."""
+    if ctx.any_session:
+        return False  # `_has_lossy_cast` already abstains there
+    return any(isinstance(n, TypeCast) and not _exact_cast(n.typeName)
+               and _typename_last_segment(n.typeName) in _STRING_TYPES - {"uuid"}
+               for m in members for n in _ast_nodes(m)) and any(
+        isinstance(m, A_Const) and isinstance(getattr(m, "val", None), String)
+        for m in members)
 
-    Either side may be a ColumnRef, A_Const, or any other supported
-    node (FuncCall in Phase 3, COALESCE/CASE in Phase 3, TypeCast
-    in Phase 4). Type inference for a bare ColumnRef on one side
-    reads the sort of the other side's translation. Arithmetic
-    operators (Phase 4: ``+``, ``-``, ``*``, ``/``, ``%``) produce
-    a Z3 ArithRef; comparisons produce a Z3 BoolRef.
-    """
-    # `node.name` is a tuple-of-String per pglast; exact length is
-    # operator-dependent (`OPERATOR(schema.+)` shapes can be 2-tuples).
-    # Phase 1+ only handles single-name operators.
-    op_names = list(node.name or ())
-    if len(op_names) != 1 or not isinstance(op_names[0], String):
-        return None
-    op = op_names[0].sval
-    op_fn = _COMPARISON_OPS.get(op) or _ARITHMETIC_OPS.get(op)
-    if op_fn is None:
-        return None  # unsupported operator
 
-    lhs, rhs = _resolve_binop_operands(node.lexpr, node.rexpr, ctx)
-    if lhs is None or rhs is None:
+def _floats_meet(left: Any, right: Any) -> bool:
+    """Whether a value cast to a float type meets a non-constant one, which
+    Postgres converts to float too, rounding it (`a = 1::float8` reads a
+    `numeric` or past-2^53 `int8` column `a` through a double)."""
+    return ((_floatish(left) and not _is_constant(right))
+            or (_floatish(right) and not _is_constant(left)))
+
+
+def _cast_value_meets_column(left: Any, right: Any) -> bool:
+    """Whether a column meets a value cast to a number type that is not a
+    literal (`amount = current_setting('app.v')::numeric`): Postgres converts
+    the value to the column's type, a float's too, rounding it, and the text
+    of an offline snapshot does not say which (a live one writes the cast)."""
+    return ((_holds_column(left) and _casts_a_value(right))
+            or (_holds_column(right) and _casts_a_value(left)))
+
+
+def _ordered_truth(op: str, left: Any, right: Any, ctx: _Context,
+                   assertions: list[Any]) -> Any:
+    """`left op right` for two non-NULL values compared in a type the text
+    does not show (a column meeting a cast value, in a diff): an order of
+    its own over the two, the same one wherever the same two are compared,
+    either way round, so a clause both sides share cancels and `=` → `>=`
+    is a loosening. Exactly one of `<`, `=`, `>` holds, as in any btree
+    type's order (NaN included); a type with no btree order may break it
+    (`lseg`'s `=` compares endpoints, its `<` lengths), as on `main`, which
+    read such a pair through Z3's own order."""
+    lhs, rhs = _canon(left), _canon(right)
+    if lhs > rhs:
+        lhs, rhs, op = rhs, lhs, _MIRRORED.get(op, op)
+    key = f"order {lhs!r} {rhs!r}"
+    known = f"{key} =" in ctx._opaque_vars
+    lt, eq, gt = (ctx.opaque(f"{key} {o}", z3.BoolSort()) for o in "<=>")
+    if not known:
+        assertions.append(z3.PbEq([(lt, 1), (eq, 1), (gt, 1)], 1))
+    return {"=": eq, "<>": z3.Not(eq), "!=": z3.Not(eq), "<": lt, ">": gt,
+            "<=": z3.Or(lt, eq), ">=": z3.Or(gt, eq)}[op]
+
+
+_MIRRORED = {"<": ">", ">": "<", "<=": ">=", ">=": "<="}
+
+
+def _columns_meet_through_arms(left: Any, right: Any) -> bool:
+    """Whether two values that each hold a column meet, one through a
+    COALESCE / CASE / GREATEST / LEAST / NULLIF, which gives its column the
+    type a literal beside it has: the two columns' own types (a numeric and a
+    float8, which Postgres compares through a double) are not shown."""
+    return _holds_column(left) and _holds_column(right) and (
+        _takes_a_column_type(left) or _takes_a_column_type(right))
+
+
+def _holds_column(node: Any) -> bool:
+    """Whether a column is anywhere in `node`: `COALESCE(amount, 0)` has
+    `amount`'s type."""
+    return any(isinstance(n, ColumnRef) for n in _ast_nodes(node))
+
+
+def _casts_a_value(node: Any) -> bool:
+    return any(isinstance(n, TypeCast) and not _is_constant(n.arg)
+               and _typename_last_segment(n.typeName) in _NUMBER_TYPES
+               for n in _ast_nodes(node))
+
+
+_NUMBER_TYPES = frozenset({
+    "int2", "int4", "int8", "int", "integer", "bigint", "smallint", "numeric", "decimal",
+    "float4", "float8", "oid",
+})
+
+
+def _floatish(node: Any) -> bool:
+    """Whether `node` holds a value of a float type: a float cast, or a
+    built-in that returns one (for some argument type)."""
+    return any((isinstance(n, TypeCast)
+                and _typename_last_segment(n.typeName) in ("float4", "float8"))
+               or (isinstance(n, FuncCall) and func_name_parts(n)[1] in _FLOAT_FUNCTIONS)
+               for n in _ast_nodes(node))
+
+
+# Built-ins that return a float for some argument type.
+_FLOAT_FUNCTIONS = frozenset({
+    "pi", "sqrt", "cbrt", "power", "pow", "exp", "ln", "log", "log10", "float4", "float8",
+    "date_part", "degrees", "radians", "sin", "cos", "tan", "cot", "asin", "acos", "atan",
+    "atan2", "sind", "cosd", "tand", "cotd", "asind", "acosd", "atand", "atan2d", "sinh",
+    "cosh", "tanh", "asinh", "acosh", "atanh", "random", "random_normal", "erf", "erfc",
+    "to_timestamp", "extract",
+})
+
+
+def _real_integer(number: int, ctx: _Context) -> Any:
+    """An integer literal as a real: exactly, up to where a `float8` holds
+    it (an `int8` compared with one is rounded past 2^53), and among values
+    Postgres gives one type (`ctx.unified`: an `IN` list, a `COALESCE`, an
+    array with a column in it) only where a `float4` does (measured: a
+    `float4` column reads `IN (16777217, 1)` and `COALESCE(g, 16777217)`
+    through a float4, `= 16777217` not)."""
+    if ctx.unified:
+        return _exact_real(str(number))
+    return z3.RealVal(number) if abs(number) <= 2**53 else None
+
+
+def _exact_real(text: str) -> Any:
+    """`text`'s number as a Z3 real when it is Postgres numeric syntax and a
+    `float4` holds it exactly — so a `numeric`, a `float8` and a `float4`
+    read it alike — else None."""
+    m = re.fullmatch(r"\s*[+-]?(\d+\.?\d*|\.\d+)(?:[eE]([+-]?\d+))?\s*", text, re.ASCII)
+    # A float4 holds nothing past 1e39 or with more digits than its exact
+    # subnormals have; `Fraction` would build `1e999999999` exactly first.
+    if (m is None or len(m.group(1)) > 200
+            or len((m.group(2) or "").lstrip("+-").lstrip("0")) > 5
+            or abs(int(m.group(2) or 0)) > 200):
         return None
+    exact = fractions.Fraction(text.strip())
     try:
-        return op_fn(lhs, rhs)
-    except (z3.Z3Exception, TypeError):
-        # TypeError: a Python-overloaded operator (arithmetic `-`/`*`/
-        # `/`/`%`, or a `<`/`>` comparison) applied to String- or
-        # Bool-sorted operands it doesn't support. Degrade to None
-        # (untranslatable -> NO-OP) rather than letting it escape.
+        single = struct.unpack("f", struct.pack("f", float(exact)))[0]
+    except (OverflowError, struct.error):
         return None
-
-
-def _resolve_binop_operands(
-    lexpr: Any, rexpr: Any, ctx: _Context
-) -> tuple[Any, Any]:
-    """Translate both sides of a binary comparison, inferring column
-    types from the other side when one side is a bare ColumnRef.
-
-    Returns ``(None, None)`` on any unsupported / type-conflict path.
-    """
-    l_is_col = isinstance(lexpr, ColumnRef)
-    r_is_col = isinstance(rexpr, ColumnRef)
-
-    if l_is_col and not r_is_col:
-        rhs = _to_z3(rexpr, ctx)
-        if rhs is None:
-            return (None, None)
-        lhs = _bind_column(lexpr, rhs.sort(), ctx)
-        return (lhs, rhs)
-    if r_is_col and not l_is_col:
-        lhs = _to_z3(lexpr, ctx)
-        if lhs is None:
-            return (None, None)
-        rhs = _bind_column(rexpr, lhs.sort(), ctx)
-        return (lhs, rhs)
-    if l_is_col and r_is_col:
-        # `col OP col`: bind both sides as String by default — pglast
-        # introspection can't tell us the actual Postgres type. Z3
-        # equality across mismatched sorts would raise; defaulting to
-        # String works for the common UUID-vs-UUID and text-vs-text
-        # shapes. Two String columns compared with `<` will succeed
-        # (Z3 strings have lex order); Int-vs-Int comparisons need a
-        # prior literal context that we don't have here.
-        lhs = _bind_column(lexpr, z3.StringSort(), ctx)
-        rhs = _bind_column(rexpr, z3.StringSort(), ctx)
-        return (lhs, rhs)
-    # Neither side is a column — translate generically.
-    return (_to_z3(lexpr, ctx), _to_z3(rexpr, ctx))
-
-
-def _bind_column(node: ColumnRef, sort: Any, ctx: _Context) -> Any:
-    """Bind ``node`` to a Z3 free variable of ``sort``."""
-    key = _column_key(node)
-    if not key:
+    if not math.isfinite(single) or fractions.Fraction(single) != exact:
         return None
-    return ctx.column(key, sort)
+    return z3.Q(exact.numerator, exact.denominator)
 
 
-def _type_cast_to_z3(node: TypeCast, ctx: _Context) -> Any:
-    """Translate ``<expr>::<type>`` (Phase 4).
+def _z3_string(text: str) -> Any:
+    """`text` as a Z3 string constant. ``StringVal`` reads ``\\u{…}`` escapes
+    in its argument (``'\\u{41}'`` would be ``'A'``), so each backslash goes
+    in escaped — a policy's ``'\\u{41}'`` is those six characters. None for
+    a character past U+2FFFF, where Z3's alphabet ends: it would stand for
+    the text of its own escape."""
+    if any(ord(c) > 0x2FFFF for c in text):
+        return None
+    return z3.StringVal(text.replace("\\", "\\u{5c}"))
 
-    Strategy:
 
-    * Resolve the target type to a Z3 sort. If unknown, the cast is
-      opaque (keyed by full canonical rendering).
-    * Translate the inner expression. If it failed (None), abort
-      and produce an opaque variable for the whole cast — that way
-      ``COALESCE(...)::text`` on both sides is still comparable
-      via canonical-string keying even though the inner COALESCE
-      itself is opaque.
-    * If the inner expression's sort matches the target sort, return
-      the inner translation unchanged (the cast is a no-op for
-      Z3's purposes — e.g. ``int8 → integer`` both resolve to Int).
-    * Otherwise, the cast is sort-changing (e.g. ``Int → Text`` for
-      ``id::text``); model as opaque so an identical cast on the
-      other side reuses the same Z3 variable.
-    """
-    target_sort = _typename_segments_to_sort(node.typeName)
-    inner = _to_z3(node.arg, ctx)
+def _z3_value(val: object) -> Any:
+    """A decoded witness value as a Z3 constant to pin a column to — a
+    string through `_z3_string`, which Z3's own coercion would not use."""
+    return _z3_string(val) if isinstance(val, str) else val
 
-    if target_sort is None:
-        # Unknown target type — fall back to opaque, keyed by the
-        # whole cast's canonical form so identical casts collapse.
-        return _opaque_expression(node, ctx, sort=z3.StringSort())
 
-    if inner is None:
-        # Inner expression unsupported — opaque the whole cast,
-        # under the target sort so subsequent comparisons can match.
-        return _opaque_expression(node, ctx, sort=target_sort)
+# Cast targets that keep the value of a column, a literal or another such
+# cast (an out-of-range integer raises rather than changing): a cast to one
+# of these, with no type modifier, of a value Z3 already holds in that sort
+# leaves it as it is; one that changes sort, like `1.5::int`, is opaque,
+# except a string literal Postgres reads exactly (`'5'::int`).
+# Any other —
+# `varchar(3)` truncates, `char` is `char(1)`, `bpchar` ignores trailing
+# spaces, `numeric(4,1)` and `float4` round, `oid` wraps a negative integer
+# — makes a value of its own (an opaque one, which the same cast in both
+# predicates shares).
+_EXACT_CAST_TARGETS = frozenset({
+    "text", "varchar", "int", "int4", "integer", "int8", "bigint", "bool",
+    "boolean", "numeric", "decimal",
+})
 
-    inner_sort = inner.sort()
-    if inner_sort == target_sort:
-        # Cast is a no-op at the Z3 level (e.g. `'a'::text` where
-        # the inner is already a Z3 String).
-        return inner
 
-    # Sort-changing cast (`id::text`, `created_at::date`). Model as
-    # opaque under the target sort so identical casts on both sides
-    # collapse to the same Z3 variable.
-    return _opaque_expression(node, ctx, sort=target_sort)
+def _exact_cast(typename: Any) -> bool:
+    """Whether a cast to `typename` keeps the value (see `_EXACT_CAST_TARGETS`)."""
+    return (
+        _typename_last_segment(typename) in _EXACT_CAST_TARGETS
+        and not getattr(typename, "typmods", None)
+        and not getattr(typename, "arrayBounds", None)
+    )
+
+
+def _bare_type(typename: Any, name: str) -> bool:
+    """Whether `typename` is `name` with no type modifier or array bounds."""
+    return (
+        _typename_last_segment(typename) == name
+        and not getattr(typename, "typmods", None)
+        and not getattr(typename, "arrayBounds", None)
+    )
+
+
+def _keeps_its_type(node: Any) -> bool:
+    """Whether `node` is a column, a literal, or a value-keeping cast of one —
+    a value a further cast to an exact target reads as the diff path models
+    it."""
+    node = _unwrap_scalar_sublink(node)
+    if isinstance(node, (ColumnRef, A_Const)):
+        return True
+    return (isinstance(node, TypeCast) and _exact_cast(node.typeName)
+            and _keeps_its_type(node.arg))
+
+
+def _takes_a_column_type(node: Any) -> bool:
+    """Whether `node` is a COALESCE / CASE / GREATEST / LEAST / NULLIF or a
+    value-changing cast: one whose Postgres type a column in it may give,
+    which a further cast may then change (`COALESCE(score, 0)::numeric`)."""
+    node = _unwrap_scalar_sublink(node)
+    if isinstance(node, (CoalesceExpr, CaseExpr, MinMaxExpr)):
+        return True
+    if isinstance(node, A_Expr) and node.kind == A_Expr_Kind.AEXPR_NULLIF:
+        return True
+    return isinstance(node, TypeCast) and not _exact_cast(node.typeName)
 
 
 def _typename_last_segment(typename: Any) -> str | None:
@@ -741,110 +905,6 @@ def _typename_segments_to_sort(typename: Any) -> Any:
     return None
 
 
-def _between_to_z3(node: A_Expr, ctx: _Context, *, negate: bool) -> Any:
-    """`<expr> BETWEEN <lo> AND <hi>` ⇒ ``lo <= expr AND expr <= hi``.
-
-    pglast represents BETWEEN as ``A_Expr(kind=AEXPR_BETWEEN,
-    lexpr=<expr>, rexpr=[<lo>, <hi>])``. NOT BETWEEN is the same
-    shape with ``kind=AEXPR_NOT_BETWEEN``; translates as the
-    ``Not(...)`` of the same body.
-
-    Built from two ``_resolve_binop_operands`` calls so that bare
-    ColumnRef on the lexpr side gets typed by the lo/hi literals
-    (otherwise the column would default to Bool sort and the Int
-    comparisons would silently coerce via ``If(x, 1, 0)``).
-
-    Symmetric variants (``BETWEEN SYMMETRIC``) use
-    ``AEXPR_BETWEEN_SYM`` / ``AEXPR_NOT_BETWEEN_SYM`` and abort
-    here — supporting them needs ``min(lo, hi) <= expr AND expr <=
-    max(lo, hi)`` which Z3 can express but the translation is
-    non-trivial; deferred until a real RLS predicate uses it.
-    """
-    lexpr = node.lexpr
-    rexpr_list = node.rexpr
-    if not isinstance(rexpr_list, (list, tuple)) or len(rexpr_list) != 2:
-        return None
-    lo, hi = rexpr_list
-
-    # `lo <= expr` (sorted as `_resolve_binop_operands(lo, expr)`)
-    lo_z3, expr_z3_low = _resolve_binop_operands(lo, lexpr, ctx)
-    if lo_z3 is None or expr_z3_low is None:
-        return None
-    # `expr <= hi`
-    expr_z3_high, hi_z3 = _resolve_binop_operands(lexpr, hi, ctx)
-    if expr_z3_high is None or hi_z3 is None:
-        return None
-
-    try:
-        body = z3.And(lo_z3 <= expr_z3_low, expr_z3_high <= hi_z3)
-    except (z3.Z3Exception, TypeError):
-        # `<=` on Bool-sorted operands raises TypeError (not
-        # Z3Exception); degrade to None like every other operator site.
-        return None
-    return z3.Not(body) if negate else body
-
-
-def _func_call_to_z3(node: FuncCall, ctx: _Context) -> Any:
-    """Translate a function call to an opaque Z3 String constant.
-
-    The call is keyed by ``<funcname>(<canonical-args>)`` so the
-    same call on base and head sides yields the same Z3 variable.
-    Aggregates, window functions, and DISTINCT-aggregates abort —
-    those don't appear in RLS predicates.
-
-    Args may be literals, ColumnRefs, or other supported nodes;
-    each must translate via ``_to_z3`` (which is itself recursive).
-    The call is keyed via ``_canon`` (``canonical_key``) so cosmetic
-    differences (whitespace, redundant parens) collapse. Two calls
-    that differ only in canonical arg ordering are NOT considered
-    equal — ``canonical_key`` preserves source order.
-    """
-    if node.agg_filter is not None:
-        return None  # FILTER (WHERE ...) — out of scope
-    if node.agg_within_group:
-        return None  # WITHIN GROUP (ORDER BY ...) — out of scope
-    if node.over is not None:
-        return None  # window function — out of scope
-    if node.agg_star:
-        return None  # `count(*)` etc. — out of scope
-    funcname_parts = node.funcname or ()
-    if not all(isinstance(part, String) for part in funcname_parts):
-        return None
-    func_name = ".".join(p.sval for p in funcname_parts)
-    if not func_name:
-        return None
-
-    # Sanity-check args translate. We don't actually consume the
-    # translated Z3 expressions here — the function call is opaque
-    # — but if any argument is unsupported, abort upward so we
-    # don't synthesize a misleading Z3 variable for an unparseable
-    # signature.
-    for arg in (node.args or ()):
-        if _to_z3(arg, ctx) is None:
-            return None
-
-    # Use the syntactic canonical rendering as the cache key. Two
-    # base/head predicates that reference the exact same call (e.g.
-    # `current_setting('app.tenant')`) get the same Z3 variable.
-    key = _canon(node)
-    return ctx.opaque(key, z3.StringSort())
-
-
-def _opaque_expression(node: Any, ctx: _Context, *, sort: Any) -> Any:
-    """Generic opaque-Z3-variable wrapper for nodes whose semantics
-    Phase 3 doesn't fully model (currently CoalesceExpr, CaseExpr).
-
-    Two equal canonical keys (the same AST) on base and head produce the
-    same Z3 variable, so predicates like ``COALESCE(col, 'default')
-    = 'foo'`` are comparable across base and head when they appear
-    verbatim. Predicates whose CASE/COALESCE bodies differ get
-    different variables and Z3 reports them as incomparable
-    (caller falls through to ``requires_review``).
-    """
-    key = _canon(node)
-    return ctx.opaque(key, sort)
-
-
 def _canon(node: Any) -> str:
     """``canonical_key``: the node's faithful SQL, tagged with an AST digest
     only when no rendering parses back to it — so two different expressions
@@ -852,76 +912,228 @@ def _canon(node: Any) -> str:
     return canonical_key(node)
 
 
-def _in_to_z3(node: A_Expr, ctx: _Context) -> Any:
-    """Translate `<col> IN (literal, literal, ...)` to Or-of-equalities.
-
-    pglast represents `IN` as `A_Expr(kind=AEXPR_IN, name=[String('=')],
-    lexpr=<col>, rexpr=<list of A_Const>)`. A subquery RHS lands in a
-    different kind — unsupported in Phase 1.
-    """
-    lexpr = node.lexpr
-    if not isinstance(lexpr, ColumnRef):
-        return None
-    rexpr = node.rexpr
-    if not isinstance(rexpr, (list, tuple)):
-        return None
-    if not all(isinstance(item, A_Const) for item in rexpr):
-        return None
-    if not rexpr:  # pragma: no cover - `col IN ()` is a Postgres syntax
-        # error, so a parsed AEXPR_IN always has >=1 element. This guard
-        # (an empty list survives the all()-over-[] check above, which is
-        # vacuously True) is a defensive failsafe, never reached from
-        # parsed SQL.
-        return z3.BoolVal(False)  # empty IN list — never matches
-    # Use the first literal's sort to bind the column.
-    first_sort = _infer_sort(rexpr[0])
-    if first_sort is None:
-        return None
-    key = _column_key(lexpr)
-    if not key:
-        return None
-    var = ctx.column(key, first_sort)
-    if var is None:
-        return None
-    eqs = []
-    for item in rexpr:
-        v = _const_to_z3(item)
-        if v is None:
-            return None
-        try:
-            eqs.append(var == v)
-        except z3.Z3Exception:
-            return None
-    return z3.Or(*eqs) if len(eqs) >= 2 else eqs[0]
-
-
 _Z3Result = Literal["semantic_equivalent", "semantic_tightened", "semantic_loosened"]
 
 
-def _as_bool_predicate(expr: Any) -> Any | None:
-    """Return `expr` iff it is a Z3 Bool expression, else None.
+_F = TypeVar("_F", bound=Callable[..., Any])
 
-    A predicate that translates to a non-Bool sort — a bare constant
-    (`USING (1)`, `USING ('x')`) or a bare numeric column — cannot drive
-    the implication / counterexample checks: `z3.Not` and `z3.And` require
-    Bool operands and otherwise raise Z3Exception. Postgres rejects a
-    non-boolean USING / WITH CHECK at policy creation, but a hand-built or
-    snapshot-loaded predicate can still reach the differ, so gate the
-    top-level translation here and let the caller fall through to
-    `requires_review` instead of crashing `pgrls diff`. (Operands such as
-    the `1` in `x = 1` are unaffected — only the whole-predicate result is
-    checked.)
-    """
-    if expr is None:
+
+def _bare_columns(*names: str) -> Callable[[_F], _F]:
+    """Run the decorated prover with the named predicate arguments' columns
+    written bare, and restore them after: `pg_get_expr` qualifies a column
+    in a sub-select (`t.a`) and not outside it (`a`), one column. Outside a
+    sub-select with a FROM, a qualified column can only be the policy's own
+    table's (a composite's field needs `(c).f`), so the qualifiers must
+    agree; if they do not, the columns stay as they are (and `_column_key`
+    declines to read a column spelled two ways). In place, not a copy: a
+    copy of a predicate a few hundred levels deep overflows the stack."""
+
+    def wrap(fn: _F) -> _F:
+        signature = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def run(*args: Any, **kwargs: Any) -> Any:
+            bound = signature.bind_partial(*args, **kwargs).arguments
+            undo = _write_bare([bound.get(name) for name in names])
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                for ref, fields in undo:
+                    ref.fields = fields
+        return cast(_F, run)
+    return wrap
+
+
+def _write_bare(nodes: list[Any]) -> list[tuple[Any, Any]]:
+    """Write each qualified column in `nodes` bare (see `_bare_columns`),
+    returning what to restore."""
+    refs: dict[int, tuple[Any, Any]] = {}
+    qualifier = None
+    stack: list[Any] = list(nodes)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (list, tuple)):
+            stack.extend(node)
+        elif isinstance(node, SelectStmt) and node.fromClause:
+            continue  # its columns can be another table's
+        elif isinstance(node, ColumnRef):
+            fields = tuple(node.fields or ())
+            if len(fields) > 1 and all(isinstance(f, String) for f in fields):
+                q = tuple(f.sval for f in fields[:-1])
+                if qualifier not in (None, q):
+                    return []
+                qualifier = q
+                refs[id(node)] = (node, node.fields)
+        elif isinstance(node, Node):
+            stack.extend(getattr(node, f, None) for f in node)
+    for ref, fields in refs.values():
+        ref.fields = tuple(fields)[-1:]
+    return list(refs.values())
+
+
+@_bare_columns("base_node", "head_node")
+def _diff_truths(base_node: Any, head_node: Any, *, integers: bool = False,
+                 column_types: Mapping[str, str] | None = None,
+                 ) -> tuple[_Context, list[Any], _TV, _TV] | None:
+    """Both predicates as Kleene truths over one context (so a column or an
+    opaque expression is the same variable in both), with the assertions
+    their free boolean leaves need — None when either does not translate.
+
+    A row passes a policy only when the predicate is exactly TRUE: NULL hides
+    it as FALSE does. So the predicates are compared on ``is_true``, over
+    every row including ones holding NULLs, and over any session (no auth
+    call or GUC is assumed NULL or unset)."""
+    ctx = _Context()
+    ctx.any_session = True
+    ctx.integers = integers
+    ctx.column_types = column_types
+    assertions: list[Any] = []
+    base = _lift_to_tv(_anon_3vl(base_node, ctx, set(), assertions), assertions)
+    head = _lift_to_tv(_anon_3vl(head_node, ctx, set(), assertions), assertions)
+    if base is None or head is None or any(
+            not _reads_strings_alike(column, kinds, column_types)
+            for column, kinds in ctx.string_reads.items()) or any(
+            not _reads_value_alike(hint, kinds) for (_, hint), kinds in ctx.value_reads.items()):
         return None
-    try:
-        is_bool = expr.sort() == z3.BoolSort()
-    except (z3.Z3Exception, AttributeError):
+    return ctx, assertions, base, head
+
+
+def _reads_value_alike(hint: str | None, kinds: set[str]) -> bool:
+    """`_reads_strings_alike` for a value that is no column, of type `hint`
+    (a cast's) or one the text does not show (a function's, a sub-select's):
+    then every comparison of it must read the string one way."""
+    if hint is None:
+        return len(kinds) <= 1
+    return hint in _ALIKE_TYPES or kinds <= {"bare", "as " + hint}
+
+
+def _reads_strings_alike(column: str, kinds: set[str],
+                         column_types: Mapping[str, str] | None) -> bool:
+    """Whether Z3's one reading of a string compared with `column` is
+    Postgres's in every spelling: a `text` column (or a number, `uuid`, a
+    time, which no string is compared with as text) reads `'A'`, `'A'::text`,
+    `(SELECT 'A')` and an `IN` list alike; any other known one (a `citext`
+    or `char(n)` one, which reads a bare literal as itself and a typed one
+    as text, and lists otherwise again) is read only against bare literals,
+    where it reads them as `main` does (and against a literal cast to its
+    own type, `'admin'::app_role`). Without column types (a snapshot from
+    before they were captured) a column is not read against both a bare
+    literal and anything else. A column's collation is not in the
+    snapshots: a nondeterministic one (`text COLLATE ci`) compares strings
+    otherwise, which the diff does not see, as on `main`."""
+    data_type = None if column_types is None else column_types.get(column)
+    if data_type in (None, "unknown"):
+        # A type the snapshots do not give (or the offline model is not
+        # sure of): read the column one way only.
+        return len(kinds) <= 1
+    if _reads_alike(data_type):
+        return True
+    own = "as " + _type_key(data_type) if data_type is not None else None
+    return all(kind in ("bare", own) for kind in kinds)
+
+
+def _keeps_strings_text(node: Any, ctx: Any) -> bool:
+    """Whether `node`, beside a bare string literal that takes its type,
+    keeps that literal text: a literal (a bare one, a number, which Z3 keeps
+    apart by its sort), one cast to text, or a column the diff knows is
+    text."""
+    if isinstance(node, A_Const) or _literal_kind(node) in ("as text", "as varchar"):
+        return True
+    column = _unwrap_scalar_sublink(node)
+    return (isinstance(column, ColumnRef) and bool(column.fields)
+            and isinstance(column.fields[-1], String)
+            and _is_text(None if ctx.column_types is None
+                         else ctx.column_types.get(column.fields[-1].sval)))
+
+
+def _entry_type(node: Any, ctx: Any) -> str | None:
+    """The type a list entry brings to the list's common type: a typed
+    literal's (`'b'::varchar`; `(SELECT 'b')` and other typed ones text), a
+    known plain column's, else None."""
+    kind = _literal_kind(node)
+    if kind is None:
+        return _plain_column_type(node, ctx)
+    if kind == "typed":
+        return "text"
+    return _type_key(kind.removeprefix("as ")) if kind.startswith("as ") else None
+
+
+def _plain_column_type(node: Any, ctx: Any) -> str | None:
+    """The type of a bare column (through a scalar sub-select) the diff knows
+    and reads alike (`text`, `uuid`, an integer …), else None."""
+    column = _unwrap_scalar_sublink(node)
+    if not (isinstance(column, ColumnRef) and column.fields
+            and isinstance(column.fields[-1], String) and ctx.column_types is not None):
         return None
-    return expr if is_bool else None
+    data_type = ctx.column_types.get(column.fields[-1].sval)
+    return _type_key(data_type) if data_type is not None and _reads_alike(data_type) else None
 
 
-def classify_via_z3(base_node: Any, head_node: Any) -> _Z3Result | None:
+def _is_text(data_type: str | None) -> bool:
+    return data_type is not None and '"' not in data_type and _type_key(
+        data_type) in ("text", "varchar")
+
+
+def _reads_alike(data_type: str | None) -> bool:
+    if data_type is None or '"' in data_type:
+        return False  # a quoted name is a user type's (`"Text"`)
+    return _type_key(data_type) in _ALIKE_TYPES
+
+
+def _type_key(data_type: Any) -> str:
+    """A type's name to compare by: lower case, its modifiers dropped, a
+    `pg_catalog.` prefix (only) dropped (`app.text` is a user type), and the
+    aliases a `TypeName` and `format_type` spell otherwise made one."""
+    if not isinstance(data_type, str):
+        names = [n.sval for n in getattr(data_type, "names", None) or () if isinstance(n, String)]
+        if names == ["char"]:
+            return '"char"'  # the one-byte type; `char(n)` parses as `bpchar`
+        data_type = ".".join(names)
+    name = re.sub(r"\(.*\)", "", data_type.lower()).strip()
+    name = re.sub(r"\s+", " ", name.removeprefix("pg_catalog."))
+    return _TYPE_ALIASES.get(name, name)
+
+
+_TYPE_ALIASES = {"character": "bpchar", "char": "bpchar", "character varying": "varchar",
+                 "int": "int4", "integer": "int4", "bigint": "int8", "smallint": "int2",
+                 "boolean": "bool", "double precision": "float8", "real": "float4"}
+
+
+_ALIKE_TYPES = frozenset({
+    "text", "varchar", "character varying", "uuid", "smallint", "integer", "bigint",
+    "int", "int2", "int4", "int8", "numeric", "decimal", "real", "double precision",
+    "float4", "float8", "boolean", "bool", "date", "timestamp", "timestamptz",
+    "timestamp without time zone", "timestamp with time zone", "time", "timetz",
+    "time without time zone", "time with time zone", "interval", "serial", "bigserial",
+    "smallserial", "oid",
+})
+
+
+
+
+def _abstains_when_too_deep(result: Any) -> Callable[[_F], _F]:
+    """Return `result` (the entry point's "decided nothing") instead of a
+    RecursionError on a predicate nested past the stack — Postgres accepts
+    hundreds of levels of COALESCE."""
+    def wrap(fn: _F) -> _F:
+        @functools.wraps(fn)
+        def inner(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return fn(*args, **kwargs)
+            except RecursionError:
+                return result
+            except ctypes.ArgumentError as exc:
+                # Z3's ctypes layer re-raises a RecursionError as this.
+                if "RecursionError" not in str(exc):
+                    raise
+                return result
+        return cast(_F, inner)
+    return wrap
+
+
+@_abstains_when_too_deep(None)
+def classify_via_z3(base_node: Any, head_node: Any, *,
+                    column_types: Mapping[str, str] | None = None) -> _Z3Result | None:
     """Classify a base/head predicate pair using Z3 implication.
 
     Returns:
@@ -936,20 +1148,34 @@ def classify_via_z3(base_node: Any, head_node: Any) -> _Z3Result | None:
       node, or neither implication holds (incomparable). Caller falls
       through to ``requires_review``.
 
-    The pair MUST share a single ``_Context`` so column references
-    resolve to the same Z3 variables in both predicates.
+    Implication is over the rows each predicate admits — the ones it is
+    exactly TRUE for under SQL's three-valued logic (see `_diff_truths`).
     """
     if not Z3_AVAILABLE:
         return None
-    ctx = _Context()
-    base_z3 = _as_bool_predicate(_to_z3(base_node, ctx))
-    head_z3 = _as_bool_predicate(_to_z3(head_node, ctx))
-    if base_z3 is None or head_z3 is None:
-        return None
+    verdict = _classify(base_node, head_node, integers=False, column_types=column_types)
+    if verdict in ("semantic_loosened", _UNTRANSLATED):
+        # Loosened only where a column is not an integer one, which the
+        # text does not say, is no verdict; one the reals cannot read (an
+        # integer a float4 rounds) is loosened if an integer row leaks.
+        again = _classify(base_node, head_node, integers=True, column_types=column_types)
+        return "semantic_loosened" if again == "semantic_loosened" else None
+    return cast("_Z3Result | None", verdict)
 
-    # Implication check: `P → Q` is valid iff `P AND NOT Q` is UNSAT.
-    base_implies_head = _implies(base_z3, head_z3)
-    head_implies_base = _implies(head_z3, base_z3)
+
+# `_classify`'s "the predicates do not translate".
+_UNTRANSLATED = "untranslated"
+
+
+def _classify(base_node: Any, head_node: Any, *, integers: bool,
+              column_types: Mapping[str, str] | None = None) -> Any:
+    truths = _diff_truths(base_node, head_node, integers=integers, column_types=column_types)
+    if truths is None:
+        return _UNTRANSLATED
+    _, assertions, base, head = truths
+
+    base_implies_head = _implies(base.is_true, head.is_true, assertions)
+    head_implies_base = _implies(head.is_true, base.is_true, assertions)
 
     if base_implies_head and head_implies_base:
         return "semantic_equivalent"
@@ -960,14 +1186,17 @@ def classify_via_z3(base_node: Any, head_node: Any) -> _Z3Result | None:
     return None
 
 
-def _implies(p: Any, q: Any) -> bool:
-    """Return True iff `p → q` is valid (i.e. `p AND NOT q` is UNSAT)."""
+def _implies(p: Any, q: Any, assertions: Sequence[Any] = ()) -> bool:
+    """Return True iff `p → q` is valid under `assertions` (i.e.
+    `assertions AND p AND NOT q` is UNSAT)."""
     solver = z3.Solver()
     # Bound the search: real-world RLS predicates resolve in
     # milliseconds, but a pathologically constructed predicate with
     # deep quantifier alternation could otherwise hang. 1 second is
     # comfortable for the supported subset.
     solver.set("timeout", 1000)
+    for a in assertions:
+        solver.add(a)
     solver.add(z3.And(p, z3.Not(q)))
     result = solver.check()
     # `unsat` ⇒ no counterexample exists ⇒ implication holds.
@@ -981,11 +1210,13 @@ def _decode_model(model: Any, ctx: _Context) -> dict[str, object]:
     """Render a Z3 model into ``{column_key: python_value}``.
 
     Keeps only real columns (``ctx.is_real_column``) — synthetic
-    ``_isnull__*`` / ``_opaque__*`` markers are dropped — and decodes
+    ``_nullflag__*`` / ``_opaque__*`` / ``_session__*`` vars are dropped — and decodes
     each value by its Z3 sort, one-to-one with the constructors in
     ``_const_to_z3`` (Int → ``as_long``, String → ``as_string``,
-    Bool → ``z3.is_true``, Real → ``float(as_fraction())``). Any other
-    sort is omitted (defensive). ``model.decls()`` yields only the
+    Bool → ``z3.is_true``, Real → ``float(as_fraction())``, left out when
+    it is beyond a double's range; a witness gate declines a row whose
+    float no longer witnesses the leak). Any other sort is omitted
+    (defensive). ``model.decls()`` yields only the
     constants Z3 actually assigned; a don't-care column is simply
     absent and is never fabricated.
     """
@@ -993,64 +1224,25 @@ def _decode_model(model: Any, ctx: _Context) -> dict[str, object]:
     for decl in model.decls():
         name = decl.name()
         if not ctx.is_real_column(name):
-            continue  # skip _isnull__ / _opaque__ synthetic vars
+            continue  # skip the synthetic vars
         value = model[decl]
         sort = value.sort()
         if sort == z3.IntSort():
             row[name] = value.as_long()
         elif sort == z3.StringSort():
-            row[name] = value.as_string()
+            # `as_string` escapes every character past U+00FF, and the
+            # backslash `_z3_string` escaped, as `\\u{…}`.
+            row[name] = re.sub(r"\\u\{([0-9a-fA-F]+)\}",
+                               lambda m: chr(int(m.group(1), 16)), value.as_string())
         elif sort == z3.BoolSort():
             row[name] = z3.is_true(value)
         elif sort == z3.RealSort():
-            row[name] = float(value.as_fraction())
+            try:
+                row[name] = float(value.as_fraction())
+            except OverflowError:
+                pass
         # any other sort: omit (defensive)
     return row
-
-
-def _row_is_sufficient_witness(
-    row: dict[str, object], base_z3: Any, head_z3: Any, ctx: _Context
-) -> bool:
-    """True iff pinning `row`'s columns forces ``head ∧ ¬base`` for ALL
-    completions of the free (synthetic / unpinned) variables.
-
-    A Z3 model of ``head ∧ ¬base`` is a *full* assignment; the
-    real-column projection ``row`` we return drops every synthetic
-    (``_isnull__*`` / ``_opaque__*``) var. A projection is NOT in
-    general a satisfying assignment — e.g. for ``active = true`` vs
-    ``active = true OR deleted_at IS NULL`` the model is
-    ``{active=False, _isnull__deleted_at=True}`` but ``{active=False}``
-    alone does not leak (it needs ``deleted_at IS NULL``). Emitting
-    ``{active=False}`` would be unsound.
-
-    Soundness gate: the row is a genuine, self-sufficient witness iff
-    ``(pins) ∧ ¬(head ∧ ¬base)`` is UNSAT — i.e. there is no completion
-    of the unpinned variables under which the pinned row fails to leak.
-    Only then does every row matching ``row`` (for any value of the
-    columns/markers we did not pin) lie inside HEAD \\ BASE. We rebuild
-    the pins against the SAME ``ctx`` used to build ``base_z3`` /
-    ``head_z3`` so each pinned ``z3.Const(key, sort)`` is identical to
-    the variable already inside the formulas.
-    """
-    pins = []
-    for key, val in row.items():
-        var = ctx.column(key, _py_value_sort(val))
-        if var is None:  # pragma: no cover
-            # Unreachable: `row` comes only from `_decode_model`, which
-            # decodes each column by its bound sort, and `_py_value_sort`
-            # is the exact inverse, so the re-derived sort always equals
-            # the original binding and `ctx.column` never returns None
-            # here. Kept as a defensive soundness bail (matches the
-            # pragma-marked siblings): a sort clash means we cannot
-            # honestly pin the value, so we cannot prove sufficiency.
-            return False
-        pins.append(var == val)
-    solver = z3.Solver()
-    solver.set("timeout", 1000)
-    pinned = z3.And(*pins) if len(pins) >= 2 else (pins[0] if pins else z3.BoolVal(True))
-    solver.add(z3.And(pinned, z3.Not(z3.And(head_z3, z3.Not(base_z3)))))
-    # UNSAT ⇒ no completion escapes head ∧ ¬base ⇒ row is sufficient.
-    return bool(solver.check() == z3.unsat)
 
 
 def _py_value_sort(val: object) -> Any:
@@ -1070,7 +1262,9 @@ def _py_value_sort(val: object) -> Any:
     return z3.StringSort()
 
 
-def counterexample(base_node: Any, head_node: Any) -> dict[str, object] | None:
+@_abstains_when_too_deep(None)
+def counterexample(base_node: Any, head_node: Any, *,
+                   column_types: Mapping[str, str] | None = None) -> dict[str, object] | None:
     """Return a concrete leaking row for a loosened predicate change, or None.
 
     The returned dict maps real column keys → decoded Python values. By
@@ -1085,9 +1279,11 @@ def counterexample(base_node: Any, head_node: Any) -> dict[str, object] | None:
     * ``head ∧ ¬base`` is UNSAT — the head admits no row the base rejected
       (an equivalent or tightened change); or
     * the real-column projection of the model is not a *self-sufficient*
-      witness — the leak depends on a NULL test or an opaque
-      (function / GUC / COALESCE / CASE) value that the column-only row
-      cannot honestly express. In that case we emit NO counterexample
+      witness — the leak depends on an opaque (function / GUC / COALESCE /
+      CASE) value the row cannot express, or on a column being NOT NULL
+      that the predicates only test for NULL (the row pins a column NULL,
+      but has no value to give one that must not be). In that case we
+      emit NO counterexample
       (degrade to the label-only DANGEROUS verdict) rather than a row
       that does not actually leak. Soundness over cleverness.
 
@@ -1100,33 +1296,67 @@ def counterexample(base_node: Any, head_node: Any) -> dict[str, object] | None:
     """
     if not Z3_AVAILABLE:
         return None
-    ctx = _Context()
-    base_z3 = _as_bool_predicate(_to_z3(base_node, ctx))
-    head_z3 = _as_bool_predicate(_to_z3(head_node, ctx))
-    if base_z3 is None or head_z3 is None:
+    # An integer row leaks whatever numeric type a column is.
+    truths = _diff_truths(base_node, head_node, integers=True, column_types=column_types)
+    if truths is None:
         return None
+    ctx, assertions, base, head = truths
+    leaks = z3.And(head.is_true, z3.Not(base.is_true))
     solver = z3.Solver()
     solver.set("timeout", 1000)
-    # SAME formula as _implies(head_z3, base_z3) — we keep the model.
-    solver.add(z3.And(head_z3, z3.Not(base_z3)))
+    for a in assertions:
+        solver.add(a)
+    # SAME formula as _implies(head, base) — we keep the model.
+    solver.add(leaks)
     if solver.check() != z3.sat:
         return None  # soundness guard: no model ⇒ no claim
-    row = _decode_model(solver.model(), ctx)
+    model = solver.model()
+    row = _decode_model(model, ctx)
+    # A column the model makes NULL is NULL in the row, whatever value its
+    # (then irrelevant) value variable took.
+    for key in {*ctx._vars, *ctx.null_tested}:
+        flag = model[ctx.null_flag(key)] if key in ctx._nullflag_vars else None
+        if flag is not None and z3.is_true(flag):
+            row[key] = None
     # Soundness gate (critique #1/#2): the real-column projection must
     # be a witness on its own, independent of the dropped synthetic
     # vars. An empty row (all-opaque/all-GUC loosen) is sufficient iff
     # EVERY row leaks — which is exactly when the gate passes; for the
     # common GUC-only loosen it does not, so we return None.
-    if not _row_is_sufficient_witness(row, base_z3, head_z3, ctx):
+    if not _diff_witness_is_sufficient(row, leaks, ctx, assertions):
         return None
     return row
 
 
+def _diff_witness_is_sufficient(
+    row: dict[str, object], leaks: Any, ctx: _Context, assertions: list[Any]
+) -> bool:
+    """True iff pinning `row`'s columns — each one's value and null-flag, a
+    ``None`` as NULL — forces `leaks` for every completion of the rest: the
+    variables it does not pin (opaque values, other columns) are free, so
+    only then does every row matching `row` lie inside HEAD \\ BASE."""
+    pins = []
+    for key, val in row.items():
+        if val is None:
+            pins.append(ctx.null_flag(key))
+            continue
+        var = ctx.column(key, _py_value_sort(val))
+        if var is None:  # pragma: no cover - _py_value_sort inverts the bound sort
+            return False
+        pins.extend((var == _z3_value(val), z3.Not(ctx.null_flag(key))))
+    solver = z3.Solver()
+    solver.set("timeout", 1000)
+    for a in assertions:
+        solver.add(a)
+    solver.add(*pins)
+    solver.add(z3.Not(leaks))
+    return bool(solver.check() == z3.unsat)
+
+
 # ===========================================================================
 # H2 (SEC038) — semantic anonymous-read property via Kleene three-valued
-# (3VL) logic. ADDITIVE: nothing above this line is touched. Every symbol
-# below is new. The 2-valued diff path (`_to_z3` / `classify_via_z3` /
-# `counterexample` / `_implies`) is unchanged and its tests stay green.
+# (3VL) logic. The diff path above (`classify_via_z3` / `counterexample`)
+# runs on the same encoder, under `_Context.any_session`.
 #
 # The property: a read-capable policy (FOR ALL / FOR SELECT) leaks to
 # anonymous iff its USING predicate, evaluated under a session where every
@@ -1233,6 +1463,11 @@ def _is_anon_null_leaf(node: Any, auth_funcs: set[str]) -> bool:
         # the two-arg current_setting(name, true) is NULLable under anon.
         if is_never_null_current_setting(node):
             return False
+        if (func_name_parts(node)[0] in ("current_setting", "pg_catalog.current_setting")
+                and not has_literal_setting_arguments(node)):
+            # A name or missing_ok read from a column: neither the session's
+            # identity nor NULL under anon, but whatever the row makes it.
+            return False
         if qualified in auth_funcs:
             return True
         # Bare-name fallback: an UNQUALIFIED call has qualified == bare
@@ -1270,12 +1505,31 @@ def _first_string_arg(node: Any) -> str | None:
     return val.sval if isinstance(val, String) else None
 
 
+def _computes_missing_ok(node: Any) -> bool:
+    """`current_setting(<literal name>, <missing_ok not a literal>)`."""
+    qualified, _bare = func_name_parts(node)
+    args = node.args or ()
+    return (qualified in ("current_setting", "pg_catalog.current_setting")
+            and len(args) == 2 and _first_string_arg(node) is not None
+            and not has_literal_setting_arguments(node))
+
+
 def _is_builtin_current_setting_call(node: Any) -> bool:
+    """A call of the built-in `current_setting` with literal arguments; one
+    with a computed name or missing_ok is an opaque value."""
     qualified, bare = func_name_parts(node)
     return bare == "current_setting" and qualified in (
         "current_setting",
         "pg_catalog.current_setting",
-    )
+    ) and has_literal_setting_arguments(node)
+
+
+def _operator(node: A_Expr) -> str | None:
+    """The unqualified operator of an `A_Expr`, or None for a qualified one."""
+    names = list(node.name or ())
+    if len(names) != 1 or not isinstance(names[0], String):
+        return None
+    return str(names[0].sval)
 
 
 def _is_jwt_role_extraction(node: Any) -> bool:
@@ -1315,10 +1569,9 @@ def _anon_jwt_claim(node: Any) -> str | None:
         return "role"
     if qualified == "auth.jwt":
         return "jwt"
-    if bare == "current_setting" and (
-        qualified == "current_setting" or qualified == "pg_catalog.current_setting"
-    ):
-        name = _first_string_arg(node)
+    if _is_builtin_current_setting_call(node):
+        # Postgres reads a setting's name ignoring case.
+        name = (_first_string_arg(node) or "").lower()
         if name == "request.jwt.claim.role":
             return "role"
         if name == "request.jwt.claims":
@@ -1384,32 +1637,67 @@ def _unwrap_scalar_sublink(node: Any) -> Any:
     (corpus ``sec004-is-null-in-subquery-safe``) must stay opaque so that
     case stays clean.
     """
-    if not isinstance(node, SubLink):
-        return node
-    if node.subLinkType != SubLinkType.EXPR_SUBLINK:
-        return node
-    sel = node.subselect
-    if not isinstance(sel, SelectStmt):
-        return node
-    target_list = sel.targetList
-    if not target_list or len(target_list) != 1:
-        return node
-    # `sel.op` is a SetOperation IntEnum; SETOP_NONE == 0 is a plain
-    # SELECT. Reject UNION/INTERSECT/EXCEPT and any FROM/WHERE/aggregation
-    # shape — those aren't a bare scalar.
-    if (
-        sel.fromClause
-        or sel.whereClause
-        or int(sel.op) != 0
-        or sel.distinctClause
-        or sel.groupClause
-        or sel.havingClause
-    ):
-        return node
-    target = target_list[0]
-    if not isinstance(target, ResTarget):
-        return node
-    return target.val
+    # `(SELECT (SELECT x))` is `x` too — a loop, not a recursion, so a deep
+    # nesting cannot exhaust the stack.
+    while True:
+        if not isinstance(node, SubLink):
+            return node
+        if node.subLinkType != SubLinkType.EXPR_SUBLINK:
+            return node
+        sel = node.subselect
+        if not isinstance(sel, SelectStmt):
+            return node
+        target_list = sel.targetList
+        if not target_list or len(target_list) != 1:
+            return node
+        # `sel.op` is a SetOperation IntEnum; SETOP_NONE == 0 is a plain
+        # SELECT. Reject UNION/INTERSECT/EXCEPT and any FROM/WHERE/
+        # aggregation shape — those aren't a bare scalar — and a LIMIT /
+        # OFFSET, which can make it NULL (`(SELECT x LIMIT 0)`).
+        if (
+            sel.fromClause
+            or sel.whereClause
+            or int(sel.op) != 0
+            or sel.distinctClause
+            or sel.groupClause
+            or sel.havingClause
+            or sel.limitCount is not None
+            or sel.limitOffset is not None
+            # A set-returning function in ORDER BY or a WINDOW makes it NULL
+            # when it yields no row.
+            or sel.sortClause
+            or sel.windowClause
+        ):
+            return node
+        target = target_list[0]
+        if not isinstance(target, ResTarget):
+            return node
+        # (One in the target is `_anon_3vl`'s: see `_may_yield_no_row`.)
+        node = target.val
+
+
+def _ast_nodes(node: Any) -> Any:
+    """`node` and every pglast node beneath it."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (list, tuple)):
+            stack.extend(n)
+        elif isinstance(n, Node):
+            yield n
+            stack.extend(getattr(n, f, None) for f in n)
+
+
+def _may_yield_no_row(target: Any, auth_funcs: set[str]) -> bool:
+    """Whether the target of a scalar sub-select calls anything that may be
+    set-returning: any call but an auth function (the configured ones and
+    the defaults, on the diff path too, which configures none) or the
+    built-in `current_setting`; the arguments are walked too."""
+    known = auth_funcs | _DEFAULT_AUTH_FUNCTIONS
+    return any(
+        isinstance(n, FuncCall) and not _is_anon_null_leaf(n, known)
+        and func_name_parts(n)[0] not in ("current_setting", "pg_catalog.current_setting")
+        for n in _ast_nodes(target))
 
 
 def _as_val(x: Any) -> Any:
@@ -1466,7 +1754,7 @@ def _anon_3vl(
     NullTest, bool column / bool literal), ``_Val`` for a scalar (column,
     auth call, literal, arithmetic, COALESCE, cast), or ``None`` when any
     sub-expression is untranslatable (soundness abort — propagated by the
-    ``any(... is None)`` pattern, mirroring ``_to_z3``).
+    ``any(... is None)`` pattern).
 
     ``assertions`` collects leaf-exclusivity constraints (§ amendment #1);
     the caller adds them to BOTH the validity and witness solvers.
@@ -1474,7 +1762,30 @@ def _anon_3vl(
     Every call unwraps a scalar SubLink first, then checks the anon-NULL
     leaf BEFORE the generic FuncCall / SQLValueFunction branches.
     """
-    node = _unwrap_scalar_sublink(node)
+    inner = _unwrap_scalar_sublink(node)
+    if inner is not node:
+        # Its columns are the outer query's (see `subselect_depth`).
+        ctx.subselect_depth += 1
+        try:
+            result = _anon_3vl(inner, ctx, auth_funcs, assertions)
+        finally:
+            ctx.subselect_depth -= 1
+        if not _may_yield_no_row(inner, auth_funcs):
+            return result
+        # A call in the target may be set-returning, which a name cannot tell
+        # apart, and yield no row: the sub-select is then NULL whatever its
+        # target reads (`(SELECT srf() IS NULL)` is NULL, not TRUE). The same
+        # sub-select shares the one flag, in base and head alike.
+        if result is None:
+            return None
+        # Keyed by the target: Postgres renders `(SELECT f() AS f)`.
+        no_row = ctx.opaque(f"no_row {_canon(inner)}", z3.BoolSort())
+        if no_row is None:
+            return None
+        if isinstance(result, _TV):
+            return _TV(is_true=z3.And(result.is_true, z3.Not(no_row)),
+                       is_null=z3.Or(result.is_null, no_row))
+        return dataclasses.replace(result, is_null=z3.Or(result.is_null, no_row))
 
     # --- auth-context leaf: auth.uid()/role()/jwt(), current_setting(...),
     # current_user, session_user. Checked before the generic FuncCall
@@ -1519,7 +1830,7 @@ def _anon_3vl(
             is_null=(
                 z3.BoolVal(False)
                 if is_never_null_current_setting(node)
-                else ctx.null_flag(_canon(node))
+                else ctx.opaque_null_flag(_canon(node))
             ),
         )
     if (
@@ -1539,14 +1850,34 @@ def _anon_3vl(
         # uncaptured value (`None`) falls back to an opaque non-null one,
         # which can only decline to prove isolation, never claim it.
         configured = ctx.set_gucs[(_first_string_arg(node) or "").lower()]
+        value = _z3_string(configured) if configured is not None else None
         return _Val(
             value=(
-                z3.StringVal(configured)
-                if configured is not None
+                value if value is not None
                 else ctx.opaque(_canon(node), z3.StringSort())
             ),
             is_null=z3.BoolVal(False),
         )
+    if (isinstance(node, FuncCall) and _computes_missing_ok(node)
+            and func_name_parts(node)[0] in auth_funcs | {"pg_catalog.current_setting"}
+            and "current_setting" in auth_funcs):
+        # `current_setting('app.t', <computed>)`: the setting as an auth
+        # leaf reads it, or NULL where missing_ok is (it is STRICT).
+        name = (_first_string_arg(node) or "").lower()
+        if ctx.session_mode:
+            return _Val(value=ctx.session_var(_canon(node), z3.StringSort()),
+                        is_null=ctx.opaque_null_flag(_canon(node)))
+        if ctx.anon_jwt and name in ("request.jwt.claim.role", "request.jwt.claims"):
+            # Set for the anon-key caller: its claim, or NULL where
+            # missing_ok is.
+            return _Val(value=(z3.StringVal("anon") if name == "request.jwt.claim.role"
+                               else ctx.opaque(_canon(node), z3.StringSort())),
+                        is_null=ctx.opaque_null_flag(_canon(node)))
+        if (not ctx.any_session and _reads_unset_guc_under_anon(node)
+                and name not in ctx.set_gucs):
+            # Unset under anon: NULL, or it raises (no rows).
+            return _Val(value=ctx.opaque(_canon(node), z3.StringSort()),
+                        is_null=z3.BoolVal(True))
     if _is_anon_null_leaf(node, auth_funcs):
         if ctx.session_mode:
             # `session_var` never returns None for a fresh StringSort key.
@@ -1572,7 +1903,7 @@ def _anon_3vl(
                         z3.BoolVal(False)
                         if _first_string_arg(node) is not None
                         # a computed name could be either: stay undecided
-                        else ctx.null_flag(_canon(node))
+                        else ctx.opaque_null_flag(_canon(node))
                     ),
                 )
         return _Val(
@@ -1582,7 +1913,7 @@ def _anon_3vl(
 
     # --- literals.
     if isinstance(node, A_Const):
-        v = _const_to_z3(node)
+        v = _const_to_z3(node, ctx)
         if v is None:
             return None  # literal NULL / unsupported
         # Bool literal at top level is a truth; the caller's _lift_to_tv
@@ -1594,7 +1925,7 @@ def _anon_3vl(
     # bool operand); a typed comparison context rebinds it via the 3VL
     # operand resolver. The free null-flag is a Kleene U candidate.
     if isinstance(node, ColumnRef):
-        key = _column_key(node)
+        key = _column_key(node, ctx)
         if not key:
             return None
         value = ctx.column(key, z3.BoolSort())
@@ -1604,10 +1935,16 @@ def _anon_3vl(
 
     # --- non-auth function call: opaque value + FREE null-flag (a
     # non-auth function is NOT known-NULL under anon). Sanity-translate
-    # args so an unparseable signature aborts.
+    # args so an unparseable signature aborts. A bare column argument is not
+    # bound: it has no sort here, and as a Bool it clashed with the same
+    # column compared elsewhere (`user_id = auth.uid() AND f(user_id)`).
     if isinstance(node, FuncCall):
         for arg in (node.args or ()):
-            if _anon_3vl(arg, ctx, auth_funcs, assertions) is None:
+            arg = _unwrap_scalar_sublink(arg)
+            if isinstance(arg, ColumnRef):
+                if not _column_key(arg, ctx):
+                    return None
+            elif _anon_3vl(arg, ctx, auth_funcs, assertions) is None:
                 return None
         key = _canon(node)
         # A never-NULL builtin current_setting (the one-arg form, or two-arg
@@ -1631,7 +1968,7 @@ def _anon_3vl(
                     value=ctx.session_var(key, z3.StringSort()),
                     is_null=z3.BoolVal(False),
                 )
-            if _reads_unset_guc_under_anon(node) and (
+            if not ctx.any_session and _reads_unset_guc_under_anon(node) and (
                 (_first_string_arg(node) or "").lower() not in ctx.set_gucs
             ):
                 # Anon: the GUC is unset, so this RAISES — the statement
@@ -1653,7 +1990,7 @@ def _anon_3vl(
             )
         return _Val(
             value=ctx.opaque(key, z3.StringSort()),
-            is_null=ctx.null_flag(key),
+            is_null=ctx.opaque_null_flag(key),
         )
 
     # --- boolean connectives (Kleene tables).
@@ -1662,6 +1999,23 @@ def _anon_3vl(
 
     # --- comparison / arithmetic.
     if isinstance(node, A_Expr):
+        if ctx.any_session and (
+            node.kind == A_Expr_Kind.AEXPR_NULLIF
+            or (node.kind == A_Expr_Kind.AEXPR_OP and _operator(node) in _JSON_OPS)
+        ):
+            # The diff path keeps a JSON field read (`auth.jwt() ->> 'org_id'`)
+            # or a NULLIF as an opaque value, as it does a function call: one
+            # free value and null-flag per distinct expression, shared by base
+            # and head, which can only leave an implication unproven.
+            for operand in (node.lexpr, node.rexpr):
+                operand = _unwrap_scalar_sublink(operand)
+                if isinstance(operand, ColumnRef):
+                    if not _column_key(operand, ctx):
+                        return None
+                elif _anon_3vl(operand, ctx, auth_funcs, assertions) is None:
+                    return None
+            key = _canon(node)
+            return _Val(value=ctx.opaque(key, z3.StringSort()), is_null=ctx.opaque_null_flag(key))
         if node.kind == A_Expr_Kind.AEXPR_OP:
             return _anon_binop(node, ctx, auth_funcs, assertions)
         if node.kind in (A_Expr_Kind.AEXPR_OP_ANY, A_Expr_Kind.AEXPR_IN):
@@ -1669,17 +2023,34 @@ def _anon_3vl(
             # `IN (...)` normalizes to this form — plus the hand-written
             # `IN (...)` list itself. Gated to `=` + literal elements.
             return _anon_any_array(node, ctx, auth_funcs, assertions)
+        if ctx.any_session and node.kind in (
+            A_Expr_Kind.AEXPR_BETWEEN, A_Expr_Kind.AEXPR_NOT_BETWEEN,
+        ):
+            return _anon_between(node, ctx, auth_funcs, assertions)
+        if ctx.any_session and node.kind in (
+            A_Expr_Kind.AEXPR_DISTINCT, A_Expr_Kind.AEXPR_NOT_DISTINCT,
+        ):
+            return _anon_distinct(node, ctx, auth_funcs, assertions)
         # IN / BETWEEN / ALL / others: soundness abort (SEC004 still guards
         # the literal IS NULL shape syntactically).
         return None
 
     # --- NULL tests. The arg is resolved as a SCALAR (_Val) so
     # `auth.uid() IS NULL`, `(... )::cast IS NULL`, etc. all work — this
-    # is the whole point vs the 2VL path (amendment #2: route through the
-    # scalar resolver, not the bool-_TV path). The result is a definite
+    # is the point (amendment #2: route through the scalar resolver, not
+    # the bool-_TV path). The result is a definite
     # truth (never U): IS NULL is exactly the null-flag.
     if isinstance(node, NullTest):
-        inner = _as_val(_anon_3vl(node.arg, ctx, auth_funcs, assertions))
+        if ctx.any_session and isinstance(node.arg, ColumnRef):
+            # Only the column's null-flag is tested: binding its value would
+            # give it a sort (Bool) that clashes with its comparisons.
+            key = _column_key(node.arg, ctx)
+            if not key:
+                return None
+            ctx.null_tested.add(key)
+            inner = _Val(value=z3.BoolVal(False), is_null=ctx.null_flag(key))
+        else:
+            inner = _as_val(_anon_3vl(node.arg, ctx, auth_funcs, assertions))
         if inner is None:
             return None
         if ctx.session_mode:
@@ -1701,43 +2072,37 @@ def _anon_3vl(
 
     # --- COALESCE: value is the first non-null arg; null iff all null.
     if isinstance(node, CoalesceExpr):
-        vals: list[Any] = []
-        for arg in (node.args or ()):
-            v = _as_val(_anon_3vl(arg, ctx, auth_funcs, assertions))
-            if v is None:
+        args = list(node.args or ())
+        # A bare column argument (`(SELECT x)` too) has no sort of its own:
+        # `_anon_coalesce` gives it its siblings'. With every argument a
+        # bare column there is none to give — modelled as Bools, three text
+        # columns could hold only two values — so such a COALESCE is an
+        # opaque value on every path, like CASE below, without binding those
+        # columns; the diff path also makes one it cannot model exactly for
+        # another reason opaque, shared by base and head.
+        all_bare = all(isinstance(_unwrap_scalar_sublink(a), ColumnRef) for a in args)
+        exact = None if all_bare else _anon_coalesce(node, ctx, auth_funcs, assertions)
+        if exact is None and (ctx.any_session or all_bare):
+            if any(not isinstance(_unwrap_scalar_sublink(a), ColumnRef)
+                   and _anon_3vl(a, ctx, auth_funcs, assertions) is None
+                   for a in args):
                 return None
-            vals.append(v)
-        if not vals:
-            return None
-        # Every COALESCE branch shares a common type in Postgres, so the
-        # translated branch values must share a Z3 sort. A mismatch here
-        # is an ENCODING ARTIFACT, not real SQL: a bare column argument
-        # reaches the COALESCE with no comparison-sort context, so it
-        # defaults to BoolSort (see the ColumnRef branch above), while a
-        # sibling numeric/text literal is Int/Real/String. The `z3.If`
-        # fold below SILENTLY COERCES such a Bool into {0,1} rather than
-        # raising, so the `except z3.Z3Exception` never catches it — and a
-        # numeric gate like `COALESCE(level, 0) < 3` would be mis-encoded
-        # as unconditionally TRUE, fabricating a catastrophic SEC038
-        # anonymous-read-leak verdict on a safe, auth-free predicate.
-        # Abstain on any cross-branch sort mismatch: soundness (no false
-        # positive) over coverage. (R18 #1)
-        if len({v.value.sort() for v in vals}) > 1:
-            return None
-        try:
-            value = vals[-1].value
-            for v in reversed(vals[:-1]):
-                value = z3.If(z3.Not(v.is_null), v.value, value)
-            is_null = vals[0].is_null
-            for v in vals[1:]:
-                is_null = z3.And(is_null, v.is_null)
-        except z3.Z3Exception:
-            return None  # sort mismatch across branches
-        return _Val(value=value, is_null=is_null)
+            key = _canon(node)
+            return _Val(value=ctx.opaque(key, z3.StringSort()), is_null=ctx.opaque_null_flag(key))
+        return exact
 
     # --- CASE: v1 soundness abort (no CASE corpus negative; Oracle §3.5).
+    # The diff path keeps it as an opaque value — one free value and
+    # null-flag per distinct CASE, shared by base and head, which can only
+    # leave an implication unproven.
     if isinstance(node, CaseExpr):
-        return None
+        if not ctx.any_session:
+            return None
+        for part in _case_parts(node):
+            if _anon_3vl(part, ctx, auth_funcs, assertions) is None:
+                return None
+        key = _canon(node)
+        return _Val(value=ctx.opaque(key, z3.StringSort()), is_null=ctx.opaque_null_flag(key))
 
     # --- TypeCast. Handle both a scalar (_Val) and a boolean (_TV) inner
     # (amendment #4: P4 `(... IS NULL)::bool` feeds a _TV inner). A cast
@@ -1809,6 +2174,158 @@ def _anon_boolexpr(
     return None
 
 
+def _anon_coalesce(
+    node: CoalesceExpr, ctx: _Context, auth_funcs: set[str], assertions: list[Any]
+) -> Any:
+    """COALESCE: value is the first non-null arg; null iff all null.
+
+    A bare column argument takes the sort its siblings share (Postgres
+    gives every argument one type), rather than the Bool a bare column
+    defaults to; with no sibling to give one, the caller keeps the COALESCE
+    opaque."""
+    args = list(node.args or ())
+    if sum(_floatish(a) or _casts_a_value(a) or any(isinstance(n, ColumnRef) for n in _ast_nodes(a))
+           for a in args) > 1:
+        # Two columns (or a column and a float): Postgres gives the
+        # COALESCE the type of either (a float column's), rounding the
+        # other, which the text does not show.
+        return None
+    if any(_rounds_its_kin(a, ctx) for a in args) or _blanks_its_kin(args, ctx):
+        # Postgres gives every argument the float type a cast gives one,
+        # rounding a column's value too (`COALESCE(id, 0::real)`).
+        return None
+    if not ctx.any_session and any(isinstance(n, ColumnRef) for a in args for n in _ast_nodes(a)) \
+            and not all(isinstance(_unwrap_scalar_sublink(a), ColumnRef)
+                        or isinstance(a, A_Const) for a in args):
+        # Beside a column only a bare literal takes the column's type: a
+        # typed arm (`'x'::text`, `(SELECT '')`, `auth.email()`, a cast)
+        # gives a citext or char(n) column its own, comparing it otherwise
+        # (the diff path reads it by the column's type, `_note_string_read`).
+        return None
+    if any(_literal_kind(a) == "bare" or ctx.any_session and _literal_kind(a) in _STRING_CASTS
+           for a in args) and not all(
+            _keeps_strings_text(a, ctx) for a in args):
+        # A bare string takes the type of the values beside it, so on a NULL
+        # row two literals meet in it (`COALESCE(price, '0') = '0.00'` is
+        # TRUE, numeric; `'A' = 'a'` citext; `COALESCE(length(s), '1') =
+        # '01'`, integer), which Z3 reads as text: only beside text columns
+        # and literals does it read exactly (the diff path keeps the rest
+        # opaque).
+        return None
+    # Its arguments take one type, a column's beside a literal.
+    with ctx.unifying(not all(_is_constant(a) for a in args)):
+        others = [_as_val(_anon_3vl(a, ctx, auth_funcs, assertions)) for a in args
+                  if not isinstance(_unwrap_scalar_sublink(a), ColumnRef)]
+    if not others or any(v is None for v in others):
+        return None
+    sorts = {v.value.sort() for v in others}
+    if len(sorts) != 1:
+        return None
+    sort = sorts.pop()
+    vals: list[Any] = []
+    rest = iter(others)
+    for arg in args:
+        column = _unwrap_scalar_sublink(arg)
+        if isinstance(column, ColumnRef):
+            key = _column_key(column, ctx)
+            var = ctx.column(key, sort) if key else None
+            if var is None:
+                return None
+            vals.append(_Val(value=var, is_null=ctx.null_flag(key)))
+        else:
+            vals.append(next(rest))
+    # Every COALESCE branch shares a common type in Postgres, so the
+    # translated branch values must share a Z3 sort. A mismatch here
+    # is an ENCODING ARTIFACT, not real SQL: a bare column argument
+    # reaches the COALESCE with no comparison-sort context, so it
+    # defaults to BoolSort (see the ColumnRef branch above), while a
+    # sibling numeric/text literal is Int/Real/String. The `z3.If`
+    # fold below SILENTLY COERCES such a Bool into {0,1} rather than
+    # raising, so the `except z3.Z3Exception` never catches it — and a
+    # numeric gate like `COALESCE(level, 0) < 3` would be mis-encoded
+    # as unconditionally TRUE, fabricating a catastrophic SEC038
+    # anonymous-read-leak verdict on a safe, auth-free predicate.
+    # Abstain on any cross-branch sort mismatch: soundness (no false
+    # positive) over coverage. (R18 #1)
+    if len({v.value.sort() for v in vals}) > 1:
+        return None
+    try:
+        value = vals[-1].value
+        for v in reversed(vals[:-1]):
+            value = z3.If(z3.Not(v.is_null), v.value, value)
+        is_null = vals[0].is_null
+        for v in vals[1:]:
+            is_null = z3.And(is_null, v.is_null)
+    except z3.Z3Exception:
+        return None  # sort mismatch across branches
+    return _Val(value=value, is_null=is_null)
+
+
+def _case_parts(node: CaseExpr) -> list[Any]:
+    """The sub-expressions of a CASE: its operand, each WHEN / THEN, ELSE."""
+    parts = [node.arg] if node.arg is not None else []
+    for when in node.args or ():
+        parts.extend((when.expr, when.result))
+    if node.defresult is not None:
+        parts.append(node.defresult)
+    return parts
+
+
+def _anon_between(
+    node: A_Expr, ctx: _Context, auth_funcs: set[str], assertions: list[Any]
+) -> Any:
+    """``x [NOT] BETWEEN lo AND hi`` as ``[NOT] (lo <= x AND x <= hi)`` —
+    the SQL definition, so its Kleene value is exactly that AND's.
+    ``BETWEEN SYMMETRIC`` is another kind and abstains."""
+    bounds = node.rexpr
+    if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+        return None
+    lo, hi = bounds
+    body = BoolExpr(boolop=BoolExprType.AND_EXPR, args=(
+        A_Expr(kind=A_Expr_Kind.AEXPR_OP, name=(String(sval="<="),),
+               lexpr=lo, rexpr=node.lexpr),
+        A_Expr(kind=A_Expr_Kind.AEXPR_OP, name=(String(sval="<="),),
+               lexpr=node.lexpr, rexpr=hi),
+    ))
+    if node.kind == A_Expr_Kind.AEXPR_NOT_BETWEEN:
+        body = BoolExpr(boolop=BoolExprType.NOT_EXPR, args=(body,))
+    return _anon_3vl(body, ctx, auth_funcs, assertions)
+
+
+def _anon_distinct(
+    node: A_Expr, ctx: _Context, auth_funcs: set[str], assertions: list[Any]
+) -> Any:
+    """``a IS [NOT] DISTINCT FROM b``: never NULL — two NULLs are not
+    distinct, a NULL and a value are, two values compare with ``<>``."""
+    left, right = _resolve_3vl_operands(
+        node.lexpr, node.rexpr, ctx, auth_funcs, assertions
+    )
+    if left is None or right is None or left.unset or right.unset:
+        return None
+    _note_string_read(ctx, node.lexpr, [node.rexpr])
+    if _unlike_sql("=", left.value, right.value, any_session=ctx.any_session) or _floats_meet(
+            node.lexpr, node.rexpr) or _columns_meet_through_arms(node.lexpr, node.rexpr):
+        return None
+    if ctx.any_session and _cast_value_meets_column(node.lexpr, node.rexpr):
+        # As in `_anon_binop`: the values' order is one of its own.
+        values_differ = _ordered_truth("<>", node.lexpr, node.rexpr, ctx, assertions)
+        differ = z3.If(z3.Or(left.is_null, right.is_null),
+                       left.is_null != right.is_null, values_differ)
+        if node.kind == A_Expr_Kind.AEXPR_NOT_DISTINCT:
+            differ = z3.Not(differ)
+        return _TV(is_true=differ, is_null=z3.BoolVal(False))
+    try:
+        differ = z3.Or(
+            left.is_null != right.is_null,
+            z3.And(z3.Not(left.is_null), z3.Not(right.is_null), left.value != right.value),
+        )
+    except (z3.Z3Exception, TypeError):
+        return None
+    if node.kind == A_Expr_Kind.AEXPR_NOT_DISTINCT:
+        differ = z3.Not(differ)
+    return _TV(is_true=differ, is_null=z3.BoolVal(False))
+
+
 def _kleene_or(acc: _TV, y: _TV) -> _TV:
     """Pairwise Kleene (SQL three-valued) OR of two truths.
 
@@ -1868,6 +2385,83 @@ def _anon_any_array(
         return None
     if not elements:
         return None
+    if ctx.any_session and node.kind != A_Expr_Kind.AEXPR_IN and (
+            _has_lossy_cast(node.lexpr) or any(
+                isinstance(e, A_Const) and isinstance(getattr(e, "val", None), String)
+                for e in elements)):
+        # In a diff, `x = ANY(ARRAY['US '])` is no `x = 'US '`: the bare
+        # literals make a `text[]`, so a `char(n)` or `citext` `x` (which the
+        # text may not show) compares as text there, and as itself here.
+        return None
+    # Postgres types an array's elements together, and an `IN` list's
+    # members that hold no column of its own query (two or more of them)
+    # with the left side; a member holding one it compares with the left
+    # side alone. In a sub-select (one with no FROM: a column is the outer
+    # query's) every member holds none.
+    together = elements if isinstance(arr, A_ArrayExpr) or ctx.subselect_depth else [
+        e for e in elements if not any(isinstance(n, ColumnRef) for n in _ast_nodes(e))]
+    if _literal_kind(node.lexpr) == "bare" and len(together) > 1 \
+            and any(_literal_kind(e) == "bare"
+                    or ctx.any_session and _literal_kind(e) in _STRING_CASTS
+                    for e in together) \
+            and not all(_keeps_strings_text(e, ctx) for e in together):
+        # `'1' IN (current_setting('x')::int, '01')`: the members take one
+        # type with the left side (int), so the two literals meet in it,
+        # which Z3 would read as text (as in `_anon_coalesce`).
+        return None
+    if ctx.any_session:
+        # Two or more values a list types together (with its left side) take
+        # a type Postgres picks from them by their order and kinds (the
+        # first typed one; a char(n) one makes the rest char), which the
+        # text does not show: in a diff such a list decides nothing, as on
+        # `main`, unless they are all columns of one known plain type.
+        # (An IN types together only two or more members holding no column
+        # of its own query; any other member it compares alone, as `=`.)
+        group = [node.lexpr, *elements] if node.kind != A_Expr_Kind.AEXPR_IN else (
+            [node.lexpr, *together] if len(together) > 1 else [])
+        group_values = [g for g in group if _literal_kind(g) is None]
+        types = {_plain_column_type(v, ctx) for v in group_values}
+        if len(group_values) > 1 and (None in types or len(types) > 1):
+            return None
+        # A typed literal takes part in that choice too (`(SELECT 'b')` is
+        # text, `'b'::varchar` varchar): an array's elements, or an IN's
+        # together-typed members beside an untyped left side, typed two ways
+        # (or one way unknown) decide nothing either.
+        typed = [e for e in (elements if node.kind != A_Expr_Kind.AEXPR_IN else (
+            together if len(together) > 1 and _literal_kind(node.lexpr) == "bare" else []))
+            if _literal_kind(e) not in ("bare", "other")]
+        typed_kinds = {_entry_type(e, ctx) for e in typed}
+        if len(typed) > 1 and (None in typed_kinds or len(typed_kinds) > 1):
+            return None
+    rounded = any(_rounds_its_kin(e, ctx) for e in elements) or (
+            node.kind == A_Expr_Kind.AEXPR_IN and _rounds_its_kin(node.lexpr, ctx)) or (
+            _blanks_its_kin([node.lexpr, *elements], ctx))
+    if (rounded and ctx.any_session) or (
+            # An array takes one type from its elements, a column's too
+            # (`ARRAY[a + 0, 1]` is a float8[] for a float `a`), rounding
+            # the left side; an `IN` list compares one with each.
+            isinstance(arr, A_ArrayExpr)
+            and any(isinstance(n, ColumnRef) for e in elements for n in _ast_nodes(e))):
+        # The list takes the float type a cast gives one element (or, for
+        # `IN`, its left side), rounding the others: `IN (16777217, 1::real)`
+        # is a `real[]`. Off the diff path each comparison is then a truth
+        # of its own (`_anon_binop`), as a float meeting a column is.
+        return None
+    # The list is read as a whole: its members take one common type, which
+    # a typed member may decide.
+    if node.kind == A_Expr_Kind.AEXPR_IN and len(together) > 1:
+        # The members typed together with the left side are one read; each
+        # member Postgres splits off (one holding a column of the IN's own
+        # query) is compared alone, as `=` would.
+        _note_string_read(ctx, node.lexpr, together, in_list=True)
+        for e in elements:
+            if not any(e is t for t in together):
+                _note_string_read(ctx, node.lexpr, [e])
+    elif node.kind == A_Expr_Kind.AEXPR_IN:
+        for e in elements:
+            _note_string_read(ctx, node.lexpr, [e])
+    else:
+        _note_string_read(ctx, node.lexpr, elements)
     acc: _TV | None = None
     for elem in elements:
         cmp_node = A_Expr(
@@ -1876,7 +2470,17 @@ def _anon_any_array(
             lexpr=node.lexpr,
             rexpr=elem,
         )
-        tv = _anon_binop(cmp_node, ctx, auth_funcs, assertions)
+        # An `IN` list takes one type with its left side, and an array
+        # one with a non-constant element.
+        with ctx.unifying(node.kind == A_Expr_Kind.AEXPR_IN or not all(
+                _is_constant(e) for e in elements)):
+            ctx.kin_rounded += rounded
+            ctx.list_members.add(id(cmp_node))  # noted with the list above
+            try:
+                tv = _anon_binop(cmp_node, ctx, auth_funcs, assertions)
+            finally:
+                ctx.kin_rounded -= rounded
+                ctx.list_members.discard(id(cmp_node))
         # `=` yields a _TV; anything else (None, or a _Val) → abstain whole.
         if not isinstance(tv, _TV):
             return None
@@ -1914,6 +2518,8 @@ def _anon_binop(
     )
     if left is None or right is None:
         return None
+    if comparison_fn is not None and id(node) not in ctx.list_members:
+        _note_string_read(ctx, node.lexpr, [node.rexpr])
 
     # Cross-tenant verifier: capture a `<column> = <session symbol>`
     # scoping equality (the tenant predicate `pgrls generate` emits) so the
@@ -1921,6 +2527,35 @@ def _anon_binop(
     # anon/diff path (session_mode False).
     if ctx.session_mode and op == "=":
         _record_tenant_pair(ctx, left, right)
+
+    cast_meets = ctx.any_session and _cast_value_meets_column(node.lexpr, node.rexpr)
+    unlike = _unlike_sql(op, left.value, right.value, any_session=ctx.any_session)
+    if comparison_fn is None and not ctx.any_session and not unlike and _floats_meet(
+            node.lexpr, node.rexpr):
+        # Off the diff path, float arithmetic (`score * (2)::double precision`)
+        # is a fresh value of its own, as other real arithmetic is below.
+        floats_meet = False
+    else:
+        floats_meet = _floats_meet(node.lexpr, node.rexpr) or (
+            comparison_fn is not None and (ctx.kin_rounded > 0 or _columns_meet_through_arms(
+                node.lexpr, node.rexpr)))
+    if unlike or floats_meet or cast_meets:
+        if comparison_fn is None or (ctx.any_session and (not cast_meets or ctx.unified)):
+            # In an `IN` list or array the value takes the list's type, not
+            # the column's: `x IN (v::int, 1)` rounds `v` to a `real` `x`'s
+            # float4, while `x = v::int` compares in float8.
+            return None
+        if left.unset or right.unset:
+            return _TV(is_true=z3.BoolVal(False), is_null=z3.BoolVal(True))
+        # Off the diff path, a fresh truth of its own: free where both
+        # operands are non-NULL, so a proof holds only if it holds for either
+        # outcome, and a leak resting on it has no witness row.
+        null = z3.Or(left.is_null, right.is_null)
+        if cast_meets:
+            truth = _ordered_truth(op, node.lexpr, node.rexpr, ctx, assertions)
+        else:
+            truth = ctx.opaque(f"comparison#{len(ctx._opaque_vars)}", z3.BoolSort())
+        return _TV(is_true=z3.And(z3.Not(null), truth), is_null=null)
 
     if comparison_fn is not None:
         if left.unset or right.unset:
@@ -1947,6 +2582,30 @@ def _anon_binop(
             is_null=z3.Or(left.is_null, right.is_null),
         )
 
+    if arithmetic_fn is not None and (left.unset or right.unset):
+        # An unset GUC raises before its NULL could reach an `IS NULL` or a
+        # COALESCE, which read only the null-flag: no reading of the result
+        # (a value, or one marked unset) is right for both, so abstain.
+        return None
+    sorts = {left.value.sort(), right.value.sort()}
+    if arithmetic_fn is not None and (sorts != {z3.IntSort()} or op in ("/", "%") or _floats_meet(
+            node.lexpr, node.rexpr)):
+        # Off the diff path too, a result Z3 does not compute as Postgres
+        # does — on reals (no NaN / ±Infinity, no rounding), `/` and `%`
+        # (Postgres truncates) — is a fresh value of its own each time (not
+        # keyed by its rendering, which recursed a second time down a deep
+        # chain; a fresh value only frees it further). Arithmetic on
+        # anything else — text standing for a timestamp or an interval,
+        # whose order is not text's — abstains, as the diff path did above.
+        if not sorts <= {z3.IntSort(), z3.RealSort()}:
+            return None
+        floaty = z3.RealSort() in sorts or _floats_meet(node.lexpr, node.rexpr)
+        sort = z3.RealSort() if floaty else z3.IntSort()
+        return _Val(
+            value=ctx.opaque(f"arithmetic#{len(ctx._opaque_vars)}", sort),
+            is_null=z3.Or(left.is_null, right.is_null),
+        )
+
     if arithmetic_fn is not None:
         try:
             value = arithmetic_fn(left.value, right.value)
@@ -1961,6 +2620,49 @@ def _anon_binop(
     return None  # unreachable (guarded above) — satisfies the type checker
 
 
+def _unlike_sql(op: str, left: Any, right: Any, *, any_session: bool) -> bool:
+    """Whether Z3's reading of `left op right` would differ from Postgres's,
+    so the comparison must not be translated (on the diff path it abstains;
+    off it, it is a truth of its own, see `_anon_binop`).
+
+    On every path:
+
+    * a Bool against a non-Bool — an encoding artifact (a bare column
+      defaults to Bool) that Z3 coerces to 0 / 1 rather than rejects — and
+      text against a number (an opaque value against a literal), which Z3
+      cannot compare at all;
+    * ``<`` / ``>`` / ``<=`` / ``>=`` on text — Postgres orders it by
+      collation, Z3 by code point (``'B' < 'b'`` is FALSE under en_US), and
+      an equality elsewhere can pin either side to a literal.
+
+    On the diff path (`any_session`), where both predicates' readings must be
+    exact for an equivalence or an implication to hold, also (off it,
+    arithmetic on numbers is a value of its own instead and on text still
+    abstains, see `_anon_binop`):
+
+    * arithmetic on anything but integers — Z3's ``+`` on two strings
+      concatenates, and its reals have no NaN / ±Infinity and never round;
+    * ``/`` and ``%`` — Postgres truncates an integer quotient toward zero
+      (``-1 % 2`` is -1, Z3's is 1)."""
+    sorts = (left.sort(), right.sort())
+    if (sorts[0] == z3.BoolSort()) != (sorts[1] == z3.BoolSort()):
+        return True
+    if sorts[0] != sorts[1] and not set(sorts) <= {z3.IntSort(), z3.RealSort()}:
+        return True
+    if op in ("<", ">", "<=", ">=") and z3.StringSort() in sorts:
+        return True
+    if not any_session:
+        return False
+    if op in _ARITHMETIC_OPS:
+        # Only integers: Z3's reals have no NaN or ±Infinity, which a
+        # `numeric` / `float8` value can be (`n * 0.0 = 0.0` is not TRUE
+        # for NaN), and they never round as `float8` does.
+        if not all(s == z3.IntSort() for s in sorts):
+            return True
+        return op in ("/", "%")
+    return False
+
+
 def _resolve_3vl_operands(
     lexpr: Any,
     rexpr: Any,
@@ -1970,20 +2672,23 @@ def _resolve_3vl_operands(
 ) -> tuple[Any, Any]:
     """Translate both comparison operands to ``_Val`` pairs.
 
-    Distinct from ``_resolve_binop_operands`` (the 2VL path) — that one
-    returns bare Z3 exprs, not ``_Val`` null-pairs. When one side is a
+    When one side is a
     bare ColumnRef and the other resolves to a concrete-sorted ``_Val``,
     the column is bound to that sort (its null-flag is a free Kleene U
-    candidate). ``col OP col`` binds both as String (mirroring the 2VL
-    default). Any None → ``(None, None)``.
+    candidate). ``col OP col`` binds both as String (no other side gives
+    them a type). Any None → ``(None, None)``.
     """
-    lexpr = _unwrap_scalar_sublink(lexpr)
-    rexpr = _unwrap_scalar_sublink(rexpr)
+    # A bare column is found through a sub-select; anything else is
+    # translated as written, so `_anon_3vl` sees the sub-select.
+    if isinstance(_unwrap_scalar_sublink(lexpr), ColumnRef):
+        lexpr = _unwrap_scalar_sublink(lexpr)
+    if isinstance(_unwrap_scalar_sublink(rexpr), ColumnRef):
+        rexpr = _unwrap_scalar_sublink(rexpr)
     l_is_col = isinstance(lexpr, ColumnRef)
     r_is_col = isinstance(rexpr, ColumnRef)
 
     def col_val(col: ColumnRef, sort: Any) -> Any:
-        key = _column_key(col)
+        key = _column_key(col, ctx)
         if not key:
             return None
         var = ctx.column(key, sort)
@@ -2036,10 +2741,12 @@ def _fold_literal_cast(value: Any, target_sort: Any, type_name: str | None) -> A
 
     Only folds a String constant the encoder already knows exactly — a
     captured GUC value or a policy literal — and only when Postgres would
-    accept it: in range for the integer type, and finite for a float
-    (`'Infinity'` and `'NaN'` are valid PG values that `z3.RealVal` cannot
-    parse, and the resulting `Z3Exception` crashed the whole command).
-    Anything else returns None and stays opaque: declining to decide is the
+    accept it and read it alike whatever it is compared with: in range for
+    the integer type, and for a real one that `_exact_real` reads (not
+    `'NaN'` / `'Infinity'`, which Z3 reals do not have). The caller folds
+    only for a cast that keeps the value (`_exact_cast`, and off the diff
+    path an integer one). Anything else
+    returns None and stays opaque: declining to decide is the
     safe direction, and modelling the raise as "isolated" is not this
     function's job.
     """
@@ -2048,13 +2755,14 @@ def _fold_literal_cast(value: Any, target_sort: Any, type_name: str | None) -> A
     text = value.as_string()
     try:
         if target_sort == z3.IntSort():
+            if not re.fullmatch(r"\s*[+-]?\d+\s*", text, re.ASCII):
+                return None  # Postgres reads no other digits (`'١٢'`)
             number = int(text)
             low, high = _INT_RANGES.get(type_name or "", _INT_RANGES["int8"])
             return z3.IntVal(number) if low <= number <= high else None
         if target_sort == z3.RealSort():
-            real = float(text)
-            return z3.RealVal(real) if math.isfinite(real) else None
-    except (ValueError, OverflowError, z3.Z3Exception):
+            return _exact_real(text)
+    except (ValueError, OverflowError, ZeroDivisionError, z3.Z3Exception):
         return None
     if target_sort == z3.BoolSort():
         low_text = text.strip().lower()
@@ -2063,6 +2771,11 @@ def _fold_literal_cast(value: Any, target_sort: Any, type_name: str | None) -> A
         if low_text in _PG_FALSE:
             return z3.BoolVal(False)
     return None
+
+
+def _in_int_range(number: int, typename: Any) -> bool:
+    low, high = _INT_RANGES.get(_typename_last_segment(typename) or "", _INT_RANGES["int8"])
+    return low <= number <= high
 
 
 def _anon_typecast(
@@ -2075,9 +2788,12 @@ def _anon_typecast(
     Bool-sorted scalar whose value carries its truth and whose null-flag
     carries through — there is no separate ``_TV`` branch here. A cast of
     NULL is NULL, so the inner ``is_null`` always propagates. When the
-    target sort matches the inner value's sort the cast is a no-op;
-    otherwise the value is opaque under the target sort (an unknown
-    target keeps a String opaque) but the null-flag is preserved.
+    target sort matches the inner value's sort the cast is a no-op only
+    for a cast that keeps the value (`_exact_cast`; off the diff path also
+    a `uuid` or non-`oid` integer cast) — and on the diff path only of a
+    value that keeps its type (`_keeps_its_type`); otherwise the value is
+    opaque under the target sort (an unknown target keeps a String opaque)
+    but the null-flag is preserved.
 
     One exception under the cross-tenant verifier (``session_mode``): a
     sort-changing cast of the session identity stays a free, NON-NULL
@@ -2095,10 +2811,65 @@ def _anon_typecast(
     if inner is None:
         return None
     target_sort = _typename_segments_to_sort(node.typeName)
+    if (ctx.integers and target_sort == z3.RealSort() and _exact_cast(node.typeName)
+            and z3.is_int_value(inner.value)):
+        return inner  # the integer pass: `5::numeric` is 5
+    if (target_sort == z3.IntSort() and not ctx.integers and _exact_cast(node.typeName)
+            and z3.is_rational_value(inner.value) and inner.value.denominator_as_long() == 1
+            and _in_int_range(inner.value.numerator_as_long(), node.typeName)):
+        return inner  # `5::int` is 5 (not `(-256)::oid`, which wraps)
+    if (target_sort == z3.IntSort() and not ctx.integers
+            and _is_real_column_term(ctx, inner.value)):
+        # Over the reals (see `_const_to_z3`) an integer cast of a column
+        # that may be a `numeric` rounds it: an integer of its own.
+        return _Val(
+            value=ctx.opaque(_canon(node), target_sort),
+            is_null=inner.is_null,
+            unset=inner.unset,
+        )
+    lossy = target_sort is not None and not _exact_cast(node.typeName)
+    if lossy and not ctx.any_session:
+        # Off the diff path a `uuid` cast (the session identity's) and an
+        # integer one (which raises rather than changes) keep the value as
+        # before; `oid` wraps a negative integer. (A `uuid` cast does fold
+        # case and braces, which the text model does not — the documented
+        # uuid limit.)
+        lossy = not (
+            _bare_type(node.typeName, "uuid")
+            or (target_sort == z3.IntSort()
+                and _typename_last_segment(node.typeName) != "oid")
+            # `'demo'::bpchar`, as `pg_get_expr` writes a `char(n)` literal,
+            # is 'demo' (a trailing space is the documented char(n) limit).
+            or (_bare_type(node.typeName, "bpchar") and isinstance(node.arg, A_Const)
+                and isinstance(getattr(node.arg, "val", None), String)
+                and not node.arg.val.sval.endswith(" "))
+        )
+    if lossy:
+        # A cast that may change the value (`varchar(3)`, `float4`, `oid`,
+        # `numeric(3,1)`, `citext`) is a value of its own.
+        return _Val(
+            value=ctx.opaque(_canon(node), target_sort),
+            is_null=inner.is_null,
+            unset=inner.unset,
+        )
     if target_sort is None:
         # Unknown target type — opaque value, keep the inner null-flag.
         return _Val(
             value=ctx.opaque(_canon(node), z3.StringSort()),
+            is_null=inner.is_null,
+            unset=inner.unset,
+        )
+    if not _keeps_its_type(node.arg) and (ctx.any_session or _takes_a_column_type(node.arg)):
+        # A cast of a value whose Postgres type pgrls does not know — a
+        # function's result, a lossy or unknown cast — may change it even to
+        # a type of the same sort (`s::float8::numeric`, `abs(n)::text`).
+        # Off the diff path a function's result keeps its reading (the
+        # session identity's `current_setting(…)::bigint`), but a COALESCE
+        # or CASE does not: it takes a column's type (`COALESCE(score,
+        # 0)::numeric` rounds a float8 `score`; `::text` makes a citext one
+        # case-sensitive).
+        return _Val(
+            value=ctx.opaque(_canon(node), target_sort),
             is_null=inner.is_null,
             unset=inner.unset,
         )
@@ -2119,9 +2890,14 @@ def _anon_typecast(
             value=ctx.session_var(_canon(node), target_sort),
             is_null=inner.is_null,
         )
-    folded = _fold_literal_cast(
+    # On the diff path only to an integer or a boolean: a real fold is
+    # what a captured GUC value needs, and only the provers capture one.
+    folded = None if ctx.any_session and target_sort == z3.RealSort() else _fold_literal_cast(
         inner.value, target_sort, _typename_last_segment(node.typeName)
     )
+    if folded is not None and z3.is_int_value(folded):
+        # `'…'::int8` is an integer literal too (see `_integer`).
+        folded = _integer(folded.as_long(), ctx)
     if folded is not None:
         # A captured GUC value cast to the column's type is exactly that
         # constant — `col = current_setting('app.n')::int` with `app.n` set to
@@ -2136,6 +2912,8 @@ def _anon_typecast(
     )
 
 
+@_abstains_when_too_deep(None)
+@_bare_columns("using_node")
 def anon_read_counterexample(
     using_node: Any, auth_functions: set[str] | None = None
 ) -> dict[str, object] | None:
@@ -2219,7 +2997,7 @@ def _anon_witness_is_sufficient(
     every row and no column characterizes it. Pin the row and check
     ``(assertions) ∧ (pins) ∧ ¬is_true`` UNSAT: only then does every row
     matching ``row`` lie inside the anon-visible set, so it is an honest,
-    self-sufficient counterexample. Mirrors ``_row_is_sufficient_witness``.
+    self-sufficient counterexample. Mirrors ``_diff_witness_is_sufficient``.
 
     Each pin fixes the column's VALUE **and** its 3VL null-flag: a real row
     holding ``tenant = 'shared'`` has a non-null ``tenant``, by construction.
@@ -2240,7 +3018,7 @@ def _anon_witness_is_sufficient(
         var = ctx.column(key, _py_value_sort(val))
         if var is None:  # pragma: no cover - _py_value_sort inverts the bound sort
             return False
-        pins.append(var == val)
+        pins.append(var == _z3_value(val))
         pins.append(z3.Not(ctx.null_flag(key)))
     solver = z3.Solver()
     solver.set("timeout", 1000)
@@ -2251,6 +3029,7 @@ def _anon_witness_is_sufficient(
     return bool(solver.check() == z3.unsat)
 
 
+@_abstains_when_too_deep(("unverified", None))
 def prove_anon_isolation(
     using_node: Any,
     auth_functions: set[str] | None = None,
@@ -2326,6 +3105,7 @@ def prove_anon_isolation(
     return ("isolated", None)
 
 
+@_abstains_when_too_deep(False)
 def anon_leak_is_total(
     using_node: Any,
     auth_functions: set[str] | None = None,
@@ -2372,7 +3152,35 @@ def _prove_anon_session(
 ) -> tuple[str, dict[str, object] | None]:
     """`prove_anon_isolation` for ONE session model (see `_Context.anon_jwt`)
     in ONE inherited-GUC state (see `_Context.set_gucs`)."""
+    return _integers_agree(lambda integers: _prove_anon_session_once(
+        using_node, auth, anon_jwt=anon_jwt, set_gucs=set_gucs, integers=integers))
+
+
+def _integers_agree(prove: Callable[[bool], tuple[str, Any]]) -> tuple[str, Any]:
+    """`prove` over the reals (see `_const_to_z3`), whose `isolated` holds
+    for an integer column too; a leak stands only if an integer row leaks
+    as well (else it may hold only where a column is not an integer one),
+    and its witness is that row (also where the reals decide nothing)."""
+    verdict = prove(False)
+    if verdict[0] not in ("leak", "unverified"):
+        return verdict
+    # A leak the reals cannot decide (an integer a float4 rounds) is one if
+    # an integer row leaks.
+    again = prove(True)
+    return again if again[0] == "leak" else ("unverified", None)
+
+
+@_bare_columns("using_node")
+def _prove_anon_session_once(
+    using_node: Any,
+    auth: set[str],
+    *,
+    anon_jwt: bool,
+    set_gucs: Mapping[str, str | None] | None,
+    integers: bool,
+) -> tuple[str, dict[str, object] | None]:
     ctx = _Context()
+    ctx.integers = integers
     ctx.anon_jwt = anon_jwt
     ctx.set_gucs = dict(set_gucs or {})
     assertions: list[Any] = []
@@ -2562,7 +3370,7 @@ def _cross_tenant_witness_sufficient(
         var = ctx.column(key, _py_value_sort(val))
         if var is None:  # pragma: no cover - _py_value_sort inverts the bound sort
             return False
-        pins.append(var == val)
+        pins.append(var == _z3_value(val))
         pins.append(z3.Not(ctx.null_flag(key)))
     solver = z3.Solver()
     solver.set("timeout", 1000)
@@ -2632,11 +3440,26 @@ def _cross_tenant_witness(
     return witness
 
 
+@_abstains_when_too_deep(("unverified", None))
 def prove_cross_tenant_isolation(
     using_node: Any,
     auth_functions: set[str] | None = None,
     *,
     identity_columns: frozenset[str] | None = None,
+) -> tuple[str, dict[str, object] | None]:
+    """See `_prove_cross_tenant_once`; over the reals, refined by the
+    integers (see `_integers_agree`)."""
+    return _integers_agree(lambda integers: _prove_cross_tenant_once(
+        using_node, auth_functions, identity_columns=identity_columns, integers=integers))
+
+
+@_bare_columns("using_node")
+def _prove_cross_tenant_once(
+    using_node: Any,
+    auth_functions: set[str] | None = None,
+    *,
+    identity_columns: frozenset[str] | None = None,
+    integers: bool = False,
 ) -> tuple[str, dict[str, object] | None]:
     """Prove whether one tenant's session can read another tenant's row.
 
@@ -2698,6 +3521,7 @@ def prove_cross_tenant_isolation(
         else set(_DEFAULT_AUTH_FUNCTIONS)
     )
     ctx = _Context()
+    ctx.integers = integers
     ctx.session_mode = True
     assertions: list[Any] = []
     tv = _lift_to_tv(_anon_3vl(using_node, ctx, auth, assertions), assertions)
@@ -2757,6 +3581,8 @@ def prove_cross_tenant_isolation(
     return ("leak", witness)
 
 
+@_abstains_when_too_deep(None)
+@_bare_columns("using_node")
 def cross_tenant_session_identity(
     using_node: Any, auth_functions: set[str] | None = None
 ) -> tuple[str, str] | None:
@@ -2786,11 +3612,16 @@ def cross_tenant_session_identity(
         if auth_functions is not None
         else set(_DEFAULT_AUTH_FUNCTIONS)
     )
-    ctx = _Context()
-    ctx.session_mode = True
-    assertions: list[Any] = []
-    tv = _lift_to_tv(_anon_3vl(using_node, ctx, auth, assertions), assertions)
-    if tv is None:
+    for integers in (False, True):
+        # A leak may come from the integer pass alone (`_integers_agree`).
+        ctx = _Context()
+        ctx.session_mode = True
+        ctx.integers = integers
+        assertions: list[Any] = []
+        tv = _lift_to_tv(_anon_3vl(using_node, ctx, auth, assertions), assertions)
+        if tv is not None:
+            break
+    else:
         return None
     pairs = _distinct_tenant_pairs(ctx.tenant_pairs)
     if len(pairs) != 1:

@@ -532,6 +532,14 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             _apply_rename(stmt, tables, default_schema, index)
         # Every other statement shape is skipped tolerantly.
 
+    # The diff reads a string compared with a column by the column's type
+    # (`text` and `citext` read `'a'::text` otherwise). SQL alone cannot say
+    # what type a column ends up with — code it runs (a function, a trigger,
+    # an extension's), a search_path it changes, may change one out of
+    # sight — so the diff trusts none of an offline snapshot's (the declared
+    # type stays, for `generate` and `diff --apply`).
+    for builder in tables.values():
+        builder.columns = [replace(c, type_known=False) for c in builder.columns]
     return Schema(tables=tuple(b.build() for b in tables.values()))
 
 

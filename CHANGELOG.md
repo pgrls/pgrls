@@ -93,6 +93,208 @@ breaking changes — they will be called out in this file.
     does not follow `ALTER TABLE … INHERIT`.
 
 ### Fixed
+- **`pgrls diff` / `pgrls pr` compare predicates under SQL's three-valued
+  logic.** The Z3 comparison treated every column as non-NULL, so it called
+  predicates equivalent that differ on a row holding a NULL: `a = 1 OR
+  a <> 1` → `true`, or `(c OR false) = (d OR c)` → `c OR false = d OR c`,
+  newly admits such rows but was reported as no change. A predicate now
+  admits a row only when it is exactly TRUE — NULL hides a row as FALSE
+  does — so these are `DANGEROUS` loosenings, and the leaking row can name a
+  NULL column (`{a=NULL}`). The same model ties an `IS NULL` test to its
+  column, so `(col IS NOT NULL AND col = 5) OR b = 1` → `col = 5 OR b = 1`
+  is no longer flagged as a loosening, and it also decides `IS [NOT]
+  DISTINCT FROM`. Where Z3 and Postgres disagree — `/` and `%` (Postgres
+  truncates), arithmetic on anything but integers (Z3's reals have no NaN
+  and never round), ordering on text (Postgres uses the collation) — the
+  diff now abstains instead of deciding wrongly, and a cast that may change
+  the value (`varchar(3)`, `float4`, `numeric(4,1)`, `oid`, or any cast of a
+  function's result) is a value of its own. A number is read as a real,
+  since the column it is compared with may be a `numeric` or a `float8`
+  (the text of an offline snapshot or a migration has no casts to say so):
+  `score >= 1` → `score > 0` was no change on a `numeric` column (0.5), and
+  is a loosening only if it is one on the integers too, so such a change
+  needs review; a decimal is read only when a `float4` holds it exactly
+  (`0.5`, not `0.1`: a `numeric`, a `float8` and, in an `IN` list, a
+  `float4` column read it differently), an integer exactly up to 2^53 (an
+  `int8` compared with a `float8` is rounded past it; through a float,
+  `c = 9007199254740992` and `c = 9007199254740993` were one value) and,
+  among values Postgres gives one type (an `IN` list, a `COALESCE`, an array
+  with a column in it), up to 2^24 (a string cast to an integer type,
+  `'…'::int8`, likewise), and a literal past the double range (`1e400`) no
+  longer crashes. A leaking row is an integer one, re-checked with every
+  numeric column an integer, so it leaks for an integer or `numeric` column
+  (a `float4` holds no integer past 2^24); an integer cast that wraps
+  (`(-256)::oid`) or raises is no constant, and a literal cast to `float4`
+  (`1::real`) gives its neighbours that type. Where the reals decide nothing
+  (an integer a `float4` may round, arithmetic) a loosening or a leak on the
+  integers still stands; an equivalence there needs review (`col + 1 > 0` →
+  `col > -1`). A `COALESCE`, `IN` list or array with a float cast in it
+  (`COALESCE(id, 0::real)`, `IN (16777217, 1::real)`, or one in a sub-select
+  or float arithmetic), which Postgres gives that float type, rounding its
+  column and its integers too, decides nothing, and so does a `COALESCE` of
+  two columns (one may be a float column, whose type the other then
+  takes), an array with a column in it, and a comparison of a column with
+  a float (`a = 1::float8` or `a = pi()` reads a `numeric` `a` through a
+  double): off the diff path that comparison is a truth of its own, and so
+  is each comparison in such a list (a leak resting on one is LEAK with no
+  row, which may be a false alarm), float arithmetic a value of its own,
+  and only a number cast rounds its kin there (a `uuid`, enum or `date`
+  literal in a list or `COALESCE`, which `pg_get_expr` writes with a cast,
+  keeps the verdict, as on `main`, and a `char(n)` one, `'demo'::bpchar`,
+  its leaking row; a cast of a `COALESCE` / `CASE` / `NULLIF` or of a
+  value-changing cast, which may take a column's type, is a value of its
+  own — `COALESCE(score, 0)::numeric` rounds a float8 `score`, `::text`
+  makes a citext one case-sensitive; a `COALESCE` of a column with any arm
+  but a bare literal or column (a cast, a sub-select, a function's result)
+  decides nothing, nor does a comparison of two values holding columns
+  where one meets the other through a `COALESCE` / `CASE` (a numeric and a
+  float8 column compare through a double), and one of a column with a bare
+  string literal reads exactly only for a `text` / `varchar` column the
+  diff knows the type of — on a NULL row two literals meet in the
+  column's type, so `COALESCE(price, '0') = '0.00'` holds for a numeric
+  `price`, `COALESCE(e, 'A') = 'a'` for a citext `e` and
+  `COALESCE(length(s), '1') = '01'` for any `s`, so beside anything but
+  literals and such columns the diff keeps the COALESCE an opaque value, as
+  on `main` (and a JSON field read, `(auth.jwt() ->> 'org_id')::uuid`, or a
+  `NULLIF`, which the 3VL encoder had left needing review); so does a bare string meeting another in an `IN` list or
+  `ARRAY` a member types, `'1' IN (current_setting('x')::int, '01')`, which
+  the offline anon prover had proven isolated (an `IN` member holding a
+  column of its own query is compared alone, as Postgres does, so `'admin'
+  IN (role, 'owner')` still reads exactly; in a sub-select, where the column
+  is the outer query's, it is typed with the others)), or a cast to a text type that changes a value
+  (`bpchar`, `"char"`, `name`) beside a bare string literal, which then
+  compares as that type (`x = ANY(ARRAY['a'::bpchar, 'b '])` holds for
+  `x = 'b'`; `main` proved such a predicate isolated). In a
+  diff, an expression holding a column (`amount`, `COALESCE(amount, 0)`)
+  compared with a value cast to a number type that is not a literal
+  (`current_setting('app.v')::numeric`) is read as an order of its own
+  over the two (exactly one of `<`, `=`, `>`), the same one wherever the
+  same two are compared, either way round: Postgres reads the value through
+  the column's type, a float's too, which an offline snapshot's text does
+  not show. So a clause both sides share still cancels
+  (`tenant_id = current_setting(…)::bigint AND level < 3` → `… < 4` is
+  DANGEROUS) and `=` → `>=` is a loosening, while wrapping
+  `current_setting(…)::bigint` in a sub-select needs review, as on `main`.
+  So does `x = ANY(ARRAY['US '])` with a bare string literal (or a cast
+  that may change `x`): the literals make a `text[]`, so a `char(n)` or
+  `citext` `x` compares as text there and as itself in `x = 'US '`. A
+  string compared with a value is read by the value's type, which the
+  diff now takes from the snapshots for a column and from the cast for a
+  cast (`email::citext`): a `text` or `varchar` one (or a number, `uuid`,
+  a time) reads `'A'`, `'A'::text`, `(SELECT 'A')`, `COALESCE('A', '')`
+  and a list alike; any other (`citext`, `char(n)`, a user type) compares a
+  typed string (a cast, a sub-select, a list's common type), another column
+  or a function's result (in a `COALESCE` arm beside it too:
+  `COALESCE(email, auth.email())` is text) otherwise than a bare literal, so such a
+  comparison of it decides nothing — a literal cast to its own type
+  (`role = 'admin'::app_role`, as `pg_get_expr` writes an enum literal)
+  reads as a bare one (`main` read `col = 'a'::text` and `col = 'a'` as no
+  change). Only `pg_catalog.text` is text (`app.text` may be a domain). A
+  value whose type the text does not show (a function's result, a
+  sub-select) decides nothing when it is read two ways, one in a `COALESCE`
+  or `CASE` arm (which takes the arms' common type) never matching a direct
+  read of it. The diff takes these types from live snapshots only: SQL alone cannot
+  say what type a column ends up with (a function, trigger, event trigger,
+  extension or `dblink` it runs, or a search_path it sets, may change one
+  out of sight), so an offline snapshot (`--sql-file` / `--migrations`)
+  keeps each declared type for `generate` and `diff --apply`, marked
+  `"type_known": false` (one an earlier version wrote, with no such key,
+  is read the same way by its `"source": "sql"` marker), and the diff reads
+  such a column like one of a snapshot with no types (one way only); where
+  the other side is a live snapshot that knows it, by that side's type
+  (under `diff --apply` the head is read back from a base restored from
+  the untrusted types, so it trusts none either). An
+  `IN` list with two or more typed members that hold no column (`code IN
+  ('a '::text, 'b'::text)`) is a read of its own: Postgres types the column
+  with them, so a `char(n)` one compares as char there, as text in `code =
+  'a '::text` (in a sub-select every member is, its columns being the outer
+  query's; a COALESCE of the column reads so too). A list that types two
+  or more values together (columns, functions; the left side and an `IN`'s
+  members holding no column of its own query, or an array's elements)
+  decides nothing in a diff, as on `main`, unless they are all columns of
+  one known plain type: Postgres picks the type they meet in from their
+  order and kinds (`code IN (alt, alt)` reads `alt` as a char(n) `code`);
+  so does one whose entries are typed two ways, typed literals counted
+  (`(SELECT 'b')` is text, `'b'::varchar` varchar). A column of no
+  known type beside a literal cast to a string type (`COALESCE(code, 'a
+  '::text) = 'a'`) decides nothing either: a `char(n)` one makes the two
+  literals compare as `char`. A column
+  one snapshot has and the other lacks has no one type either. A column's
+  collation is not in the snapshots: a nondeterministic one (`text COLLATE
+  ci`) compares strings otherwise, which the diff does not see, as on
+  `main`. Without column types (a snapshot from before they were captured)
+  a column read two ways decides nothing.
+  In an `IN` list or array such a comparison decides nothing: the value
+  takes the list's type there (`x IN (v::int, 1)` rounds `v` to a `real`
+  `x`'s float4; `x = v::int` compares in float8).
+- **`pgrls verify`, `matrix --prove` and SEC038 no longer take Z3's reading
+  where it differs from Postgres's.** A comparison Z3 would read otherwise —
+  a Bool against a number (Z3 coerced it to 0 / 1), an ordering on text
+  (Postgres orders by collation) — is a truth of its own; a cast that may
+  change the value (`::float4`, `::numeric(3,1)`, `::varchar(3)`,
+  `::citext`) is a value of its own (a bare `uuid` cast, and an integer cast
+  other than `oid`, still keep it), and so are arithmetic on reals, `/` and
+  `%`, and a `COALESCE` of nothing but bare columns (modelled exactly, they
+  defaulted to Bools, so three text columns could hold only two values);
+  beside another argument a bare column takes its type (`coalesce(is_public,
+  false)` stays exact), and `(SELECT (SELECT x))` is a bare column too
+  (used directly as a condition, `AND coalesce(b, c)`, such a COALESCE
+  abstains). A scalar sub-select is no longer read as just its target when
+  it can be NULL otherwise: one with `LIMIT` / `OFFSET` (`(SELECT a LIMIT
+  0) IS NULL AND a IS NOT NULL` was a false PROVEN), `ORDER BY` or a
+  `WINDOW` is not unwrapped, and one whose target calls anything but an
+  auth function or `current_setting` (any other call may be set-returning,
+  and yield no row) may also be NULL, so `(SELECT srf() IS NULL)` is not
+  taken to be TRUE or FALSE; wrapping `auth.uid()` in a sub-select, as
+  PERF001's fix does, stays no change. A predicate nested past the stack is
+  unverified, or needs review in a diff (no change when it did not change),
+  not a crash. A `current_setting` whose name or `missing_ok` is read from a
+  column (or is NULL) is no longer taken to be never NULL, or the session's
+  identity (one joined from literals, `'app.' || 'tenant'`, still is): it is
+  NULL where the argument is, so `… OR current_setting(cfg)
+  IS NULL` and `tenant_id = current_setting('app.t', flag) OR …` were PROVEN
+  (on `main` too) and, in a diff, no change; a literal name with a computed
+  `missing_ok` reads the setting or NULL, and the anon-key caller's JWT
+  claims are read as set, by a name in any case. A column written both bare
+  and qualified (`a` and `t.a`, as `pg_get_expr` renders a sub-select) is
+  one column, not two and a leaking row that cannot exist, and a helper's
+  column argument (`(SELECT private.tier(user_id))` beside `user_id =
+  auth.uid()`) no longer clashes with the column's comparison. Two calls of
+  a built-in VOLATILE
+  function (`random()`, `clock_timestamp()`, `gen_random_uuid()`,
+  `array_shuffle()`, …) are two
+  values; a user function is taken to return one value wherever the same
+  call appears, as a STABLE or IMMUTABLE one does, so a VOLATILE one (which
+  PERF002 flags) can hide a loosening in a diff.
+  Beside such a
+  value or truth, a proof whose other conjunct isolates
+  still holds (`tenant_id = auth.uid() AND status < 'm'`), and one that
+  rested on Z3's reading is no longer made:
+  `tenant_id = auth.uid() OR (s < 'B' AND s > 'a')` (both hold for `'ab'`
+  under en_US), `… OR f + 0.5 = f` (true for `Infinity`) and
+  `n < '-0.10000000000000000001'::numeric AND n > '-0.10000000000000000002'::numeric`
+  (an empty range only through a float) go from PROVEN to LEAK, as does
+  `coalesce(x, x) <> coalesce(y, y) AND … <> coalesce(z, z) AND …`, and the
+  false SEC038 on `COALESCE(level, tier) < 2 OR …` is gone. Arithmetic on a
+  setting an anonymous session leaves unset abstains, since Postgres raises
+  there: `current_setting('app.t')::int + 0 = 5 OR … <> 5` is no longer a
+  false SEC038. An abstention covers the whole predicate, so a proof whose
+  other conjunct isolates is lost when it sits beside one: beside such
+  arithmetic (`tenant_id = auth.uid() AND amount <
+  current_setting('app.limit')::numeric * 2`), beside `+` on text (`…
+  AND created_at + interval '7 days' > now()`, as `-` already was), or
+  beside a decimal no `float4` holds; these go from PROVEN to unverified,
+  which fails a `verify --strict` gate. A leak found only through such a
+  decimal (`… OR n < 0.1`) is unverified too, and `verify` exits 0 on it.
+  The cost runs the other way too: like a function call already, such a
+  value or truth beside an `OR` is reported as a conditional LEAK (no
+  witness row) even where Postgres admits no row (`… OR (a % 2) = 5`), so
+  a `verify` gate that passed can now fail.
+- Leaking rows from every prover print a character past Latin-1 (U+00FF) as
+  itself, not Z3's `\u{…}`, and keep a backslash in a policy's string
+  literal (`'\u{41}'` was taken for `'A'`). A character past U+2FFFF, where
+  Z3's strings end, makes its comparison abstain: Z3 read it as the text of
+  its escape, so `label = '𰀀' AND label <> '\u{30000}'` was a false PROVEN.
 - **`pgrls matrix` / `--prove` / `verify` no longer trust a user function
   called by a built-in's name**, in two forms. A quoted name
   holding a dot (`"pg_catalog.casefold"(…)`, `"auth.uid"()`) is one

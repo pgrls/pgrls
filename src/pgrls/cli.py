@@ -3188,6 +3188,14 @@ def diff(
             extensions=extensions,
             verbose=verbose,
         )
+        if any(not c.type_known for t in base_schema.tables for c in t.column_details):
+            # The base was restored from types it does not trust (an offline
+            # snapshot's declared ones), so the head read back from it does
+            # not know them either.
+            head_schema = replace(head_schema, tables=tuple(
+                replace(t, column_details=tuple(
+                    replace(c, type_known=False) for c in t.column_details))
+                for t in head_schema.tables))
     else:
         assert head is not None  # guaranteed by the fallback chain above
         head_schema = _resolve_diff_source(head, schemas=schema_list)
@@ -4529,7 +4537,8 @@ def verify(
     `USING` that `FOR UPDATE`/`FOR ALL` reuses) and the old-row gate (`USING`,
     for `UPDATE`/`DELETE`/`ALL`)? Three honest verdicts:
     `PROVEN` (the property is unsatisfiable under the threat model), `LEAK` (it
-    *is* violated — with a concrete counterexample), or `UNVERIFIED` (Z3
+    *is* violated — with a counterexample row when one characterizes it), or
+    `UNVERIFIED` (Z3
     unavailable, the predicate is outside the decidable fragment, it timed out,
     or — cross-tenant/write — there is no single scoping equality on an
     identity/discriminator column to verify (the prover's tenant-axis set:
@@ -4543,11 +4552,13 @@ def verify(
 
     The `anon` and `cross-tenant` modes are complementary: the inverted `auth.uid() IS NULL OR …`
     policy is an anon LEAK but cross-tenant PROVEN. Unlike `pgrls lint`
-    (heuristic findings) this is a soundness proof: it never reports a leak it
-    the policy predicate does not admit (or, for the anonymous-role RLS
-    exemption — BYPASSRLS/superuser, or the table owner's privileges without
-    FORCE — that Postgres does not grant), and never
-    reports isolated unless Z3 proves it or Postgres default-denies outright. The provers reason about the policy predicate and the policy's
+    (heuristic findings) this is a soundness proof: it never reports isolated
+    unless Z3 proves it or Postgres default-denies outright. A leak with a
+    witness row is one the policy predicate admits (or, for the anonymous-role
+    RLS exemption — BYPASSRLS/superuser, or the table owner's privileges
+    without FORCE — that Postgres grants); a conditional leak (no single row)
+    can rest on a value or comparison the prover treats as opaque (a text
+    ordering among them) and may over-report. The provers reason about the policy predicate and the policy's
     TO roles, not about table GRANTs, so a predicate admitting every row on a
     table anon cannot SELECT is still a LEAK (an over-report in the safe
     direction; --mode reachability is where the grant is decided). Exits

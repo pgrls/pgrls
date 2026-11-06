@@ -81,6 +81,16 @@ def test_sec004_silent_on_two_arg_false_current_setting_is_null() -> None:
             assert SEC004().check(_wrap(_policy_with_using(using)), {}) == [], using
 
 
+def test_sec004_reads_a_name_built_from_literals_as_never_null() -> None:
+    # `current_setting` is STRICT: a name read from a column is NULL where
+    # the column is, but one joined from non-NULL literals never is, so its
+    # `IS NULL` disjunct is as dead as the plain literal's.
+    for name, fires in (("'app.' || 'tenant'", False), ("('app.' || 'x')::text", False),
+                        ("'app.' || col", True), ("col", True)):
+        using = f"current_setting({name}) IS NULL OR user_id = '1'"
+        assert bool(SEC004().check(_wrap(_policy_with_using(using)), {})) is fires, using
+
+
 def test_sec004_fires_on_user_defined_one_arg_current_setting() -> None:
     # A user-defined `myschema.current_setting(text)` is NOT the builtin
     # and could legitimately return NULL, so the never-NULL skip must not

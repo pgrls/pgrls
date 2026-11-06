@@ -772,3 +772,36 @@ def test_diff_apply_provisions_non_public_baseline_role(
     assert result.exit_code == 0, result.output
     assert "IndeterminateDatatype" not in result.output
     assert "could not determine data type" not in result.output
+
+
+def test_diff_apply_on_an_offline_base_trusts_no_head_type(tmp_path, monkeypatch):
+    # The head is read back from a base restored from the offline snapshot's
+    # declared (untrusted) types: `s` may be citext, so `s IN ('ab'::text,
+    # 'AB'::text)` → `s = 'AB'` is no SAFE tightening.
+    import json
+    from click.testing import CliRunner
+    from dataclasses import replace
+
+    from pgrls import cli
+    from pgrls.schema_sources import schema_from_sql
+
+    def snap(using):
+        return schema_from_sql("CREATE TABLE public.t (id int, s text);\n"
+                               "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+                               f"CREATE POLICY p ON public.t FOR SELECT USING ({using});\n")
+
+    base = tmp_path / "base.json"
+    payload = snap("s IN ('ab'::text, 'AB'::text)").to_snapshot()
+    payload["source"] = "sql"
+    base.write_text(json.dumps(payload))
+    # As introspected: every type known.
+    head = snap("s = 'AB'::text")
+    live_head = replace(head, tables=tuple(
+        replace(t, column_details=tuple(replace(c, type_known=True) for c in t.column_details))
+        for t in head.tables))
+    monkeypatch.setattr(cli, "_apply_migration_for_diff", lambda **_: live_head)
+    mig = tmp_path / "m.sql"
+    mig.write_text("SELECT 1;\n")
+    res = CliRunner().invoke(cli.main, ["diff", str(base), "--apply", str(mig), "--format", "json"])
+    kinds = {v["classification"] for v in json.loads(res.stdout)["violations"]}
+    assert "safe" not in kinds, res.output

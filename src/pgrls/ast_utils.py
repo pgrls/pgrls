@@ -19,7 +19,7 @@ from typing import Any
 
 import pglast
 from pglast.ast import A_ArrayExpr, A_Const, A_Expr, A_Indirection, A_Star, BoolExpr, Boolean, BooleanTest, CaseExpr, CoalesceExpr, CollateClause, ColumnRef, JsonIsPredicate, MinMaxExpr, RowExpr, XmlExpr, DeleteStmt, FuncCall, InsertStmt, JoinExpr, Node, NullTest, RangeFunction, RangeSubselect, RangeVar, SelectStmt, SQLValueFunction, String, SubLink, TypeCast, UpdateStmt
-from pglast.enums import BoolExprType, NullTestType, SetOperation, SQLValueFunctionOp
+from pglast.enums import A_Expr_Kind, BoolExprType, NullTestType, SetOperation, SQLValueFunctionOp
 from pglast import ast as ast_nodes
 from pglast.stream import RawStream
 
@@ -637,6 +637,37 @@ def is_builtin_current_setting(node: Any) -> bool:
     return qualified in ("current_setting", "pg_catalog.current_setting")
 
 
+def has_literal_setting_arguments(node: Any) -> bool:
+    """Whether a ``current_setting`` call names its setting by a string
+    literal and gives any ``missing_ok`` as a non-NULL literal (through any
+    cast), not by a column or other expression: the function is STRICT, so
+    a NULL argument makes it NULL."""
+    args = node.args or ()
+    if not args or len(args) > 2:
+        return False
+    literals = []
+    for arg in args:
+        while isinstance(arg, TypeCast):
+            arg = arg.arg
+        if not (isinstance(arg, A_Const) and not arg.isnull):
+            return False
+        literals.append(arg)
+    return isinstance(getattr(literals[0], "val", None), String)
+
+
+def _never_null_literal(node: Any) -> bool:
+    """Whether `node` is a non-NULL literal, or a `||` of them (`'app.' ||
+    'tenant'`), through any cast."""
+    while isinstance(node, TypeCast):
+        node = node.arg
+    if isinstance(node, A_Const):
+        return not node.isnull
+    names = list(getattr(node, "name", None) or ())
+    return (isinstance(node, A_Expr) and node.kind == A_Expr_Kind.AEXPR_OP
+            and len(names) == 1 and getattr(names[0], "sval", None) == "||"
+            and _never_null_literal(node.lexpr) and _never_null_literal(node.rexpr))
+
+
 def is_never_null_current_setting(node: Any) -> bool:
     """True iff `node` is a builtin ``current_setting`` call that can
     NEVER return NULL — so an ``IS NULL`` test on it is a dead disjunct,
@@ -665,7 +696,9 @@ def is_never_null_current_setting(node: Any) -> bool:
     if not is_builtin_current_setting(node):
         return False
     args = node.args
-    if not args:
+    if not args or not all(_never_null_literal(arg) for arg in args):
+        # `current_setting` is STRICT: a name or missing_ok read from a
+        # column is NULL where the column is.
         return False
     if len(args) == 1:
         return True
