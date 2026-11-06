@@ -3169,6 +3169,82 @@ def test_alter_system_search_path_is_not_followed_in_later_files(tmp_path):
     })
     assert res.exit_code != 0 and "search_path" in res.output
 
+@pytest.mark.parametrize("child", [
+    "CREATE TABLE app.rc (x int) INHERITS (app.renamed);\n",
+    "CREATE TABLE app.rc PARTITION OF app.renamed FOR VALUES IN (1);\n",
+])
+def test_a_child_made_after_its_parents_rename_takes_its_columns(child):
+    from pgrls.schema_sources import schema_from_sql
+    partitioned = " PARTITION BY LIST (id)" if "PARTITION OF" in child else ""
+    schema = schema_from_sql(
+        "CREATE SCHEMA app;\n"
+        f"CREATE TABLE app.old (id int, tenant_id int){partitioned};\n"
+        "ALTER TABLE app.old RENAME TO renamed;\n" + child, schemas=("app",))
+    rc = next(t for t in schema.tables if t.name == "rc")
+    assert {"id", "tenant_id"} <= set(rc.columns)
+
+
+@pytest.mark.parametrize("sql", [
+    # `a` made again and renamed to `c`: `c` is the second `a`.
+    "CREATE TABLE a (x int);\nALTER TABLE a RENAME TO b;\n"
+    "CREATE TABLE a (y int, tenant_id int);\nALTER TABLE a RENAME TO c;\n"
+    "CREATE TABLE ch () INHERITS (c);\n",
+    # Dropped and made again.
+    "CREATE TABLE c (x int);\nDROP TABLE c;\nCREATE TABLE c (y int, tenant_id int);\n"
+    "CREATE TABLE ch () INHERITS (c);\n",
+])
+def test_a_child_takes_no_columns_of_another_incarnation(sql):
+    from pgrls.schema_sources import schema_from_sql
+    ch = next(t for t in schema_from_sql(sql).tables if t.name == "ch")
+    assert list(ch.columns) == ["y", "tenant_id"]
+
+
+@pytest.mark.parametrize("made", [
+    # An IF NOT EXISTS of a name held is a no-op (code between too).
+    "CREATE TABLE IF NOT EXISTS p (id int, tenant_id int);\n"
+    "CREATE TABLE IF NOT EXISTS p (zz int);\n",
+    "CREATE TABLE IF NOT EXISTS p (id int, tenant_id int);\nDO $$ BEGIN END $$;\n"
+    "CREATE TABLE IF NOT EXISTS p (zz int);\n",
+    # ... one of a name a rename filled too.
+    "CREATE TABLE o (id int, tenant_id int);\nALTER TABLE o RENAME TO p;\n"
+    "CREATE TABLE IF NOT EXISTS p (zz int);\n",
+])
+def test_a_child_takes_the_columns_of_the_table_an_if_not_exists_left(made):
+    from pgrls.schema_sources import schema_from_sql
+    ch = next(t for t in schema_from_sql(made + "CREATE TABLE ch () INHERITS (p);\n").tables
+              if t.name == "ch")
+    assert list(ch.columns) == ["id", "tenant_id"]
+
+
+def test_a_long_rename_chain_to_a_parent_is_followed():
+    from pgrls.schema_sources import schema_from_sql
+    sql = "CREATE TABLE t0 (id int, tenant_id int);\n" + "".join(
+        f"ALTER TABLE t{i} RENAME TO t{i + 1};\n" for i in range(1500)) + (
+        "CREATE TABLE ch () INHERITS (t1500);\n")
+    ch = next(t for t in schema_from_sql(sql).tables if t.name == "ch")
+    assert list(ch.columns) == ["id", "tenant_id"]
+
+
+def test_a_rename_of_a_name_never_made_leaves_the_parent_found():
+    # `ALTER TABLE IF EXISTS nothere RENAME TO p` is a no-op.
+    from pgrls.schema_sources import schema_from_sql
+    schema = schema_from_sql("CREATE TABLE p (id int, tenant_id int);\n"
+                             "ALTER TABLE IF EXISTS nothere RENAME TO p;\n"
+                             "CREATE TABLE ch () INHERITS (p);\n")
+    ch = next(t for t in schema.tables if t.name == "ch")
+    assert list(ch.columns) == ["id", "tenant_id"]
+
+
+def test_a_child_takes_the_columns_of_the_table_its_parents_name_holds_then():
+    # `a` renamed to `b`, `b` dropped and made again: the child's parent is
+    # the new `b`, not the old `a`.
+    from pgrls.schema_sources import schema_from_sql
+    schema = schema_from_sql(
+        "CREATE TABLE a (old_col int);\nALTER TABLE a RENAME TO b;\nDROP TABLE b;\n"
+        "CREATE TABLE b (new_col int);\nCREATE TABLE c () INHERITS (b);\n")
+    c = next(t for t in schema.tables if t.name == "c")
+    assert list(c.columns) == ["new_col"]
+
 
 def test_what_the_sql_did_to_a_table_renamed_away_before_a_drop_stays():
     from pgrls.schema_sources import schema_from_sql
