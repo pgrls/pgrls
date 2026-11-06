@@ -155,7 +155,9 @@ breaking changes — they will be called out in this file.
   `price`, `COALESCE(e, 'A') = 'a'` for a citext `e` and
   `COALESCE(length(s), '1') = '01'` for any `s`, so beside anything but
   literals and such columns the diff keeps the COALESCE an opaque value, as
-  on `main`), or a cast to a text type that changes a value
+  on `main`; so does a bare string meeting another in an `IN` list or
+  `ARRAY` a member types, `'1' IN (current_setting('x')::int, '01')`, which
+  the offline anon prover had proven isolated), or a cast to a text type that changes a value
   (`bpchar`, `"char"`, `name`) beside a bare string literal, which then
   compares as that type (`x = ANY(ARRAY['a'::bpchar, 'b '])` holds for
   `x = 'b'`; `main` proved such a predicate isolated). In a

@@ -1015,6 +1015,20 @@ def _reads_strings_alike(column: str, kinds: set[str],
     return all(kind in ("bare", own) for kind in kinds)
 
 
+def _keeps_strings_text(node: Any, ctx: Any) -> bool:
+    """Whether `node`, beside a bare string literal that takes its type,
+    keeps that literal text: a literal (a bare one, a number, which Z3 keeps
+    apart by its sort), one cast to text, or a column the diff knows is
+    text."""
+    if isinstance(node, A_Const) or _literal_kind(node) in ("as text", "as varchar"):
+        return True
+    column = _unwrap_scalar_sublink(node)
+    return (isinstance(column, ColumnRef) and bool(column.fields)
+            and isinstance(column.fields[-1], String)
+            and _is_text(None if ctx.column_types is None
+                         else ctx.column_types.get(column.fields[-1].sval)))
+
+
 def _is_text(data_type: str | None) -> bool:
     return data_type is not None and '"' not in data_type and _type_key(
         data_type) in ("text", "varchar")
@@ -2118,12 +2132,7 @@ def _anon_coalesce(
         # (the diff path reads it by the column's type, `_note_string_read`).
         return None
     if any(_literal_kind(a) == "bare" for a in args) and not all(
-            isinstance(a, A_Const) or _literal_kind(a) in ("as text", "as varchar")
-            or isinstance(column := _unwrap_scalar_sublink(a), ColumnRef)
-            and column.fields and isinstance(column.fields[-1], String)
-            and _is_text(None if ctx.column_types is None
-                         else ctx.column_types.get(column.fields[-1].sval))
-            for a in args):
+            _keeps_strings_text(a, ctx) for a in args):
         # A bare string takes the type of the values beside it, so on a NULL
         # row two literals meet in it (`COALESCE(price, '0') = '0.00'` is
         # TRUE, numeric; `'A' = 'a'` citext; `COALESCE(length(s), '1') =
@@ -2311,6 +2320,12 @@ def _anon_any_array(
         # In a diff, `x = ANY(ARRAY['US '])` is no `x = 'US '`: the bare
         # literals make a `text[]`, so a `char(n)` or `citext` `x` (which the
         # text may not show) compares as text there, and as itself here.
+        return None
+    if _literal_kind(node.lexpr) == "bare" and any(_literal_kind(e) == "bare" for e in elements) \
+            and not all(_keeps_strings_text(e, ctx) for e in elements):
+        # `'1' IN (current_setting('x')::int, '01')`: the members take one
+        # type with the left side (int), so the two literals meet in it,
+        # which Z3 would read as text (as in `_anon_coalesce`).
         return None
     rounded = any(_rounds_its_kin(e, ctx) for e in elements) or (
             node.kind == A_Expr_Kind.AEXPR_IN and _rounds_its_kin(node.lexpr, ctx)) or (

@@ -503,6 +503,12 @@ def test_a_cast_of_a_coalesce_is_no_proof():
              f"AND COALESCE(discount, '5') <> '0.00')")
     assert prove_anon_isolation(parse_expr(using))[0] != "isolated"
     assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated"
+    # Nor a bare string meeting another in a list typed by a member
+    # (`'1' = '01'` as int is TRUE).
+    for using in (f"{t} OR '1' IN (current_setting('app.x', true)::int, '01')",
+                  f"{t} OR '1' = ANY (ARRAY[current_setting('app.x', true)::int, '01'])",
+                  f"{t} OR '01' IN ('1', (SELECT current_setting('app.x', true)::int))"):
+        assert prove_anon_isolation(parse_expr(using))[0] != "isolated", using
     # A COALESCE of a column and a bare literal still reads exactly.
     assert prove_anon_isolation(parse_expr(f"{t} AND COALESCE(level, 0) < 3"))[0] == "isolated"
     # The session identity's cast keeps its proof.
