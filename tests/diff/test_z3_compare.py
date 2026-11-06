@@ -459,6 +459,20 @@ def test_a_cast_of_a_coalesce_is_no_proof():
                   "x::float8::numeric = 1 AND x::float8 <> 1"):
         assert prove_anon_isolation(parse_expr(using))[0] != "isolated", using
         assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated", using
+    # Two columns meeting through a COALESCE (a numeric and a float8,
+    # compared through a double), and a column arm beside a typed one that
+    # is no cast (`(SELECT '')`, a function's text), are no proof either.
+    t = "tenant_id = (SELECT auth.uid())"
+    for using in (f"{t} OR (COALESCE(n, 0) = COALESCE(f, 0) AND n > 0.5 AND f <= 0.5)",
+                  f"{t} OR (n = COALESCE(f, 0) AND n > 0.5 AND f <= 0.5)",
+                  f"{t} OR (COALESCE(e, (SELECT '')) <> 'A' AND COALESCE(e, '') = 'A')",
+                  f"{t} OR (COALESCE(e, auth.email()) <> 'A' AND COALESCE(e, '') = 'A')"):
+        assert prove_anon_isolation(parse_expr(using))[0] != "isolated", using
+        assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated", using
+    assert _classify("x = 1", "(x = 1 OR n = COALESCE(f, 0)) AND (x = 1 OR (n > 0.5 AND f <= 0.5))"
+                     ) is None
+    # A COALESCE of a column and a bare literal still reads exactly.
+    assert prove_anon_isolation(parse_expr(f"{t} AND COALESCE(level, 0) < 3"))[0] == "isolated"
     # The session identity's cast keeps its proof.
     assert prove_cross_tenant_isolation(parse_expr(
         "tenant_id = current_setting('app.tenant_id')::bigint"))[0] == "isolated"

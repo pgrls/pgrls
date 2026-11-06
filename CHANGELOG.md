@@ -144,8 +144,11 @@ breaking changes — they will be called out in this file.
   its leaking row; a cast of a `COALESCE` / `CASE` / `NULLIF` or of a
   value-changing cast, which may take a column's type, is a value of its
   own — `COALESCE(score, 0)::numeric` rounds a float8 `score`, `::text`
-  makes a citext one case-sensitive — and so is a `COALESCE` of a column
-  with a typed string arm), or a cast to a text type that changes a value
+  makes a citext one case-sensitive; a `COALESCE` of a column with any arm
+  but a bare literal or column (a cast, a sub-select, a function's result)
+  decides nothing, nor does a comparison of two values holding columns
+  where one meets the other through a `COALESCE` / `CASE` (a numeric and a
+  float8 column compare through a double)), or a cast to a text type that changes a value
   (`bpchar`, `"char"`, `name`) beside a bare string literal, which then
   compares as that type (`x = ANY(ARRAY['a'::bpchar, 'b '])` holds for
   `x = 'b'`; `main` proved such a predicate isolated). In a

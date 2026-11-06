@@ -696,6 +696,15 @@ def _ordered_truth(op: str, left: Any, right: Any, ctx: _Context,
 _MIRRORED = {"<": ">", ">": "<", "<=": ">=", ">=": "<="}
 
 
+def _columns_meet_through_arms(left: Any, right: Any) -> bool:
+    """Whether two values that each hold a column meet, one through a
+    COALESCE / CASE / GREATEST / LEAST / NULLIF, which gives its column the
+    type a literal beside it has: the two columns' own types (a numeric and a
+    float8, which Postgres compares through a double) are not shown."""
+    return _holds_column(left) and _holds_column(right) and (
+        _takes_a_column_type(left) or _takes_a_column_type(right))
+
+
 def _holds_column(node: Any) -> bool:
     """Whether a column is anywhere in `node`: `COALESCE(amount, 0)` has
     `amount`'s type."""
@@ -2086,11 +2095,12 @@ def _anon_coalesce(
         # rounding a column's value too (`COALESCE(id, 0::real)`).
         return None
     if not ctx.any_session and any(isinstance(n, ColumnRef) for a in args for n in _ast_nodes(a)) \
-            and any(isinstance(n, TypeCast) and _typename_last_segment(n.typeName) in _STRING_TYPES
-                    for a in args for n in _ast_nodes(a)):
-        # A typed string arm (`COALESCE(s, 'x'::text)`) gives a citext or
-        # char(n) column its type, comparing it otherwise (the diff path
-        # reads it by the column's type, `_note_string_read`).
+            and not all(isinstance(_unwrap_scalar_sublink(a), ColumnRef)
+                        or isinstance(a, A_Const) for a in args):
+        # Beside a column only a bare literal takes the column's type: a
+        # typed arm (`'x'::text`, `(SELECT '')`, `auth.email()`, a cast)
+        # gives a citext or char(n) column its own, comparing it otherwise
+        # (the diff path reads it by the column's type, `_note_string_read`).
         return None
     # Its arguments take one type, a column's beside a literal.
     with ctx.unifying(not all(_is_constant(a) for a in args)):
@@ -2184,7 +2194,7 @@ def _anon_distinct(
         return None
     _note_string_read(ctx, node.lexpr, [node.rexpr])
     if _unlike_sql("=", left.value, right.value, any_session=ctx.any_session) or _floats_meet(
-            node.lexpr, node.rexpr):
+            node.lexpr, node.rexpr) or _columns_meet_through_arms(node.lexpr, node.rexpr):
         return None
     if ctx.any_session and _cast_value_meets_column(node.lexpr, node.rexpr):
         # As in `_anon_binop`: the values' order is one of its own.
@@ -2365,7 +2375,8 @@ def _anon_binop(
         floats_meet = False
     else:
         floats_meet = _floats_meet(node.lexpr, node.rexpr) or (
-            comparison_fn is not None and ctx.kin_rounded > 0)
+            comparison_fn is not None and (ctx.kin_rounded > 0 or _columns_meet_through_arms(
+                node.lexpr, node.rexpr)))
     if unlike or floats_meet or cast_meets:
         if comparison_fn is None or (ctx.any_session and (not cast_meets or ctx.unified)):
             # In an `IN` list or array the value takes the list's type, not
