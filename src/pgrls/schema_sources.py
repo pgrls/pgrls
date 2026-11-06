@@ -1130,15 +1130,22 @@ _CONNECTING_ROLE = "\0connecting role"
 
 # A role pgrls cannot name: a schema's owner it does not know (one there
 # before the SQL, or one a REASSIGN OWNED may have passed on), or the role
-# CURRENT_USER is when a \connect'ed database or role sets `role`.
+# CURRENT_USER is when a \connect'ed database or role sets `role`. The role a
+# session starts as under such a setting is one too, but the same one until
+# the session changes it: `_SOME_ROLE#<n>` (`_Resolver.session_role`).
 _SOME_ROLE = "\0some role"
+
+
+def _unnamed(role: str | None) -> bool:
+    """Whether `role` is one pgrls cannot name."""
+    return role is not None and role.startswith(_SOME_ROLE)
 
 
 def _may_be(owner: str | None, roles: AbstractSet[str | None]) -> bool:
     """Whether `owner` may be one of `roles` though not named so: the
     connecting role (None) may be any named one, and one pgrls cannot name
     any at all."""
-    if owner == _SOME_ROLE or _SOME_ROLE in roles:
+    if _unnamed(owner) or any(_unnamed(r) for r in roles):
         return True
     return (owner is None and any(r is not None for r in roles)) or (
         owner is not None and None in roles)
@@ -1159,10 +1166,13 @@ def _sets_for_next_session(stmt: Any) -> tuple[bool, bool]:
     if not isinstance(stmt, (_pgast.AlterDatabaseSetStmt, _pgast.AlterRoleSetStmt,
                              _pgast.AlterSystemStmt)):
         return False, False
+    if stmt.setstmt.kind not in (VariableSetKind.VAR_SET_VALUE, VariableSetKind.VAR_SET_CURRENT):
+        # A RESET (or SET … TO DEFAULT) takes a setting away: the next session
+        # starts as one with none, as pgrls takes every session to.
+        return False, False
     name = (stmt.setstmt.name or "").lower()
-    reset_all = stmt.setstmt.kind == VariableSetKind.VAR_RESET_ALL
     # The role the next session runs as is `$user` too.
-    return reset_all or name == "search_path", reset_all or name == "role"
+    return name == "search_path", name == "role"
 
 
 class _Resolver:
@@ -1202,6 +1212,10 @@ class _Resolver:
         self.in_transaction = False
         self.inherited = False
         self.inherited_role = False
+        # Which session the role a setting gives is the one of (see
+        # session_role), and whether the session user changed since.
+        self.epoch = 0
+        self.auth_changed = False
         # A database's or role's setting the SQL makes: a session after it
         # (`snapshot --migrations`' next file, from its DISCARD ALL) starts
         # with it.
@@ -1222,6 +1236,20 @@ class _Resolver:
 
     def _get(self, key: str) -> Any:
         return self.local[key] if key in self.local else self.session[key]
+
+    @property
+    def session_role(self) -> str:
+        """The role the session started as under a database's or role's
+        setting of `role`: not one pgrls can name, but the one that made what
+        it made since."""
+        return f"{_SOME_ROLE}#{self.epoch}"
+
+    def running(self) -> str | None:
+        """The role the SQL runs as (None: the connecting one)."""
+        role: str | None = self._get("role") or self._get("auth")
+        if role is None and self.inherited_role:
+            return self.session_role
+        return role
 
     def _set(self, key: str, value: Any, *, local: bool) -> None:
         if not local:
@@ -1278,6 +1306,8 @@ class _Resolver:
                 # with: taking a setting made since is only more cautious.)
                 self.inherited |= self.next_inherited
                 self.inherited_role |= self.next_inherited_role
+                self.epoch += 1
+                self.auth_changed = False
                 self._set("search_path", self._default(), local=False)
                 self._set("role", None, local=False)
                 self._set("auth", None, local=False)
@@ -1306,12 +1336,19 @@ class _Resolver:
                 if (name == "role" and self.inherited_role and stmt.kind in (
                         VariableSetKind.VAR_RESET, VariableSetKind.VAR_SET_DEFAULT)):
                     # RESET ROLE goes back to the role a database's or role's
-                    # setting gives the session, not to the session user.
+                    # setting gives the session, not to the session user (the
+                    # one it started as, unless that changed).
+                    value = _SOME_ROLE if self.auth_changed else self.session_role
+                elif value is None and self.inherited_role:
+                    # SET ROLE NONE, or back to the session user: the
+                    # connecting role, which may not be the one it started as.
                     value = _SOME_ROLE
                 if name == "session_authorization":
                     # It sets the session user, and the role back to it.
-                    self._set("auth", value, local=local)
-                self._set("role", value if name == "role" else None, local=local)
+                    self.auth_changed = True
+                    self._set("auth", None if _unnamed(value) else value, local=local)
+                self._set("role", value if name == "role" or _unnamed(value) else None,
+                          local=local)
             return
         if _only_defines(stmt):
             return  # a definition: its expressions run when it is used
@@ -1373,7 +1410,8 @@ class _Resolver:
             role = getattr(spec, "rolename", None)
         if role is None and self.inherited_role:
             # The connecting role or the one its settings set, by turns.
-            return _SOME_ROLE
+            return self.session_role if spec is None or spec.roletype in (
+                RoleSpecType.ROLESPEC_CURRENT_USER, RoleSpecType.ROLESPEC_CURRENT_ROLE) else _SOME_ROLE
         return role
 
     def exists(self, schema: str) -> bool:
@@ -1411,12 +1449,12 @@ class _Resolver:
                 "which schema an unqualified name is in. Set it after, or "
                 "qualify the names.",
             )
-        role = self._get("role") or self._get("auth")
+        role = self.running()
         for entry in path:
             if entry == "$user":
                 # A role is taken to have no schema of its own unless the
                 # SQL creates one; the connecting role is not known.
-                if (role is None and self.inherited_role) or role == _SOME_ROLE:
+                if _unnamed(role):
                     raise SchemaSourceError(
                         "bad_sql",
                         "the SQL connects to a database or as a role that sets the "
@@ -1451,12 +1489,11 @@ class _Resolver:
         """Postgres also skips a schema the running role has no USAGE on;
         after a SET ROLE / SET SESSION AUTHORIZATION, refuse one the SQL does
         not show the role may use (owns it, or was granted USAGE on it)."""
-        role = self._get("role") or self._get("auth")
-        if role is None and self.inherited_role:
-            # The role a database's or role's setting gives the session, which
-            # may be no superuser: it may use only what PUBLIC may.
-            role = _SOME_ROLE
-        if role is None:
+        # The role a database's or role's setting gives the session may be no
+        # superuser: it may use only what PUBLIC may, and what it owns.
+        role = self.running()
+        if role is None or schema in self.override:
+            # (A CREATE SCHEMA's elements go in it as its owner.)
             return
         if (schema in ("public", "pg_catalog", "information_schema")
                 and (schema, None) not in self.revoked) or (
@@ -1465,7 +1502,7 @@ class _Resolver:
                 role != _SOME_ROLE and (schema, role) in self.usage) or (
                 schema, None) in self.usage:
             return
-        who = "a role a database's or role's setting gives" if role == _SOME_ROLE else (
+        who = "a role a database's or role's setting gives" if _unnamed(role) else (
             f"role {role!r}")
         raise SchemaSourceError(
             "bad_sql",
@@ -1617,9 +1654,7 @@ class _Resolver:
                 # A GRANT under a SET ROLE by one that is not the schema's
                 # owner may grant nothing (without the grant option Postgres
                 # only warns): it is credited to no one.
-                running = self._get("role") or self._get("auth")
-                if running is None and self.inherited_role:
-                    running = _SOME_ROLE
+                running = self.running()
                 if stmt.is_grant and running is not None and (
                         running == _SOME_ROLE or self.owners.get(schema) != running):
                     continue

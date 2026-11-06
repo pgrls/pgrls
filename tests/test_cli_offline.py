@@ -3518,3 +3518,65 @@ def test_reset_role_under_a_role_setting_returns_to_a_role_pgrls_cannot_name(tmp
 def test_a_role_a_setting_gives_may_use_only_what_public_may(tmp_path, files):
     res, _ = _migrations_snapshot(tmp_path, files)
     assert res.exit_code != 0 and "USAGE" in res.output, res.output
+
+
+@pytest.mark.parametrize("files, where", [
+    # The role a setting gives (alice) owns the schema it creates.
+    ({"001_a.sql": "ALTER DATABASE postgres SET role alice;\n",
+      "002_b.sql": "CREATE SCHEMA app;\nSET search_path = app;\nCREATE TABLE t (id int);\n"},
+     ("app", "t")),
+    # A CREATE SCHEMA's elements go in it as its owner.
+    ({"001_a.sql": "ALTER DATABASE postgres SET role alice;\n",
+      "002_b.sql": "CREATE SCHEMA app CREATE TABLE t (id int);\n"
+                   "ALTER TABLE app.t ENABLE ROW LEVEL SECURITY;\n"},
+     ("app", "t")),
+    # Its GRANT on the schema it created is credited.
+    ({"001_a.sql": "ALTER DATABASE postgres SET role alice;\n",
+      "002_b.sql": "CREATE SCHEMA app;\nGRANT USAGE, CREATE ON SCHEMA app TO bob;\n"
+                   "SET ROLE bob;\nSET search_path = app;\nCREATE TABLE t (id int);\n"},
+     ("app", "t")),
+    # RESET ROLE goes back to it.
+    ({"001_a.sql": "ALTER DATABASE postgres SET role alice;\n",
+      "002_b.sql": "CREATE SCHEMA app;\nSET ROLE bob;\nRESET ROLE;\n"
+                   "SET search_path = app;\nCREATE TABLE t (id int);\n"},
+     ("app", "t")),
+    # A RESET takes a setting away: the next session runs as the connecting role.
+    ({"001_a.sql": "CREATE SCHEMA app;\nALTER DATABASE postgres RESET ALL;\n",
+      "002_b.sql": "SET search_path = app;\nCREATE TABLE t (id int);\n"},
+     ("app", "t")),
+    ({"001_a.sql": "CREATE SCHEMA app;\nALTER ROLE postgres IN DATABASE postgres RESET role;\n"
+                   "ALTER DATABASE postgres SET search_path TO DEFAULT;\n",
+      "002_b.sql": "SET search_path = app;\nCREATE TABLE t (id int);\n"},
+     ("app", "t")),
+])
+def test_the_role_a_setting_gives_uses_the_schemas_it_creates(tmp_path, files, where):
+    res, snap = _migrations_snapshot(tmp_path, files)
+    assert res.exit_code == 0, res.output
+    assert where in {(t["schema"], t["name"]) for t in snap["tables"]}
+
+
+def test_a_role_a_setting_gives_creates_in_its_schema_in_one_file():
+    from pgrls.schema_sources import schema_from_sql
+    tables = {(t.schema, t.name) for t in schema_from_sql(
+        "CREATE DATABASE appdb;\nALTER DATABASE appdb SET role alice;\n\\connect appdb\n"
+        "CREATE SCHEMA app;\nSET search_path = app;\nCREATE TABLE t (id int);\n"
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY;\nCREATE TABLE public.u (id int);\n").tables}
+    assert {("app", "t"), ("public", "u")} <= tables
+
+
+@pytest.mark.parametrize("files", [
+    # Back to the session user, which may not be the role it started as.
+    {"001_a.sql": "ALTER DATABASE postgres SET role alice;\n",
+     "002_b.sql": "CREATE SCHEMA app;\nSET ROLE NONE;\nSET search_path = app;\n"
+                  "CREATE TABLE t (id int);\n"},
+    {"001_a.sql": "ALTER DATABASE postgres SET role alice;\n",
+     "002_b.sql": "CREATE SCHEMA app;\nSET SESSION AUTHORIZATION bob;\nRESET SESSION AUTHORIZATION;\n"
+                  "SET search_path = app;\nCREATE TABLE t (id int);\n"},
+    # Another session's: pgrls does not follow which role that one ran as.
+    {"001_a.sql": "ALTER DATABASE postgres SET role alice;\n",
+     "002_b.sql": "CREATE SCHEMA app;\n",
+     "003_c.sql": "SET search_path = app;\nCREATE TABLE t (id int);\n"},
+])
+def test_a_schema_the_role_a_setting_gives_made_is_not_another_roles(tmp_path, files):
+    res, _ = _migrations_snapshot(tmp_path, files)
+    assert res.exit_code != 0 and "USAGE" in res.output, res.output
