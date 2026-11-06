@@ -3388,3 +3388,13 @@ def test_a_cycle_is_broken_at_the_link_an_if_not_exists_may_not_have_made(sql, c
     tables = _tables_of(sql)
     assert tables[child].partition_of == ("public", parent)
     assert tables[parent].partition_of is None
+
+
+@pytest.mark.parametrize("drop", ["DROP TABLE c;\n", "DROP TABLE IF EXISTS c;\n"])
+def test_a_drop_before_a_rename_to_the_name_leaves_the_if_not_exists_a_no_op(drop):
+    # `d` takes the name `c` after the DROP, so the IF NOT EXISTS is skipped.
+    made = "CREATE TABLE c (id int);\n" if "IF EXISTS" not in drop else ""
+    tables = _tables_of("CREATE TABLE a (id int) PARTITION BY RANGE (id);\n" + made
+                        + "CREATE TABLE d (id int);\n" + drop + "ALTER TABLE d RENAME TO c;\n"
+                        "CREATE TABLE IF NOT EXISTS c PARTITION OF a DEFAULT;\n")
+    assert tables["c"].partition_of is None

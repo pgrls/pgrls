@@ -632,7 +632,8 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
                 # As a re-CREATE below: the table now, unless an IF NOT
                 # EXISTS skips while it is there.
                 if not (getattr(stmt, "if_not_exists", False)
-                        and not gone_between(current.created_at, index)):
+                        and not gone_between(max(current.created_at,
+                                                 made.taken.get(key, -1)), index)):
                     if not _renamed_between(statements, key, current.created_at, index,
                                             default_schema):
                         # A table made from a query is no partition or child.
@@ -658,7 +659,10 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             # CREATE` keeps the table, `CREATE; CREATE; DROP` removes it.
             # One `IF NOT EXISTS` skips while the table is there (with no
             # DROP since), so an ATTACH / DETACH before it still applies.
-            if stmt.if_not_exists and not gone_between(current.created_at, index, key):
+            # (Since the table took the name: a removal before a rename to it
+            # removed another.)
+            since = max(current.created_at, made.taken.get(key, -1))
+            if stmt.if_not_exists and not gone_between(since, index, key):
                 continue
             previous = current.created_at
             current.created_at = index
@@ -671,7 +675,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             partition = bool(again) and getattr(stmt, "partbound", None) is not None
             new_parent = again[0] if partition else None
             new_inherits = [] if partition else again
-            if stmt.if_not_exists and not _dropped_between(statements, key, previous, index,
+            if stmt.if_not_exists and not _dropped_between(statements, key, since, index,
                                                            default_schema):
                 def same(p: tuple[str, str]) -> bool:
                     # (A parent name renamed away or dropped between names
@@ -838,17 +842,21 @@ class _Holds:
         # there before it); a schema it dropped.
         self.ever: set[tuple[str, str]] = set()
         self.dropped_schemas: set[str] = set()
+        # The statement where the relation a name holds took it (its CREATE,
+        # or a rename to it): a removal before it removed another.
+        self.taken: dict[tuple[str, str], int] = {}
 
     def step(self, stmt: Any, index: int) -> None:
         for rel, creates in _named_relations(stmt):
             key = _relation_key(rel, self.default_schema) if creates else None
             if key is not None and key not in self.holds:
-                self.holds[key] = index
+                self.holds[key] = self.taken[key] = index
                 self.ever.add(key)
         if (isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None
                 and stmt.renameType in _RELATION_KINDS and stmt.newname
                 and (old := _relation_key(stmt.relation, self.default_schema)) in self.holds):
             self.holds[(old[0], stmt.newname)] = self.holds.pop(old)
+            self.taken[(old[0], stmt.newname)] = index
             self.ever.add((old[0], stmt.newname))
         elif (isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None
                 and stmt.renameType in _RELATION_KINDS and stmt.newname
