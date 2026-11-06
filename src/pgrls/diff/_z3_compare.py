@@ -828,6 +828,18 @@ def _keeps_its_type(node: Any) -> bool:
             and _keeps_its_type(node.arg))
 
 
+def _takes_a_column_type(node: Any) -> bool:
+    """Whether `node` is a COALESCE / CASE / GREATEST / LEAST / NULLIF or a
+    value-changing cast: one whose Postgres type a column in it may give,
+    which a further cast may then change (`COALESCE(score, 0)::numeric`)."""
+    node = _unwrap_scalar_sublink(node)
+    if isinstance(node, (CoalesceExpr, CaseExpr, MinMaxExpr)):
+        return True
+    if isinstance(node, A_Expr) and node.kind == A_Expr_Kind.AEXPR_NULLIF:
+        return True
+    return isinstance(node, TypeCast) and not _exact_cast(node.typeName)
+
+
 def _typename_last_segment(typename: Any) -> str | None:
     """The bare type name of a pglast ``TypeName`` (`int4`, `numeric`), or
     None — used to range-check an integer fold against the RIGHT width."""
@@ -2073,6 +2085,13 @@ def _anon_coalesce(
         # Postgres gives every argument the float type a cast gives one,
         # rounding a column's value too (`COALESCE(id, 0::real)`).
         return None
+    if not ctx.any_session and any(isinstance(n, ColumnRef) for a in args for n in _ast_nodes(a)) \
+            and any(isinstance(n, TypeCast) and _typename_last_segment(n.typeName) in _STRING_TYPES
+                    for a in args for n in _ast_nodes(a)):
+        # A typed string arm (`COALESCE(s, 'x'::text)`) gives a citext or
+        # char(n) column its type, comparing it otherwise (the diff path
+        # reads it by the column's type, `_note_string_read`).
+        return None
     # Its arguments take one type, a column's beside a literal.
     with ctx.unifying(not all(_is_constant(a) for a in args)):
         others = [_as_val(_anon_3vl(a, ctx, auth_funcs, assertions)) for a in args
@@ -2667,10 +2686,15 @@ def _anon_typecast(
             is_null=inner.is_null,
             unset=inner.unset,
         )
-    if ctx.any_session and not _keeps_its_type(node.arg):
+    if not _keeps_its_type(node.arg) and (ctx.any_session or _takes_a_column_type(node.arg)):
         # A cast of a value whose Postgres type pgrls does not know — a
         # function's result, a lossy or unknown cast — may change it even to
         # a type of the same sort (`s::float8::numeric`, `abs(n)::text`).
+        # Off the diff path a function's result keeps its reading (the
+        # session identity's `current_setting(…)::bigint`), but a COALESCE
+        # or CASE does not: it takes a column's type (`COALESCE(score,
+        # 0)::numeric` rounds a float8 `score`; `::text` makes a citext one
+        # case-sensitive).
         return _Val(
             value=ctx.opaque(_canon(node), target_sort),
             is_null=inner.is_null,

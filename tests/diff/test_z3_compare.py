@@ -446,6 +446,24 @@ def test_a_string_compared_with_a_column_reads_by_the_columns_type():
                 " AND status = 'active'", tenant_id="uuid", status="text") == "semantic_loosened"
 
 
+def test_a_cast_of_a_coalesce_is_no_proof():
+    # A COALESCE takes a column's type, which a cast may change: a float8
+    # `score` rounds to numeric, a citext `s` compares case-sensitively as
+    # text, a char(n) one drops trailing spaces. Off the diff path these
+    # were proven isolated.
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+    for using in ("tenant_id = auth.uid() OR (COALESCE(score, 0)::numeric = 100 AND score > 100)",
+                  "tenant_id = auth.uid() OR (s = 'A' AND COALESCE(s, 'x')::text <> 'A')",
+                  "tenant_id = auth.uid() OR (s = 'A' AND COALESCE(s, 'x'::text) <> 'A')",
+                  "tenant_id = auth.uid() OR ('x ' = s AND COALESCE(s, 'a')::text <> 'x ')",
+                  "x::float8::numeric = 1 AND x::float8 <> 1"):
+        assert prove_anon_isolation(parse_expr(using))[0] != "isolated", using
+        assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated", using
+    # The session identity's cast keeps its proof.
+    assert prove_cross_tenant_isolation(parse_expr(
+        "tenant_id = current_setting('app.tenant_id')::bigint"))[0] == "isolated"
+
+
 def test_a_non_number_cast_in_a_list_keeps_the_provers_verdict():
     # `pg_get_expr` casts every uuid / enum literal in a list; only a number
     # cast that may round its kin abstains (off the diff path).

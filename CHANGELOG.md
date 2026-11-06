@@ -141,7 +141,11 @@ breaking changes — they will be called out in this file.
   and only a number cast rounds its kin there (a `uuid`, enum or `date`
   literal in a list or `COALESCE`, which `pg_get_expr` writes with a cast,
   keeps the verdict, as on `main`, and a `char(n)` one, `'demo'::bpchar`,
-  its leaking row), or a cast to a text type that changes a value
+  its leaking row; a cast of a `COALESCE` / `CASE` / `NULLIF` or of a
+  value-changing cast, which may take a column's type, is a value of its
+  own — `COALESCE(score, 0)::numeric` rounds a float8 `score`, `::text`
+  makes a citext one case-sensitive — and so is a `COALESCE` of a column
+  with a typed string arm), or a cast to a text type that changes a value
   (`bpchar`, `"char"`, `name`) beside a bare string literal, which then
   compares as that type (`x = ANY(ARRAY['a'::bpchar, 'b '])` holds for
   `x = 'b'`; `main` proved such a predicate isolated). In a
