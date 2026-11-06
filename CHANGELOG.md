@@ -192,7 +192,10 @@ breaking changes — they will be called out in this file.
   name a temporary table and another hold, and one found ahead of a path
   entry pgrls cannot follow. A search path pgrls
   cannot follow is refused: one a `\connect`ed database or role may set,
-  `pg_temp` on it ahead of the schema that holds a name, a schema on it
+  `pg_temp` on it ahead of the schema that holds a name, no schema on it at
+  all where a name is created or looked up (a dump's empty search_path over
+  SQL after it in one session: Postgres errors; `snapshot --migrations`
+  gives each file a session of its own, as migration runners do), a schema on it
   that a role the SQL runs as (`SET ROLE` / `SET SESSION AUTHORIZATION`)
   may have no `USAGE` on where it holds the name (Postgres skips it; one
   the role owns and did not revoke `USAGE` on, was granted `USAGE` on

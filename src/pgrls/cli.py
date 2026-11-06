@@ -945,8 +945,11 @@ def _resolve_offline_schema(
     schemas_csv: str | None,
     command: WarnCommand,
     config_path: str | None = None,
+    migrations: bool = False,
 ) -> tuple[Schema, SchemaSource, int | None] | None:
     """Build a Schema from --sql-file / --snapshot, or return None.
+    `migrations`: the files are a migration directory's, each applied in a
+    session of its own (as a migration runner does), not one psql session.
 
     Returns `(schema, source, snapshot_version)` — `snapshot_version` is the
     declared format version of a --snapshot source (used to scope which
@@ -980,6 +983,7 @@ def _resolve_offline_schema(
                 "--schemas filter."
             )
     sql_text: str | None = None
+    flag = "--migrations" if migrations else "--sql-file"
     if sql_file:
         parts: list[str] = []
         total = 0
@@ -992,7 +996,7 @@ def _resolve_offline_schema(
                     chunk = (raw.read().decode("utf-8") if raw is not None
                              else sys.stdin.read())
                 except UnicodeDecodeError as exc:
-                    raise ToolError(f"cannot read --sql-file -: {exc}") from exc
+                    raise ToolError(f"cannot read {flag} -: {exc}") from exc
             else:
                 try:
                     # newline="": psql reads a line to its LF, so a lone CR
@@ -1001,7 +1005,7 @@ def _resolve_offline_schema(
                         chunk = fh.read()
                 except (OSError, UnicodeDecodeError) as exc:
                     raise ToolError(
-                        f"cannot read --sql-file {entry!r}: {exc}"
+                        f"cannot read {flag} {entry!r}: {exc}"
                     ) from exc
             # psql skips a byte-order mark opening each file it reads.
             chunk = chunk.removeprefix("\ufeff")
@@ -1013,7 +1017,10 @@ def _resolve_offline_schema(
                     "lint against a live database."
                 )
             parts.append(chunk)
-        sql_text = "\n".join(parts)
+        # A migration runner applies each file in a session of its own (the
+        # Supabase CLI resets each one), so a baseline dump's empty
+        # search_path does not reach the files after it.
+        sql_text = ("\nDISCARD ALL;\n" if migrations else "\n").join(parts)
     try:
         schema, source, snapshot_version = resolve_schema(
             sql=sql_text, snapshot=snapshot, schemas=schemas
@@ -2347,6 +2354,7 @@ def snapshot(
             schemas_csv=schemas,
             command="snapshot",
             config_path=config_path,
+            migrations=migrations_path is not None,
         )
         assert offline is not None  # a source was given
         schema = offline[0]

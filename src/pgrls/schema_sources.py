@@ -1213,8 +1213,17 @@ class _Resolver:
         first: str | None = next(iter(self._entries()), None)
         if first is None or first == "pg_catalog":
             # "no schema has been selected to create in", or a catalog
-            # Postgres refuses to create in.
-            return _NOWHERE
+            # Postgres refuses to create in: the statement errors, which
+            # pgrls cannot model as succeeding (a dump's empty search_path
+            # left in force over SQL after it, say).
+            raise SchemaSourceError(
+                "bad_sql",
+                f"the SQL {'names' if looking_up else 'creates'} a relation with no "
+                f"schema on search_path to {'find' if looking_up else 'create'} it in "
+                f"(Postgres errors; a dump sets search_path to '' and SQL after it "
+                f"in the same session sees that); qualify the names, or lint the "
+                f"files apart.",
+            )
         if first not in self.schemas and first not in self.created and first not in self.named:
             # Postgres creates in it if it exists, else in the next one.
             raise SchemaSourceError(

@@ -2337,7 +2337,6 @@ def test_an_unqualified_name_resolves_on_the_search_path_the_sql_sets():
     ("SET SCHEMA 'app';\nCREATE TABLE x (id int);\n", "app"),
     ("SELECT set_config('search_path', 'APP, public', false);\nCREATE TABLE x (id int);\n", "app"),
     # pg_dump's: an unqualified CREATE then has nowhere to go.
-    ("SELECT pg_catalog.set_config('search_path', '', false);\nCREATE TABLE x (id int);\n", None),
     # A search_path string splits on ASCII whitespace: a no-break space is
     # part of a name.
     ("CREATE SCHEMA \"\u00a0app\";\n"
@@ -2374,6 +2373,34 @@ def test_the_search_path_follows_the_session(sql, where):
     sql = "CREATE SCHEMA IF NOT EXISTS app;\n" + sql if "CREATE SCHEMA app " not in sql else sql
     got = [t.schema for t in schema_from_sql(sql).tables if t.name == "x"]
     assert got == ([where] if where else []), sql
+
+
+def test_a_name_with_no_schema_to_go_to_is_refused():
+    # A dump's empty search_path left in force: Postgres errors on the
+    # unqualified CREATE, which was silently dropped.
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+    with pytest.raises(SchemaSourceError, match="no schema on search_path"):
+        schema_from_sql("SELECT pg_catalog.set_config('search_path', '', false);\n"
+                        "CREATE TABLE x (id int);\n")
+
+
+def test_each_migration_file_is_a_session_of_its_own(tmp_path):
+    # A baseline dump's empty search_path does not reach the migration after
+    # it (the Supabase CLI resets each file's session).
+    import json
+    from click.testing import CliRunner
+    from pgrls.cli import main
+    mig = tmp_path / "migrations"
+    mig.mkdir()
+    (mig / "20240101000000_remote_schema.sql").write_text(
+        "SELECT pg_catalog.set_config('search_path', '', false);\n"
+        "CREATE TABLE public.base (id int);\n")
+    (mig / "20240201000000_invoices.sql").write_text("CREATE TABLE invoices (id int);\n")
+    out = tmp_path / "s.json"
+    res = CliRunner().invoke(main, ["snapshot", "--migrations", str(mig), "-o", str(out)])
+    assert res.exit_code == 0, res.output
+    names = {(t["schema"], t["name"]) for t in json.loads(out.read_text())["tables"]}
+    assert ("public", "invoices") in names
 
 
 @pytest.mark.parametrize("gone", [
