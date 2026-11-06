@@ -970,7 +970,9 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
             # views, indexes, triggers, grants (`transformCreateSchemaStmtElements`).
             # They run as its owner (`AUTHORIZATION r`), and a name an earlier
             # one made is the new schema's.
-            owner = resolver.role_of(stmt.authrole) if stmt.authrole is not None else None
+            owner = resolver.role_of(stmt.authrole) if stmt.authrole is not None and (
+                stmt.authrole.roletype not in (RoleSpecType.ROLESPEC_CURRENT_USER,
+                                               RoleSpecType.ROLESPEC_CURRENT_ROLE)) else None
             made_here: set[str] = set()
             for element in sorted(stmt.schemaElts or (), key=_schema_element_order):
                 # Its elements go in it, and see it first.
@@ -1409,7 +1411,7 @@ class _Resolver:
             if entry == "$user":
                 # A role is taken to have no schema of its own unless the
                 # SQL creates one; the connecting role is not known.
-                if role is None and self.inherited_role:
+                if (role is None and self.inherited_role) or role == _SOME_ROLE:
                     raise SchemaSourceError(
                         "bad_sql",
                         "the SQL connects to a database or as a role that sets the "

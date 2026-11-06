@@ -3474,3 +3474,14 @@ def test_a_definitions_body_setting_the_path_is_no_set_local(tmp_path):
         "001_a.sql": "CREATE FUNCTION public.f() RETURNS text LANGUAGE sql BEGIN ATOMIC"
                      " SELECT set_config('search_path', 'public', true); END;\n"})
     assert res.exit_code == 0, res.output
+
+
+def test_create_schema_authorization_current_user_under_a_set_role_setting_is_refused():
+    # The role comes from the database's setting, so `$user` is unknown.
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+    with pytest.raises(SchemaSourceError):
+        schema_from_sql("CREATE DATABASE appdb;\nALTER DATABASE appdb SET role = 'alice';\n"
+                        "\\connect appdb\n"
+                        "CREATE TABLE public.p (id int) PARTITION BY LIST (id);\n"
+                        "CREATE SCHEMA s AUTHORIZATION CURRENT_USER"
+                        " CREATE TABLE c PARTITION OF p FOR VALUES IN (1);\n")
