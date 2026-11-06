@@ -463,3 +463,33 @@ def test_missing_lsp_extra_raises_clean_error(monkeypatch) -> None:
     result = CliRunner().invoke(main, ["lsp"])
     assert result.exit_code == 2
     assert "pgrls[lsp]" in result.output
+
+
+def test_a_pg_dump_buffer_keeps_its_ranges() -> None:
+    # A psql meta-command (pg_dump's `\restrict`) must not cost the ranges:
+    # findings still land on their defining statement, not on line 0.
+    text = ("\\restrict k\n\n" + _PUBLIC_POLICY + "\n\\unrestrict k\n")
+    by_code = {d.code: d for d in diagnose(text)}
+    assert by_code["SEC002"].range.start.line == 2
+    assert by_code["SEC003"].range.start.line == 4
+
+
+def test_the_lsp_is_scoped_by_the_projects_schemas():
+    from pgrls.config import Config
+    from pgrls.lsp.diagnostics import diagnose
+
+    # As `pgrls lint --sql-file` with the same `[database] schemas`: a
+    # parent outside them is left out, and the child's walk stops there.
+    sql = ("CREATE TABLE a.p (id int) PARTITION BY LIST (id);\n"
+           "ALTER TABLE a.p ENABLE ROW LEVEL SECURITY;\n"
+           "CREATE TABLE b.c PARTITION OF a.p FOR VALUES IN (1);\n")
+    found = [(d.code, d.message) for d in diagnose(sql, config=Config(schemas=["b"]))]
+    assert [code for code, _ in found] == ["SEC001"], found
+    assert "b.c" in found[0][1] and "leaves the scanned schemas" in found[0][1]
+
+
+def test_spans_resolve_names_on_the_search_path_the_buffer_sets():
+    text = ("CREATE SCHEMA app;\nSET search_path TO app;\n"
+            "CREATE TABLE profiles (id int);\n")
+    (diag,) = [d for d in diagnose(text) if d.code == "SEC001"]
+    assert diag.range.start.line == 2

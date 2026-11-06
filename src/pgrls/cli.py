@@ -128,6 +128,8 @@ from pgrls.schema_sources import (
     SchemaSource,
     SchemaSourceError,
     WarnCommand,
+    ends_in_transaction,
+    sets_local_outside_transaction,
     inert_rule_ids,
     reparse_policy_asts,
     resolve_schema,
@@ -584,7 +586,8 @@ def lint(
     # gate below, keeping the two consistent.
     schema_source_inert: frozenset[str] = frozenset()
     offline = _resolve_offline_schema(
-        sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas, command="lint"
+        sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas, command="lint",
+        config_path=config_path,
     )
     if offline is not None:
         if use_migrations or db_url_explicit:
@@ -943,8 +946,12 @@ def _resolve_offline_schema(
     snapshot: str | None,
     schemas_csv: str | None,
     command: WarnCommand,
+    config_path: str | None = None,
+    migrations: bool = False,
 ) -> tuple[Schema, SchemaSource, int | None] | None:
     """Build a Schema from --sql-file / --snapshot, or return None.
+    `migrations`: the files are a migration directory's, each applied in a
+    session of its own (as a migration runner does), not one psql session.
 
     Returns `(schema, source, snapshot_version)` — `snapshot_version` is the
     declared format version of a --snapshot source (used to scope which
@@ -957,11 +964,11 @@ def _resolve_offline_schema(
     """
     if not sql_file and snapshot is None:
         return None
-    schemas = (
-        tuple(s.strip() for s in schemas_csv.split(",") if s.strip())
-        if schemas_csv
-        else None
-    )
+    # The schemas a live run would lint: `--schemas`, else `[database]
+    # schemas` (the model leaves out a partition's parents beyond them).
+    schemas = tuple(
+        _offline_effective_config(config_path=config_path, schemas_csv=schemas_csv).schemas
+    ) or None
     if snapshot is not None:
         try:
             snap_size = os.path.getsize(snapshot)
@@ -978,20 +985,32 @@ def _resolve_offline_schema(
                 "--schemas filter."
             )
     sql_text: str | None = None
+    flag = "--migrations" if migrations else "--sql-file"
     if sql_file:
         parts: list[str] = []
         total = 0
         for entry in sql_file:
             if entry == "-":
-                chunk = sys.stdin.read()
+                try:
+                    # As bytes, like a file: no newline translation, and
+                    # text that is not UTF-8 is a tool error.
+                    raw = getattr(sys.stdin, "buffer", None)
+                    chunk = (raw.read().decode("utf-8") if raw is not None
+                             else sys.stdin.read())
+                except UnicodeDecodeError as exc:
+                    raise ToolError(f"cannot read {flag} -: {exc}") from exc
             else:
                 try:
-                    with open(entry, encoding="utf-8") as fh:
+                    # newline="": psql reads a line to its LF, so a lone CR
+                    # must reach the meta-command check as it is.
+                    with open(entry, encoding="utf-8", newline="") as fh:
                         chunk = fh.read()
-                except OSError as exc:
+                except (OSError, UnicodeDecodeError) as exc:
                     raise ToolError(
-                        f"cannot read --sql-file {entry!r}: {exc}"
+                        f"cannot read {flag} {entry!r}: {exc}"
                     ) from exc
+            # psql skips a byte-order mark opening each file it reads.
+            chunk = chunk.removeprefix("\ufeff")
             total += len(chunk.encode("utf-8"))
             if total > _OFFLINE_MAX_BYTES:
                 raise ToolError(
@@ -999,8 +1018,29 @@ def _resolve_offline_schema(
                     f"{_OFFLINE_MAX_BYTES // (1024 * 1024)} MiB; split it or "
                     "lint against a live database."
                 )
+            if migrations and sets_local_outside_transaction(chunk):
+                raise ToolError(
+                    f"--migrations file {entry!r} sets search_path or the role with SET "
+                    "LOCAL (or set_config(…, true)) outside a transaction: psql "
+                    "ignores it, a runner that wraps each file in a transaction (the "
+                    "Supabase CLI, Flyway, Prisma, `pgrls lint --migrations`) keeps it "
+                    "for the file, so pgrls cannot tell where its names go. Use SET, "
+                    "or wrap the file in BEGIN / COMMIT."
+                )
+            if migrations and ends_in_transaction(chunk):
+                raise ToolError(
+                    f"--migrations file {entry!r} ends inside a transaction "
+                    "(a BEGIN, or an AND CHAIN, with no COMMIT or ROLLBACK after it): migration runners end "
+                    "it otherwise (psql rolls it back; `psql -1` and `pgrls lint "
+                    "--migrations` commit it), so pgrls cannot tell what it "
+                    "leaves. End the transaction in the file."
+                )
             parts.append(chunk)
-        sql_text = "\n".join(parts)
+        # A migration runner applies each file in a session of its own (the
+        # Supabase CLI resets each one), so a baseline dump's empty
+        # search_path does not reach the files after it. psql runs a last
+        # statement with no `;` at the end of its file.
+        sql_text = ("\n;\nROLLBACK;\nDISCARD ALL;\n" if migrations else "\n").join(parts)
     try:
         schema, source, snapshot_version = resolve_schema(
             sql=sql_text, snapshot=snapshot, schemas=schemas
@@ -1848,7 +1888,8 @@ def fix(
     rules = _validate_rule_filter(rules, auto_fixable, kind="auto-fixable ")
 
     offline = _resolve_offline_schema(
-        sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas, command="fix"
+        sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas, command="fix",
+        config_path=config_path,
     )
     if offline is not None:
         _reject_apply_offline(apply, "fix")
@@ -2155,7 +2196,7 @@ def generate(
 
     offline = _resolve_offline_schema(
         sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas,
-        command="generate",
+        command="generate", config_path=config_path,
     )
     if offline is not None:
         _reject_apply_offline(apply, "generate")
@@ -2240,8 +2281,8 @@ def _offline_migration_options(func: Callable[..., Any]) -> Callable[..., Any]:
         default=None,
         help=(
             "Build the snapshot OFFLINE from a migration directory (or a single "
-            ".sql file): its layout-ordered files are concatenated and parsed — "
-            "no database, no Docker (unlike `lint --migrations`, which "
+            ".sql file): its layout-ordered files are parsed in order, each as a session of "
+            "its own (one that ends inside a transaction is refused) — no database, no Docker (unlike `lint --migrations`, which "
             "provisions an ephemeral Postgres). Mutually exclusive with "
             "--sql-file / --snapshot / --database-url."
         ),
@@ -2302,7 +2343,8 @@ def snapshot(
 
     if migrations_path is not None:
         # Static/offline migration-directory read: resolve the layout to an
-        # ordered file list and build the schema from their concatenated DDL —
+        # ordered file list and build the schema from their DDL, each file a
+        # session of its own —
         # no database, no Docker (distinct from `lint --migrations`, which
         # provisions an ephemeral Postgres). Feed the ordered files through the
         # same offline `--sql-file` path below.
@@ -2332,6 +2374,8 @@ def snapshot(
             snapshot=snapshot,
             schemas_csv=schemas,
             command="snapshot",
+            config_path=config_path,
+            migrations=migrations_path is not None,
         )
         assert offline is not None  # a source was given
         schema = offline[0]

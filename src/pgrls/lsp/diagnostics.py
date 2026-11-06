@@ -41,7 +41,10 @@ from pgrls.rules import (
 )
 from pgrls.schema_sources import (
     SchemaSourceError,
+    _check_psql_meta_commands,
+    _model_statements,
     _relation_key,
+    _split_psql_meta_commands,
     inert_rule_ids,
     schema_from_sql,
 )
@@ -72,14 +75,15 @@ def diagnose(text: str, *, config: Config | None = None) -> list[lsp.Diagnostic]
     unconfigured default is used (every rule at its default severity, no
     allowlists) — the shape a plain `pgrls lint --sql-file` produces.
     """
-    try:
-        schema = schema_from_sql(text)
-    except SchemaSourceError:
-        # Unparseable mid-edit buffer: publish nothing, don't surface an error.
-        return []
-
     if config is None:
         config = Config()
+    try:
+        # Scoped by the project's schemas, as `pgrls lint --sql-file` is.
+        schema = schema_from_sql(text, schemas=tuple(config.schemas) or ("public",))
+    except (SchemaSourceError, RecursionError):
+        # Unparseable mid-edit buffer (or one too deep to walk): publish
+        # nothing, don't surface an error.
+        return []
 
     inert = inert_rule_ids("sql")
     overrides = config.severity_overrides
@@ -199,15 +203,22 @@ def _object_spans(text: str) -> _Spans:
     so a `CREATE` keeps its span even if a later `ALTER` references the object.
     """
     spans = _Spans()
+    # As `schema_from_sql` reads it: psql meta-commands blanked, offsets kept,
+    # and names resolved on the search path the buffer sets.
     try:
+        text, commands = _split_psql_meta_commands(text)
+        connects = _check_psql_meta_commands(commands)
         statements = pglast.parse_sql(text)
-    except pglast.parser.ParseError:
+        model = _model_statements(statements, after=lambda raw: not connects or (
+            (raw.stmt_location or 0) + raw.stmt_len if raw.stmt_len else len(text)
+        ) >= connects[-1])
+    except (pglast.parser.ParseError, SchemaSourceError):
         return spans
 
     default_schema = "public"
     length = len(text)
-    for raw in statements:
-        stmt = raw.stmt
+    for item in model:
+        stmt, raw = item.stmt, item.raw
         loc = raw.stmt_location or 0
         # pglast's `stmt_location` points at the whitespace / comment before the
         # statement — advance past leading blanks AND SQL comments so the range

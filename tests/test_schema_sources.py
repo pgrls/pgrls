@@ -100,9 +100,11 @@ def test_inert_rule_ids_live_is_empty():
 
 def test_warnings_none_command_matches_legacy_text():
     msgs = schema_source_warnings("sql", command=None)
-    assert len(msgs) == 2
+    assert len(msgs) == 3
     assert "absence of findings is NOT a proof" in msgs[0]
     assert "Inert on sql= input" in msgs[1]
+    # pg_dump shows an extension's tables as its CREATE EXTENSION alone.
+    assert "extension creates" in msgs[2]
 
 
 def test_warnings_generate_is_generation_scoped():
@@ -137,7 +139,7 @@ def test_warnings_live_source_is_empty():
 def test_warnings_lint_command_uses_corrected_wording():
     """CLI lint/fix path gets corrected wording: --database-url, no snapshot recommendation."""
     msgs = schema_source_warnings("sql", command="lint")
-    assert len(msgs) == 2
+    assert len(msgs) == 3
     # Must mention --database-url or $DATABASE_URL (not the internal arg name)
     assert "--database-url" in msgs[0] or "$DATABASE_URL" in msgs[0], (
         "CLI warning must name --database-url or $DATABASE_URL, not internal arg name"

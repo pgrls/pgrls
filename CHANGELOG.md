@@ -93,6 +93,161 @@ breaking changes — they will be called out in this file.
     does not follow `ALTER TABLE … INHERIT`.
 
 ### Fixed
+- **Offline: a table made under a name the SQL used before is a table of
+  its own.** A name dropped (with its schema too), or renamed away, and
+  made again — by `CREATE TABLE`, `CREATE TABLE … AS` or `SELECT … INTO` —
+  holds a new table, with the new CREATE's columns and links (a partition
+  or child of it takes its columns); what the SQL did to the one before
+  (its RLS flags, policies, grants, constraint renames, a DETACH, a
+  rename) stays with that one, gone or renamed, a table there before the
+  SQL (a rebuild migration's) included. The old RLS carried over (hiding
+  SEC001 on a rebuild migration), and a table made under a name renamed
+  away was lost. `DROP SCHEMA` takes its tables, a view, sequence,
+  materialized view or foreign table dropped frees its name, and an `IF
+  NOT EXISTS` over a view's or sequence's name makes no table (after code,
+  a rename or a DROP between, it is taken to). Not yet followed: a
+  parent's drop taking its partitions (or, with CASCADE, its children), and
+  a drop by `DROP OWNED` or code.
+- **Offline analysis says that an extension's tables are not seen.** pg_dump
+  writes them as `CREATE EXTENSION` alone (PostGIS's `public.spatial_ref_sys`
+  has RLS off), so `--sql-file` lint and MCP `sql=` cannot report on them,
+  and drop a `GRANT` on one; the offline warnings now say so.
+- **`--sql-file` / `pgrls pr` read `pg_dump --schema-only` output.** A
+  dump from `pg_dump` since the August 2025 minor releases (13.22, 14.19,
+  15.14, 16.10, 17.6) opens with a `\restrict <key>` psql meta-command,
+  which is not SQL, so the whole file failed to parse. psql meta-command
+  lines it can ignore (`\restrict`, `\echo`, `\pset`, `\set ON_ERROR_STOP
+  on` and psql's other error and output settings, to a value psql takes, a `\connect` after
+  `CREATE DATABASE`, …), each alone on its line and between statements as
+  Postgres's own lexer reads the file, are now skipped, the LSP's ranges
+  too. They are split on ASCII whitespace, as psql splits them (`\c` and a
+  no-break space is no `\connect`); a line holding a vertical tab, which
+  psql 17 splits on and earlier ones do not, is refused, and so is a
+  search_path string holding one. Inside a `\restrict` psql runs no
+  meta-command but `\unrestrict` with its key, so any other there is
+  refused (pg_dump writes `\unrestrict` before each `\connect`), and so is
+  one psql rejects with an error, at which `ON_ERROR_STOP` stops the run
+  (a `\restrict` with no alphanumeric key or inside another, an `\unrestrict` outside
+  one, a `\pset` or `\timing` argument psql does not take). Any other is refused with an error naming it, since the SQL pgrls
+  would read is not the SQL that runs: a dump with data (`\.` ends its
+  COPY rows, and any `COPY … FROM stdin` reads them from the file), `\i`, `\if`, `\gexec`, any other `\set`, a `\connect` in any form
+  but those pg_dump writes (a name, bare or double-quoted, or
+  `-reuse-previous=on "dbname='…'"`; a conninfo string can set `options` or
+  `client_encoding`; a byte-order mark opening the file is skipped as psql
+  skips it), a second command on the line, a line Postgres reads
+  as inside a string, SQL beside a meta-command that names one of psql's
+  own variables (`:ROW_COUNT`), and `pg_dumpall` output, which connects to one database
+  after another (dump each with `pg_dump`), or a `\connect` after anything
+  but database-level statements (a database's `COMMENT` or `SECURITY
+  LABEL`, pg_dump's `datistemplate = false` UPDATE and a transaction
+  committed before it count, a `SELECT` whose CTE writes does not; psql
+  rolls a transaction open at any `\connect` back, and ends statements by
+  its own rules), a `\connect` to a database or as a role that sets the role
+  its session runs as when a name then resolves on `$user`, one to a database it creates with an encoding other than UTF8
+  (psql then reads the SQL in that encoding; even set back to UTF8,
+  Postgres converts the text to it and, single-byte even as SQL_ASCII, cuts
+  and folds names by byte and locale), or one to a database created with an
+  explicit template other than `template0`. A NUL character, where reading
+  used to stop silently, is refused too. `--sql-file` now reads a lone CR as
+  psql does (part of the line), and a file that is not UTF-8 is a tool
+  error rather than a traceback. Any SQL file that sets `client_encoding`
+  to an encoding such as SJIS or BIG5, or to anything but UTF-8 /
+  SQL_ASCII when the file holds non-ASCII text (an `\encoding` included),
+  or turns `standard_conforming_strings` off or `transform_null_equals` on
+  (by `SET`, `ALTER DATABASE / ROLE … SET`, `set_config()` or an `UPDATE`
+  of `pg_settings` or of a view the SQL defines over it), is refused too:
+  Postgres then reads the text differently from pgrls. And every `ALTER … OWNER TO` the dump
+  writes for a sequence, view or materialized view created a phantom table
+  in the model, with a false SEC001 on it: an `ALTER` on a relation that is
+  not a table, or one that changes nothing pgrls models (`OWNER TO`) on a
+  name it has not seen, no longer creates one. A partition the dump
+  attaches with `ALTER TABLE … ATTACH PARTITION` is now its parent's
+  partition (`DETACH PARTITION` undoes it), not a standalone table with a
+  false SEC001 — when the child and parent were created before the ATTACH
+  (one created again after it is a table of its own, a `CREATE TABLE … AS`
+  too, which a DROP before it removed; a `CREATE … IF NOT EXISTS` of it
+  changes nothing when no DROP (a `CASCADE` of a function, type, access
+  method or extension can take a table too), `DROP OWNED`, rename of a
+  relation or code — a `DO` block, a `CALL`, a function called, a write or
+  a read of a relation (a trigger, rule or view may run code), an event
+  trigger — lies
+  between, which could have taken it; a table made again is a partition
+  or child only as its `CREATE` says (a `CREATE TABLE … AS` none), one an
+  `IF NOT EXISTS` may have skipped only as both it and the table there
+  would be, a `DETACH` before either still applying, and one made under the
+  name of a table renamed away is merged with it, as before), and it
+  follows its parent through a rename. A partition's parents outside the
+  linted schemas (`--schemas`, else `[database] schemas`, in the LSP too)
+  are left out of the model, as live lint does not see them, so the child's
+  ancestor walk stops there. An unqualified name resolves as Postgres
+  resolves it, whatever the scope: on the search path the SQL sets as it
+  runs (`SET [LOCAL] search_path`, `SET SCHEMA`, `RESET`, `DISCARD ALL`, a
+  plain `SELECT set_config('search_path', …)`, `$user` after `SET ROLE`),
+  skipping a schema not created yet, and against the tables as they stand
+  at that statement; a table a policy reads resolves there too, and the
+  elements of `CREATE SCHEMA` go in it, in the order Postgres runs them
+  (sequences, tables, views, indexes, triggers, grants), as its owner
+  (`AUTHORIZATION r`: `$user` and a GRANT's grantor are `r`), and a name
+  an earlier one made is the new schema's. `--schemas app` or `app,public` (and
+  MCP's `schemas`) moved every one into `app`, so findings named tables that
+  did not exist and missed those on `public.*`. What a `ROLLBACK` (or
+  `ROLLBACK TO SAVEPOINT`, or the end of the file in an open transaction)
+  undoes is left out of the model, and a temporary table is no table (nor,
+  once `DISCARD`ed or dropped at COMMIT, hides one; a view on one is
+  temporary too). A view, sequence, matview or foreign table's `SET
+  SCHEMA`, and a rename through a qualified `ALTER INDEX`, are followed; a
+  `DROP SCHEMA` is taken to succeed (so what the model held there was
+  gone), and `DROP OWNED` drops the schemas the SQL gave those roles
+  (`CREATE SCHEMA`, its `AUTHORIZATION`, `ALTER SCHEMA … OWNER TO`, as
+  `REASSIGN OWNED` and a role's rename pass them on, and `CURRENT_USER`
+  as the `SET ROLE` it runs under); a later lookup in one whose owner may
+  be among them, or that the SQL gave no owner (`public` aside), is
+  refused. A name more than one
+  schema on the path holds is refused, since the first may be gone or
+  moved by something pgrls does not follow (a `CASCADE`, a partition
+  dropped with its parent, `DROP OWNED`, an owned sequence or an
+  extension's member dropped with it); after code or such a DROP, so is a
+  name a temporary table and another hold, and one found ahead of a path
+  entry pgrls cannot follow. A search path pgrls
+  cannot follow is refused: one a `\connect`ed database or role may set,
+  `pg_temp` on it ahead of the schema that holds a name, no schema on it at
+  all (`SET search_path = ''` names none) where a relation is created (a dump's empty search_path over SQL after
+  it in one session: Postgres errors; a name looked up there is a
+  catalog's, an `IF EXISTS` no-op or an error, as before; `snapshot
+  --migrations` gives each file a session of its own, as migration runners
+  do: a file that ends inside a transaction is refused (psql rolls it
+  back, `psql -1` and `lint --migrations` commit it), and so is one that
+  sets the search_path or role `SET LOCAL` outside a transaction it begins
+  (psql ignores it; a runner that wraps the file in one keeps it), a last statement with
+  no `;` ends with its file, and a
+  database's or role's `search_path` or role set by `ALTER DATABASE` /
+  `ALTER ROLE … SET` (or `ALTER SYSTEM SET`) is one later files start
+  with, so is not followed there; `lint --migrations` still applies the files in one session), a schema on it
+  that a role the SQL runs as (`SET ROLE` / `SET SESSION AUTHORIZATION`)
+  may have no `USAGE` on where it holds the name (Postgres skips it; one
+  the role owns and did not revoke `USAGE` on, was granted `USAGE` on
+  (under its name then, through a rename; a GRANT made under a SET ROLE by one not its owner, which may grant nothing, credits no one, and one `TO CURRENT_USER` is no grant to PUBLIC; a role a database's or role's setting gives the session is taken to use only what PUBLIC may, besides the schemas it creates in that session, on which its GRANTs count; a RESET of such a setting sets none), or a `public` the SQL did not
+  drop and make again is followed), a `set_config()` of the path or the role anywhere but a
+  plain `SELECT` of literals (a cursor, `PREPARE`, `ALTER … USING`, `ADD
+  COLUMN … DEFAULT`, a partition bound (in a `CREATE SCHEMA` too),
+  `CREATE TABLE … AS EXECUTE`; a definition — a view, a new table's
+  DEFAULT, a policy, a rule, a trigger, a function — runs it when used and is
+  not seen), a literal under a cast that may change it (`::varchar(11)`;
+  `::text` or `::pg_catalog.text` is read, as pg_dump writes it, unless the
+  SQL creates a type so named or renames one to it), a CREATE
+  whose first schema the SQL neither creates nor names a relation in, a
+  schema used before the SQL creates it `IF NOT EXISTS`, and `PREPARE
+  TRANSACTION`; one set by running code (a `DO` block, a function) is not
+  seen, and a role is taken to have no schema of its own unless the SQL
+  creates one (a name resolved on `$user` with no `SET ROLE` after the SQL
+  creates a schema named as its owner — `CREATE SCHEMA AUTHORIZATION r`, or
+  `ALTER SCHEMA r OWNER TO r` as pg_dump writes it — is refused: psql may
+  connect as `r`; and so is `CREATE
+  SCHEMA AUTHORIZATION CURRENT_USER`, named for a role pgrls does not know). `ALTER TABLE … SET SCHEMA` and `ALTER SCHEMA …
+  RENAME` are
+  refused: policies name the table by its old schema. An ATTACH Postgres
+  refuses (of an inheritance child, of a table already attached, to a
+  parent not partitioned) is not modelled.
 - **`pgrls matrix` / `--prove` / `verify` no longer trust a user function
   called by a built-in's name**, in two forms. A quoted name
   holding a dot (`"pg_catalog.casefold"(…)`, `"auth.uid"()`) is one
