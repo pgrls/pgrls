@@ -1632,132 +1632,6 @@ def test_offline_alter_table_drop_column_is_applied():
     assert [c.name for c in t.column_details] == ["id"]
 
 
-def test_offline_alter_column_type_is_applied():
-    # The diff reads a string compared with a column by its type.
-    t = _only("CREATE TABLE t (id int, role text); ALTER TABLE t ALTER COLUMN role TYPE citext;")
-    assert [(c.name, c.data_type) for c in t.column_details][-1] == ("role", "citext")
-
-
-@pytest.mark.parametrize("sql, table", [
-    # The ALTER before the DROP is the old table's.
-    ("CREATE TABLE t (id int, role citext); ALTER TABLE t ALTER COLUMN role TYPE text;"
-     " DROP TABLE t; CREATE TABLE t (id int, role citext);", "t"),
-    # The rebuild's new t is not the renamed old one.
-    ("CREATE TABLE t (id int, role citext); ALTER TABLE t RENAME TO t_old;"
-     " CREATE TABLE t (id int, role text);", "t_old"),
-    # A child re-created as a partition is attached again.
-    ("CREATE TABLE p (id int, role text) PARTITION BY RANGE (id);"
-     " CREATE TABLE t PARTITION OF p FOR VALUES FROM (0) TO (100); ALTER TABLE p DETACH PARTITION t;"
-     " DROP TABLE t; CREATE TABLE t PARTITION OF p FOR VALUES FROM (0) TO (100);"
-     " ALTER TABLE p ALTER COLUMN role TYPE citext;", "t"),
-    # ADD COLUMN IF NOT EXISTS keeps the column there.
-    ("CREATE TABLE t (id int, role citext); ALTER TABLE t ADD COLUMN IF NOT EXISTS role text;", "t"),
-    # A table made in a CREATE SCHEMA is seen.
-    ("CREATE SCHEMA app CREATE TABLE t (id int, role citext);"
-     " CREATE TABLE IF NOT EXISTS app.t (id int, role text);", "t"),
-])
-def test_a_column_type_is_the_one_the_statements_leave_in_order(sql, table):
-    from pgrls.schema_sources import schema_from_sql
-    (t,) = [t for t in schema_from_sql(sql, schemas=("public", "app")).tables if t.name == table]
-    assert {c.name: _diff_type(c) for c in t.column_details}["role"] in ("citext", "unknown")
-
-
-def _diff_type(column):
-    # The type the diff reads a column by: none where pgrls is not sure.
-    return column.data_type if column.type_known else "unknown"
-
-
-@pytest.mark.parametrize("sql", [
-    # A child keeps a column of its own, or one an ONLY drop leaves.
-    "CREATE TABLE p (id int, role text); CREATE TABLE c () INHERITS (p);"
-    " ALTER TABLE p ALTER COLUMN role TYPE citext; ALTER TABLE ONLY p DROP COLUMN role;",
-    # A partitioned parent's DROP takes its partition; one made IF NOT EXISTS
-    # after is new (which pgrls cannot always tell).
-    "CREATE TABLE p (id int, role text) PARTITION BY LIST (id);"
-    " CREATE TABLE c PARTITION OF p FOR VALUES IN (1); DROP TABLE p;"
-    " CREATE TABLE IF NOT EXISTS c (id int, role citext);",
-    # A CREATE TABLE AS lists no types.
-    "CREATE TABLE c AS SELECT 1 AS id, 'a'::citext AS role;"
-    " ALTER TABLE c ADD COLUMN IF NOT EXISTS role text;",
-    # A domain renamed to `text` is no built-in.
-    "CREATE SCHEMA app; CREATE DOMAIN app.d AS citext; ALTER DOMAIN app.d RENAME TO text;"
-    " CREATE TABLE c (id int, role text);",
-    # A base (or shell) type named `text` shadows the built-in.
-    "CREATE TYPE public.text; CREATE TABLE c (id int, role text);",
-    # An imported foreign table may be what an unqualified name finds.
-    "CREATE TABLE c (id int, role citext); IMPORT FOREIGN SCHEMA public FROM SERVER s INTO app;"
-    " ALTER TABLE c ALTER COLUMN role TYPE text;",
-])
-def test_a_column_type_pgrls_cannot_tell_is_unknown(sql):
-    from pgrls.schema_sources import schema_from_sql
-    (t,) = [t for t in schema_from_sql(sql).tables if t.name == "c"]
-    assert {c.name: _diff_type(c) for c in t.column_details}.get("role", "unknown") == "unknown"
-
-
-def test_a_column_type_follows_a_re_create_and_reaches_children():
-    # The diff trusts a type only where pgrls is sure of it; anywhere a table
-    # is made again, moved or takes columns from a parent it is unknown, and
-    # never the stale one.
-    from pgrls.schema_sources import schema_from_sql
-
-    def roles(sql, column="role"):
-        return {t.name: {_diff_type(c) for c in t.column_details if c.name == column}
-                for t in schema_from_sql(sql).tables}
-
-    assert roles("CREATE TABLE t (role text); ALTER TABLE t ALTER COLUMN role TYPE citext;") == {
-        "t": {"citext"}}
-    # A policy's or trigger's rename, and a DROP before the CREATE, leave the
-    # table the one table of its name.
-    assert roles("DROP TABLE IF EXISTS t CASCADE; CREATE TABLE t (role text);"
-                 " ALTER POLICY p ON t RENAME TO q; ALTER TRIGGER g ON t RENAME TO h;") == {
-        "t": {"text"}}
-    # An ALTER reaches the table of its name in the schema an unqualified
-    # name resolves to (the path's first) ...
-    schema = schema_from_sql("CREATE SCHEMA app; SET search_path = app, public;"
-                             " CREATE TABLE t (role text); ALTER TABLE app.t ALTER COLUMN role TYPE citext;")
-    assert {_diff_type(c) for t in schema.tables for c in t.column_details} == {"citext"}
-    # ... and the qualifiers that only name it (ENABLE RLS, an index) do not
-    # count.
-    assert roles("CREATE TABLE public.t (role text); ALTER TABLE t ENABLE ROW LEVEL SECURITY;"
-                 " CREATE INDEX ON t (role);") == {"t": {"text"}}
-    # One naming it in another schema may be of another table (an IF EXISTS
-    # skipped): the type is not trusted.
-    for sql in ("CREATE TABLE t (role citext); ALTER TABLE IF EXISTS legacy.t ALTER COLUMN role TYPE text;",
-                "CREATE TABLE t (role citext); SET search_path = legacy;"
-                " ALTER TABLE IF EXISTS t ALTER COLUMN role TYPE text; RESET search_path;"):
-        assert roles(sql)["t"] <= {"unknown"}, sql
-    # Nor in SQL that may change a type out of the replay's sight: code, a
-    # function whose body runs DDL (a call, trigger or default may run it),
-    # an event trigger, a ROLLBACK; nor one made IF NOT EXISTS.
-    for sql in ("CREATE TABLE t (role text); DO $$ BEGIN ALTER TABLE t ALTER COLUMN role TYPE citext;"
-                " END $$;",
-                "CREATE TABLE t (role text); CREATE FUNCTION m() RETURNS void LANGUAGE plpgsql AS"
-                " $f$ BEGIN ALTER TABLE t ALTER COLUMN role TYPE citext; END $f$; SELECT m();",
-                "CREATE TABLE t (role text); CREATE FUNCTION g() RETURNS event_trigger LANGUAGE plpgsql"
-                " AS $f$ BEGIN END $f$; CREATE EVENT TRIGGER e ON ddl_command_end EXECUTE FUNCTION g();",
-                "CREATE TABLE t (role citext); BEGIN; ALTER TABLE t ALTER COLUMN role TYPE text; ROLLBACK;",
-                "CREATE TABLE IF NOT EXISTS t (role text);"):
-        assert roles(sql) == {"t": {"unknown"}}, sql
-    # A function that runs no DDL (Supabase's handle_new_user) leaves them.
-    assert roles("CREATE TABLE t (role text); CREATE FUNCTION h() RETURNS trigger LANGUAGE plpgsql"
-                 " AS $f$ BEGIN INSERT INTO t VALUES (NEW.role); RETURN NEW; END $f$;") == {
-        "t": {"text"}}
-    for sql, column in (
-        ("CREATE TABLE t (role text); DROP TABLE t; CREATE TABLE t (role citext);", "role"),
-        ("CREATE TABLE t (role text); CREATE TABLE IF NOT EXISTS t (role citext);", "role"),
-        ("CREATE TABLE m (k int, role text) PARTITION BY LIST (k);"
-         " CREATE TABLE m1 PARTITION OF m FOR VALUES IN (1); CREATE TABLE c () INHERITS (m1);"
-         " ALTER TABLE m ALTER COLUMN role TYPE citext;", "role"),
-        ("CREATE TABLE m (k int, role text) PARTITION BY LIST (k); CREATE TABLE m1 (k int, role text);"
-         " ALTER TABLE m ATTACH PARTITION m1 FOR VALUES IN (1); CREATE TABLE c (k int, role text);"
-         " ALTER TABLE c INHERIT m1; ALTER TABLE m ALTER COLUMN role TYPE citext;", "role"),
-        ("CREATE TABLE r (c text); CREATE TABLE rc () INHERITS (r); ALTER TABLE r RENAME TO r2;"
-         " ALTER TABLE r2 ALTER COLUMN c TYPE citext;", "c"),
-    ):
-        for name, kinds in roles(sql, column).items():
-            assert kinds <= {"citext", "unknown"}, (sql, name, kinds)
-
-
 def test_offline_alter_table_rename_is_applied():
     # The finding used to be reported against the pre-rename name — a
     # `pgrls pr` annotation naming a table that does not exist.
@@ -1958,16 +1832,36 @@ def test_offline_constraint_before_a_rebuild_does_not_reach_the_new_table():
     assert {c.name: c.is_nullable for c in t.column_details}["tenant_id"] is True
 
 
-def test_a_type_the_diff_does_not_trust_stays_the_declared_one():
-    # `generate` casts by it and `diff --apply` makes the table with it.
+def test_the_diff_trusts_no_offline_column_type():
+    # Code the SQL runs, or a search_path it sets, may change a column's type
+    # out of sight; the declared type stays for `generate` and `diff --apply`.
     import json
     from pgrls.model import Schema
     from pgrls.schema_sources import schema_from_sql
-    schema = schema_from_sql("CREATE TABLE IF NOT EXISTS d (tenant_id uuid);\n"
-                             "CREATE TABLE IF NOT EXISTS d (tenant_id uuid);\n")
-    (col,) = schema.tables[0].column_details
-    assert (col.data_type, col.type_known) == ("uuid", False)
-    assert "uuid" in schema.to_sql() and "unknown" not in schema.to_sql()
+    schema = schema_from_sql("CREATE TABLE d (tenant_id uuid, email text);\n")
+    assert [(c.data_type, c.type_known) for c in schema.tables[0].column_details] == [
+        ("uuid", False), ("text", False)]
+    assert "uuid" in schema.to_sql()
     # The snapshot carries it to the diff.
     again = Schema.from_snapshot(json.loads(json.dumps(schema.to_snapshot())))
-    assert not again.tables[0].column_details[0].type_known
+    assert not any(c.type_known for c in again.tables[0].column_details)
+
+
+def test_an_offline_diff_reads_a_column_compared_two_ways_by_no_type(tmp_path):
+    # `email` may be citext (an ALTER in a function, a DO block, dblink):
+    # `<> 'admin@x.io'` → `= 'ADMIN@x.io'::text` is no SAFE tightening.
+    import json
+    from click.testing import CliRunner
+    from pgrls.cli import main
+    out = {}
+    for side, using in (("base", "email <> 'admin@x.io'"), ("head", "email = 'ADMIN@x.io'::text")):
+        sql = tmp_path / f"{side}.sql"
+        sql.write_text("CREATE TABLE public.users (id int, email text);\n"
+                       "ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;\n"
+                       f"CREATE POLICY p ON public.users FOR SELECT USING ({using});\n")
+        out[side] = tmp_path / f"{side}.json"
+        res = CliRunner().invoke(main, ["snapshot", "--sql-file", str(sql), "-o", str(out[side])])
+        assert res.exit_code == 0, res.output
+    res = CliRunner().invoke(main, ["diff", str(out["base"]), str(out["head"]), "--format", "json"])
+    kinds = {v["classification"] for v in json.loads(res.stdout)["violations"]}
+    assert "safe" not in kinds, res.stdout
