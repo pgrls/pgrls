@@ -57,6 +57,7 @@ from pglast.enums.primnodes import OnCommitAction
 from pglast.stream import RawStream
 
 from pgrls import ast_utils
+from pgrls._pg_catalog_functions import PG_CATALOG_FUNCTIONS
 from pgrls.model import (
     SNAPSHOT_VERSION,
     Column,
@@ -1061,6 +1062,12 @@ class _Resolver:
         self.code_ran = False
         self.started = False
         self.override: list[str] = []
+        # The schemas the SQL has made a function of each name in so far;
+        # None once something may make, drop or move functions pgrls does not
+        # see (an extension, a DO block, a CALL, DROP OWNED). A name dropped,
+        # renamed or moved (an overload may stay) is no longer followed.
+        self.functions: dict[str, set[str]] | None = {}
+        self.unsure_functions: set[str] = set()
 
     def start(self) -> None:
         if not self.started:
@@ -1400,6 +1407,7 @@ class _Resolver:
     def qualify(self, stmt: Any) -> None:
         """Qualify each relation `stmt` creates or names, and follow what it
         creates, drops and renames."""
+        self._follow_functions(stmt)
         given = {id(rel) for rel, _ in _named_relations(stmt) if rel.schemaname}
         if isinstance(stmt, _pgast.ViewStmt) and stmt.view.relpersistence != "t" and any(
                 isinstance(n, _pgast.RangeVar) and n.relname in self.temp
@@ -1425,6 +1433,7 @@ class _Resolver:
                 rel.schemaname = self.find(rel.relname)[0]
         if isinstance(stmt, (_pgast.CreatePolicyStmt, _pgast.AlterPolicyStmt)):
             self._qualify_policy(stmt)
+            self._qualify_calls(stmt)
         elif isinstance(stmt, _pgast.DropStmt):
             self._drop(stmt)
         elif (isinstance(stmt, _pgast.AlterOwnerStmt)
@@ -1512,6 +1521,67 @@ class _Resolver:
                 if old[1] in self.commit_drop:
                     self.commit_drop.discard(old[1])
                     self.commit_drop.add(stmt.newname)
+
+    def _follow_functions(self, stmt: Any) -> None:
+        """Follow the functions `stmt` makes, drops and moves."""
+        if self.functions is None:
+            return
+        if isinstance(stmt, (_pgast.CreateExtensionStmt, _pgast.AlterExtensionStmt,
+                             _pgast.AlterExtensionContentsStmt, _pgast.DoStmt,
+                             _pgast.CallStmt, _pgast.DropOwnedStmt)):
+            self.functions = None
+        elif isinstance(stmt, _pgast.CreateFunctionStmt) and not stmt.is_procedure:
+            names = [str(getattr(n, "sval", "")) for n in stmt.funcname or ()]
+            try:
+                # (Unqualified, it goes where a CREATE TABLE would.)
+                schema = names[0] if len(names) == 2 else self.create_schema()
+            except SchemaSourceError:
+                schema = None
+            if len(names) > 2 or schema is None or schema == "pg_temp":
+                self.unsure_functions.add(names[-1])
+            else:
+                self.functions.setdefault(names[-1], set()).add(schema)
+        elif isinstance(stmt, _pgast.DefineStmt) and stmt.kind == ObjectType.OBJECT_AGGREGATE:
+            self.unsure_functions.add(str(getattr(stmt.defnames[-1], "sval", "")))
+        elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_SCHEMA:
+            gone = {str(getattr(item, "sval", "")) for item in stmt.objects or ()}
+            for schemas in self.functions.values():
+                schemas -= gone
+        elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType in _ROUTINE_KINDS:
+            self.unsure_functions.update(_routine_name(item) for item in stmt.objects or ())
+        elif isinstance(stmt, _pgast.RenameStmt) and stmt.renameType in _ROUTINE_KINDS:
+            self.unsure_functions.update({_routine_name(stmt.object), stmt.newname or ""})
+        elif (isinstance(stmt, _pgast.AlterObjectSchemaStmt)
+              and stmt.objectType in _ROUTINE_KINDS):
+            self.unsure_functions.add(_routine_name(stmt.object))
+
+    def _qualify_calls(self, stmt: Any) -> None:
+        # An unqualified call in a policy names the function Postgres finds
+        # on the path when the policy is made: one in a schema off the
+        # default path is written qualified (as `pg_get_expr` writes it), so
+        # the rules see `auth.uid()`. Only where it is certain: no built-in
+        # of that name (`pg_catalog` is searched first), and the SQL has made
+        # one in exactly one schema on the path (others are taken to have
+        # none, as for tables).
+        if self.functions is None:
+            return
+        for clause in (stmt.qual, stmt.with_check):
+            for node in _subnodes(clause) if clause is not None else ():
+                if not isinstance(node, _pgast.FuncCall) or len(node.funcname or ()) != 1:
+                    continue
+                name = str(getattr(node.funcname[0], "sval", ""))
+                if name in PG_CATALOG_FUNCTIONS or name in self.unsure_functions:
+                    continue
+                try:
+                    holders = [entry for entry in self._entries()
+                               if entry in self.functions.get(name, ())]
+                    if len(holders) != 1 or holders[0] in ("public", "pg_temp"):
+                        continue
+                    # (A schema the role may not use is skipped.)
+                    self._check_usage(holders[0])
+                except SchemaSourceError:
+                    continue
+                node.funcname = (_pgast.String(sval=holders[0]), node.funcname[0])
 
     def _qualify_policy(self, stmt: Any) -> None:
         # A table a policy reads resolves when the policy is created; one
@@ -1694,6 +1764,17 @@ def _only_defines(stmt: Any) -> bool:
         _pgast.ViewStmt, _pgast.CreateStmt, _pgast.CreatePolicyStmt, _pgast.AlterPolicyStmt,
         _pgast.RuleStmt, _pgast.CreateTrigStmt, _pgast.CreateDomainStmt,
         _pgast.CreateFunctionStmt, _pgast.AlterFunctionStmt))
+
+
+# Object kinds a call may name.
+_ROUTINE_KINDS = frozenset({
+    ObjectType.OBJECT_FUNCTION, ObjectType.OBJECT_ROUTINE, ObjectType.OBJECT_AGGREGATE,
+})
+
+
+def _routine_name(item: Any) -> str:
+    names = getattr(item, "objname", None) or ()
+    return str(getattr(names[-1], "sval", "")) if names else ""
 
 
 # Relation kinds a name resolves among.
@@ -3163,25 +3244,36 @@ def _deparse_or_none(node: Any, written: str | None = None) -> str | None:
 
 def _qualified_written(written: str, node: Any) -> str | None:
     """`written` with the schema the search path resolved each table it
-    reads to (`_Resolver._qualify_policy`, which qualified `node` in place)
-    written in, when that parses back to `node`; else None."""
+    reads, and each function it calls, to (`_Resolver._qualify_policy` /
+    `_qualify_calls`, which qualified `node` in place) written in, when
+    that parses back to `node`; else None."""
     prefix = "SELECT ("
     try:
         parsed = pglast.parse_sql(f"{prefix}{written}) AS _expr")[0].stmt
     except pglast.parser.ParseError:
         return None
-    mine = [n for n in _subnodes(parsed) if isinstance(n, _pgast.RangeVar)]
-    theirs = [n for n in _subnodes(node) if isinstance(n, _pgast.RangeVar)]
-    if len(mine) != len(theirs):
-        return None
     edits = []
-    for a, b in zip(mine, theirs):
-        if a.relname != b.relname:
+    for kind in (_pgast.RangeVar, _pgast.FuncCall):
+        mine = [n for n in _subnodes(parsed) if isinstance(n, kind)]
+        theirs = [n for n in _subnodes(node) if isinstance(n, kind)]
+        if len(mine) != len(theirs):
             return None
-        if not a.schemaname and b.schemaname:
-            if a.location is None or a.location < len(prefix):
-                return None
-            edits.append((a.location - len(prefix), '"' + b.schemaname.replace('"', '""') + '".'))
+        for a, b in zip(mine, theirs):
+            if kind is _pgast.RangeVar:
+                if a.relname != b.relname:
+                    return None
+                schema = b.schemaname if not a.schemaname else None
+            else:
+                # A call `_qualify_calls` qualified: its name, one part more.
+                ours = [getattr(n, "sval", None) for n in a.funcname]
+                given = [getattr(n, "sval", None) for n in b.funcname]
+                if given[-len(ours):] != ours:
+                    return None
+                schema = given[0] if len(given) == len(ours) + 1 else None
+            if schema:
+                if a.location is None or a.location < len(prefix):
+                    return None
+                edits.append((a.location - len(prefix), '"' + schema.replace('"', '""') + '".'))
     if not edits:
         return None
     text = written

@@ -93,6 +93,19 @@ breaking changes — they will be called out in this file.
     does not follow `ALTER TABLE … INHERIT`.
 
 ### Fixed
+- **Offline: an unqualified function call in a policy names the function
+  the search path finds.** Live, `pg_get_expr` writes a call to a function
+  off the default path qualified (`auth.uid()`); offline the call stayed as
+  written (`uid()` under `SET search_path = public, auth`), so SEC004,
+  SEC038, PERF001 and SEC030's tenant binding did not see the auth
+  function. A call is now qualified where it is certain: no `pg_catalog`
+  function has the name (searched first; the names are those of PG 15-18),
+  and the SQL has made one, as it runs up to the policy, in exactly one
+  schema on the path (other schemas are taken to have none, as for
+  tables). A name the SQL drops, renames or moves, or one of an aggregate,
+  is not followed, nor is any after an extension, a `DO` block, a `CALL` or
+  `DROP OWNED` (which may make or drop functions pgrls does not see); a
+  call it cannot settle stays as written.
 - **Offline analysis says that an extension's tables are not seen.** pg_dump
   writes them as `CREATE EXTENSION` alone (PostGIS's `public.spatial_ref_sys`
   has RLS off), so `--sql-file` lint and MCP `sql=` cannot report on them,
