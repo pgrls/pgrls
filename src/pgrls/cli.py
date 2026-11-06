@@ -1020,7 +1020,7 @@ def _resolve_offline_schema(
             if migrations and ends_in_transaction(chunk):
                 raise ToolError(
                     f"--migrations file {entry!r} ends inside a transaction "
-                    "(a BEGIN with no COMMIT or ROLLBACK): migration runners end "
+                    "(a BEGIN, or an AND CHAIN, with no COMMIT or ROLLBACK after it): migration runners end "
                     "it otherwise (psql rolls it back; `psql -1` and `pgrls lint "
                     "--migrations` commit it), so pgrls cannot tell what it "
                     "leaves. End the transaction in the file."

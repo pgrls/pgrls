@@ -3219,3 +3219,31 @@ def test_a_child_takes_the_columns_of_the_table_its_parents_name_holds_then():
         "CREATE TABLE b (new_col int);\nCREATE TABLE c () INHERITS (b);\n")
     c = next(t for t in schema.tables if t.name == "c")
     assert list(c.columns) == ["new_col"]
+
+
+def test_what_the_sql_did_to_a_table_renamed_away_before_a_drop_stays():
+    from pgrls.schema_sources import schema_from_sql
+    tables = {t.name: t for t in schema_from_sql(
+        "CREATE TABLE accounts (id int);\nALTER TABLE accounts ENABLE ROW LEVEL SECURITY;\n"
+        "CREATE POLICY p ON accounts TO anon USING (true);\nGRANT SELECT ON accounts TO anon;\n"
+        "ALTER TABLE accounts RENAME TO accounts_legacy;\nDROP TABLE IF EXISTS accounts;\n"
+        "CREATE TABLE accounts (id int);\n").tables}
+    legacy = tables["accounts_legacy"]
+    assert legacy.rls_enabled and len(legacy.policies) == 1 and legacy.grants
+
+
+def test_a_partition_detached_before_its_parents_drop_stands_alone():
+    from pgrls.schema_sources import schema_from_sql
+    tables = {t.name: t for t in schema_from_sql(
+        "CREATE TABLE p (id int) PARTITION BY RANGE (id);\n"
+        "CREATE TABLE c PARTITION OF p FOR VALUES FROM (0) TO (10);\n"
+        "ALTER TABLE p DETACH PARTITION c;\nDROP TABLE p;\n"
+        "CREATE TABLE p (id int) PARTITION BY RANGE (id);\n").tables}
+    assert tables["c"].partition_of is None
+
+
+def test_a_table_made_again_after_a_drop_has_its_new_columns():
+    from pgrls.schema_sources import schema_from_sql
+    (p,) = schema_from_sql("CREATE TABLE p (x int);\nDROP TABLE p;\n"
+                           "CREATE TABLE p (y int, tenant_id int);\n").tables
+    assert list(p.columns) == ["y", "tenant_id"]
