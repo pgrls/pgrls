@@ -193,9 +193,14 @@ breaking changes — they will be called out in this file.
   entry pgrls cannot follow. A search path pgrls
   cannot follow is refused: one a `\connect`ed database or role may set,
   `pg_temp` on it ahead of the schema that holds a name, no schema on it at
-  all where a name is created or looked up (a dump's empty search_path over
-  SQL after it in one session: Postgres errors; `snapshot --migrations`
-  gives each file a session of its own, as migration runners do), a schema on it
+  all where a relation is created (a dump's empty search_path over SQL after
+  it in one session: Postgres errors; a name looked up there is a
+  catalog's, an `IF EXISTS` no-op or an error, as before; `snapshot
+  --migrations` gives each file a session of its own, as migration runners
+  do: a transaction a file leaves open is rolled back at its end, and a
+  database's or role's `search_path` or role set by `ALTER DATABASE` /
+  `ALTER ROLE … SET` is one later files start with, so is not followed
+  there; `lint --migrations` still applies the files in one session), a schema on it
   that a role the SQL runs as (`SET ROLE` / `SET SESSION AUTHORIZATION`)
   may have no `USAGE` on where it holds the name (Postgres skips it; one
   the role owns and did not revoke `USAGE` on, was granted `USAGE` on

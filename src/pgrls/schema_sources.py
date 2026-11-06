@@ -821,17 +821,15 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
         if not after(raw):
             # Another session's: what it leaves the next one is a database's
             # or role's search_path setting.
-            if isinstance(raw.stmt, (_pgast.AlterDatabaseSetStmt, _pgast.AlterRoleSetStmt)):
-                name = (raw.stmt.setstmt.name or "").lower()
-                reset_all = raw.stmt.setstmt.kind == VariableSetKind.VAR_RESET_ALL
-                if reset_all or name == "search_path":
-                    resolver.inherited = True
-                if reset_all or name == "role":
-                    # The role the next session runs as, and so `$user`.
-                    resolver.inherited_role = True
+            path, role = _sets_for_next_session(raw.stmt)
+            resolver.inherited |= path
+            resolver.inherited_role |= role
             continue
         resolver.start()
         stmt = raw.stmt
+        path, role = _sets_for_next_session(stmt)
+        resolver.next_inherited |= path
+        resolver.next_inherited_role |= role
         if isinstance(stmt, _pgast.CreateSchemaStmt):
             schema = _schema_created(stmt)
             if schema not in resolver.schemas or schema in resolver.unsure:
@@ -938,6 +936,17 @@ def _may_be(owner: str | None, roles: AbstractSet[str | None]) -> bool:
         owner is not None and None in roles)
 
 
+def _sets_for_next_session(stmt: Any) -> tuple[bool, bool]:
+    """Whether a statement sets the search_path, and the role, a session
+    started after it begins with (a database's or role's setting)."""
+    if not isinstance(stmt, (_pgast.AlterDatabaseSetStmt, _pgast.AlterRoleSetStmt)):
+        return False, False
+    name = (stmt.setstmt.name or "").lower()
+    reset_all = stmt.setstmt.kind == VariableSetKind.VAR_RESET_ALL
+    # The role the next session runs as is `$user` too.
+    return reset_all or name == "search_path", reset_all or name == "role"
+
+
 class _Resolver:
     """The session state that decides where a relation name resolves, as the
     statements run in order."""
@@ -975,6 +984,11 @@ class _Resolver:
         self.in_transaction = False
         self.inherited = False
         self.inherited_role = False
+        # A database's or role's setting the SQL makes: a session after it
+        # (`snapshot --migrations`' next file, from its DISCARD ALL) starts
+        # with it.
+        self.next_inherited = False
+        self.next_inherited_role = False
         # Code ran (a DO block, a CALL, a function): it may have dropped a
         # relation the model still has.
         self.code_ran = False
@@ -1032,6 +1046,10 @@ class _Resolver:
             if stmt.target in (DiscardMode.DISCARD_ALL, DiscardMode.DISCARD_TEMP):
                 self._discard_temp(set(self.temp))
             if stmt.target == DiscardMode.DISCARD_ALL:
+                # (In the same session its defaults are those it connected
+                # with: taking a setting made since is only more cautious.)
+                self.inherited |= self.next_inherited
+                self.inherited_role |= self.next_inherited_role
                 self._set("search_path", self._default(), local=False)
                 self._set("role", None, local=False)
                 self._set("auth", None, local=False)
@@ -1152,8 +1170,10 @@ class _Resolver:
             raise SchemaSourceError(
                 "bad_sql",
                 "the SQL connects to a database or as a role that sets "
-                "search_path; pgrls cannot tell which schema an unqualified "
-                "name is in. Set it after the \\connect, or qualify the names.",
+                "search_path (a \\connect, or a later migration file's session "
+                "after an ALTER DATABASE / ALTER ROLE … SET); pgrls cannot tell "
+                "which schema an unqualified name is in. Set it after, or "
+                "qualify the names.",
             )
         role = self._get("role") or self._get("auth")
         for entry in path:
@@ -1164,7 +1184,9 @@ class _Resolver:
                     raise SchemaSourceError(
                         "bad_sql",
                         "the SQL connects to a database or as a role that sets the "
-                        "role it runs as, and resolves a name on \"$user\"; pgrls "
+                        "role it runs as (a \\connect, or a later migration file's "
+                        "session after an ALTER … SET role), and resolves a name on "
+                        "\"$user\"; pgrls "
                         "cannot tell which schema that is. Qualify the names.",
                     )
                 if role is None and self.for_roles & self.schemas:
@@ -1211,6 +1233,11 @@ class _Resolver:
         """Where an unqualified CREATE puts its relation (or where a name
         not found would be, `looking_up`)."""
         first: str | None = next(iter(self._entries()), None)
+        if (first is None or first == "pg_catalog") and looking_up:
+            # Not one the SQL made: a catalog's (pg_dump leaves `pg_roles`
+            # unqualified under its empty path), an IF EXISTS no-op, or an
+            # error.
+            return _NOWHERE
         if first is None or first == "pg_catalog":
             # "no schema has been selected to create in", or a catalog
             # Postgres refuses to create in: the statement errors, which
@@ -1218,11 +1245,11 @@ class _Resolver:
             # left in force over SQL after it, say).
             raise SchemaSourceError(
                 "bad_sql",
-                f"the SQL {'names' if looking_up else 'creates'} a relation with no "
-                f"schema on search_path to {'find' if looking_up else 'create'} it in "
-                f"(Postgres errors; a dump sets search_path to '' and SQL after it "
-                f"in the same session sees that); qualify the names, or lint the "
-                f"files apart.",
+                "the SQL creates a relation with no schema on search_path to "
+                "create it in (Postgres errors; a dump sets search_path to '' "
+                "and SQL after it in the same psql session sees that); qualify "
+                "the names, or give a migration directory to `snapshot "
+                "--migrations`, which runs each file in a session of its own.",
             )
         if first not in self.schemas and first not in self.created and first not in self.named:
             # Postgres creates in it if it exists, else in the next one.

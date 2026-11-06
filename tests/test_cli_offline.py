@@ -1691,7 +1691,7 @@ def test_a_path_naming_pg_temp_after_a_schema_finds_the_schema_first():
 def test_a_temp_table_on_a_connected_databases_path_is_refused():
     # The database may set `public, pg_temp`, which finds public.a first.
     from pgrls.schema_sources import SchemaSourceError, schema_from_sql
-    with pytest.raises(SchemaSourceError, match=r"sets search_path.*after the \\connect,"):
+    with pytest.raises(SchemaSourceError, match=r"sets search_path \(a \\connect"):
         schema_from_sql(
             "CREATE DATABASE d;\nALTER DATABASE d SET search_path = public, pg_temp;\n"
             "\\connect d\nCREATE TABLE public.a (id int);\n"
@@ -2382,6 +2382,60 @@ def test_a_name_with_no_schema_to_go_to_is_refused():
     with pytest.raises(SchemaSourceError, match="no schema on search_path"):
         schema_from_sql("SELECT pg_catalog.set_config('search_path', '', false);\n"
                         "CREATE TABLE x (id int);\n")
+
+
+@pytest.mark.parametrize("looked_up", [
+    # pg_dump leaves a catalog relation unqualified under its empty path.
+    "CREATE POLICY p ON public.t FOR SELECT USING (EXISTS (SELECT 1 FROM pg_roles r "
+    "WHERE r.rolname = current_user AND r.rolsuper));\n",
+    "DROP TABLE IF EXISTS foo;\nDROP POLICY IF EXISTS p ON foo;\n"
+    "ALTER TABLE IF EXISTS foo ENABLE ROW LEVEL SECURITY;\n",
+    "GRANT SELECT ON pg_authid TO postgres;\n",
+])
+def test_a_name_looked_up_with_no_schema_on_the_path_is_not_refused(looked_up):
+    from pgrls.schema_sources import schema_from_sql
+    schema = schema_from_sql(
+        "CREATE TABLE public.t (id int, owner text);\n"
+        "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+        "SELECT pg_catalog.set_config('search_path', '', false);\n" + looked_up)
+    assert [t.name for t in schema.tables] == ["t"]
+
+
+def _migrations_snapshot(tmp_path, files):
+    import json
+    from click.testing import CliRunner
+    from pgrls.cli import main
+    mig = tmp_path / "migrations"
+    mig.mkdir()
+    for name, text in files.items():
+        (mig / name).write_text(text)
+    out = tmp_path / "s.json"
+    res = CliRunner().invoke(main, ["snapshot", "--migrations", str(mig), "-o", str(out)])
+    return res, (json.loads(out.read_text()) if res.exit_code == 0 else None)
+
+
+@pytest.mark.parametrize("later", [
+    "CREATE TABLE g (id int);\n",
+    "CREATE TABLE g (id int);\nBEGIN;\nCREATE TABLE h (id int);\nROLLBACK;\n",
+])
+def test_a_transaction_a_migration_file_leaves_open_ends_with_it(tmp_path, later):
+    res, snap = _migrations_snapshot(tmp_path, {
+        "001_a.sql": "CREATE TABLE a1 (id int);\nBEGIN;\nCREATE TABLE e (id int);\n",
+        "002_b.sql": later,
+    })
+    assert res.exit_code == 0, res.output
+    assert {t["name"] for t in snap["tables"]} == {"a1", "g"}
+
+
+def test_a_role_setting_a_migration_makes_is_not_followed_in_later_files(tmp_path):
+    # The next file's session starts with it: pgrls cannot tell where the
+    # unqualified table goes (Postgres puts it in app).
+    res, _ = _migrations_snapshot(tmp_path, {
+        "001_a.sql": "CREATE SCHEMA app;\nALTER ROLE postgres SET search_path = app, public;\n",
+        "002_b.sql": "CREATE TABLE t (id int);\n",
+    })
+    assert res.exit_code != 0
+    assert "search_path" in res.output
 
 
 def test_each_migration_file_is_a_session_of_its_own(tmp_path):

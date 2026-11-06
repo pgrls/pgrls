@@ -1019,8 +1019,9 @@ def _resolve_offline_schema(
             parts.append(chunk)
         # A migration runner applies each file in a session of its own (the
         # Supabase CLI resets each one), so a baseline dump's empty
-        # search_path does not reach the files after it.
-        sql_text = ("\nDISCARD ALL;\n" if migrations else "\n").join(parts)
+        # search_path does not reach the files after it, and a transaction
+        # a file leaves open ends with it, rolled back.
+        sql_text = ("\nROLLBACK;\nDISCARD ALL;\n" if migrations else "\n").join(parts)
     try:
         schema, source, snapshot_version = resolve_schema(
             sql=sql_text, snapshot=snapshot, schemas=schemas
@@ -2261,8 +2262,8 @@ def _offline_migration_options(func: Callable[..., Any]) -> Callable[..., Any]:
         default=None,
         help=(
             "Build the snapshot OFFLINE from a migration directory (or a single "
-            ".sql file): its layout-ordered files are concatenated and parsed — "
-            "no database, no Docker (unlike `lint --migrations`, which "
+            ".sql file): its layout-ordered files are parsed in order, each as a session of "
+            "its own (a transaction it leaves open is rolled back) — no database, no Docker (unlike `lint --migrations`, which "
             "provisions an ephemeral Postgres). Mutually exclusive with "
             "--sql-file / --snapshot / --database-url."
         ),
