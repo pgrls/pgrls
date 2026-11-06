@@ -28,7 +28,6 @@ that absence-of-finding is NOT proof.
 from __future__ import annotations
 
 import contextlib
-import copy
 import dataclasses
 
 import json
@@ -576,10 +575,34 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     def gone_between(after: int, before: int) -> bool:
         return any(after < r < before for r in removals)
 
-    made = _Made(statements, default_schema)
-
     # Pass 1: CREATE TABLE (plus the two data-derived forms).
+    # (Stepped a statement behind: as each runs, it holds what came before.)
+    made = _Holds(default_schema)
+
+    # Each table by the CREATE that made it. One made under a name the SQL
+    # gave something before (a table dropped or renamed away, or renamed
+    # in, as pass 2 will follow) waits to take that name until pass 2
+    # reaches its CREATE; the first by a name takes it now, so a policy or
+    # grant before its CREATE still finds it.
+    by_made: dict[int, _TableBuilder] = {}
+    unborn: dict[int, tuple[tuple[str, str], _TableBuilder]] = {}
+
+    def place(key: tuple[str, str], builder: _TableBuilder, index: int) -> None:
+        by_made[index] = builder
+        if key in tables or key in made.ever:
+            unborn[index] = (key, builder)
+        else:
+            tables[key] = builder
+
+    def no_op_over(stmt: Any, key: tuple[str, str], index: int) -> bool:
+        # IF NOT EXISTS of a name another relation (a view, a sequence)
+        # holds, with nothing that may have removed it between.
+        return (getattr(stmt, "if_not_exists", False) and key not in tables
+                and key in made.holds and not gone_between(made.holds[key], index))
+
     for index, raw in enumerate(statements):
+        if index:
+            made.step(statements[index - 1].stmt, index - 1)
         stmt = raw.stmt
         kind = type(stmt).__name__
         if kind != "CreateStmt":
@@ -595,34 +618,30 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             if created is None:
                 continue
             key = _relation_key(created, default_schema)
-            if key is None:
+            if key is None or no_op_over(stmt, key, index):
                 continue
-            if key in tables:
+            held = made.holds.get(key)
+            current = by_made.get(held) if held is not None else None
+            if current is not None:
                 # As a re-CREATE below: the table now, unless an IF NOT
                 # EXISTS skips while it is there.
                 if not (getattr(stmt, "if_not_exists", False)
-                        and not gone_between(tables[key].created_at, index)):
-                    if not _renamed_between(statements, key, tables[key].created_at, index,
+                        and not gone_between(current.created_at, index)):
+                    if not _renamed_between(statements, key, current.created_at, index,
                                             default_schema):
                         # A table made from a query is no partition or child.
-                        tables[key].partition_of = None
-                        tables[key].inherits = []
-                    tables[key].created_at = index
+                        current.partition_of = None
+                        current.inherits = []
+                    current.created_at = index
                 continue
-            tables[key] = _TableBuilder(
-                schema=key[0], name=key[1], created_at=index
-            )
+            place(key, _TableBuilder(schema=key[0], name=key[1], created_at=index), index)
             continue
         key = _relation_key(stmt.relation, default_schema)
-        if key is None:
+        if key is None or no_op_over(stmt, key, index):
             continue
-        if key in tables and _dropped_between(
-                statements, key, tables[key].created_at, index, default_schema) and not (
-                _renamed_between(statements, key, tables[key].created_at, index, default_schema)):
-            # Dropped and made again: a table of its own, with this CREATE's
-            # columns and links.
-            del tables[key]
-        if key in tables:
+        held = made.holds.get(key)
+        current = by_made.get(held) if held is not None else None
+        if current is not None:
             # A second CREATE for the same relation: `IF NOT EXISTS` (a no-op
             # in Postgres), a re-CREATE after an intervening DROP, or DDL that
             # would error outright. The first definition's COLUMNS stand —
@@ -633,10 +652,10 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             # CREATE` keeps the table, `CREATE; CREATE; DROP` removes it.
             # One `IF NOT EXISTS` skips while the table is there (with no
             # DROP since), so an ATTACH / DETACH before it still applies.
-            if stmt.if_not_exists and not gone_between(tables[key].created_at, index):
+            if stmt.if_not_exists and not gone_between(current.created_at, index):
                 continue
-            previous = tables[key].created_at
-            tables[key].created_at = index
+            previous = current.created_at
+            current.created_at = index
             # A table made again is a partition or child only as this CREATE
             # says (the ATTACH / DETACH before it is the old one's); one that
             # may also be the old table (an IF NOT EXISTS after code, not
@@ -648,22 +667,21 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             new_inherits = [] if partition else again
             if stmt.if_not_exists and not _dropped_between(statements, key, previous, index,
                                                            default_schema):
-                if tables[key].partition_of != new_parent:
+                if current.partition_of != new_parent:
                     new_parent = None
-                new_inherits = [p for p in new_inherits if p in tables[key].inherits]
+                new_inherits = [p for p in new_inherits if p in current.inherits]
             if new_parent is not None and _is_below(tables, new_parent, key):
                 new_parent = None  # an ATTACH would refuse the cycle
             if _renamed_between(statements, key, previous, index, default_schema):
                 # The model merges it with the table renamed away, whose
                 # links these would wrongly become: keep the old ones.
                 continue
-            tables[key].partition_of = new_parent
-            tables[key].inherits = [p for p in new_inherits if not _is_below(tables, p, key)]
+            current.partition_of = new_parent
+            current.inherits = [p for p in new_inherits if not _is_below(tables, p, key)]
             continue
         builder = _TableBuilder(schema=key[0], name=key[1], created_at=index)
-        builder.columns_from = index
         builder.partitioned = getattr(stmt, "partspec", None) is not None
-        tables[key] = builder
+        place(key, builder, index)
         # Declarative partition child (`PARTITION OF parent`) and classic
         # `INHERITS (...)` children both arrive as `inhRelations`; the
         # `partbound` clause is what distinguishes them. The model keeps them
@@ -687,15 +705,12 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         # already populated. Without this a partition child modelled offline
         # has zero columns and every column-keyed rule silently skips it.
         for parent_key in parents:
-            # Pass 1 holds a table under the name it was made with: a parent
-            # renamed before this CREATE is found under that one, and only
-            # by the CREATE whose columns its builder holds (not one made
-            # again, which the builder merges).
-            origin = made.origin(parent_key, index)
-            if origin is None:
-                continue
-            parent = tables.get(origin[0])
-            if parent is None or parent.columns_from != origin[1]:
+            # The table the name holds as this CREATE runs (pass 1 keeps a
+            # table under the name it was made with: one renamed to it is
+            # found by its CREATE, as is one made again).
+            held = made.holds.get(parent_key)
+            parent = by_made.get(held) if held is not None else None
+            if parent is None:
                 continue
             for col in parent.columns:
                 if not any(c.name == col.name for c in builder.columns):
@@ -736,51 +751,15 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
                 if _only_no_inherit_not_null([elt]):
                     builder.no_inherit_not_null.add(col_name)
 
-    # A table dropped and made again is a table of its own: what the SQL did
-    # to the one before (its RLS flags, policies, grants) is gone with it.
-    drops: dict[Any, list[int]] = {}  # a table's key, or a schema's name
-    for index, raw in enumerate(statements):
-        stmt = raw.stmt
-        if isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_SCHEMA:
-            for item in stmt.objects or ():
-                drops.setdefault(getattr(item, "sval", None), []).append(index)
-        elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_TABLE:
-            for n in stmt.objects or ():
-                if _drop_name_parts(n):
-                    drops.setdefault(_drop_table_key(_drop_name_parts(n), default_schema),
-                                     []).append(index)
-    last_drop = {key: max(found) for key, builder in tables.items()
-                 if (found := [i for i in drops.get(key, []) + drops.get(key[0], [])
-                               if i < builder.created_at])}
-
-    def before_last_drop(relation: Any, index: int) -> bool:
-        key = _relation_key(relation, default_schema) if relation is not None else None
-        # (Not one renamed away first: the SQL did it to that table.)
-        return key is not None and index < last_drop.get(key, -1) and not _renamed_between(
-            statements, key, index, last_drop[key], default_schema)
-
     # Pass 2: ALTER TABLE (RLS toggles), CREATE POLICY, GRANT, RENAME.
     for index, raw in enumerate(statements):
+        if index in unborn:
+            # A table made again (dropped, or renamed away, before): what the
+            # SQL did to the one before stays with it, gone or renamed.
+            key, builder = unborn.pop(index)
+            tables[key] = builder
         stmt = raw.stmt
         kind = type(stmt).__name__
-        if kind in ("AlterTableStmt", "CreatePolicyStmt", "AlterPolicyStmt") and not (
-                # A DETACH frees a partition that outlives its parent's drop.
-                kind == "AlterTableStmt" and any(
-                    getattr(c, "subtype", None) == AlterTableType.AT_DetachPartition
-                    for c in stmt.cmds or ())) and \
-                before_last_drop(getattr(stmt, "relation", None) or getattr(stmt, "table", None),
-                                 index):
-            continue
-        if kind == "GrantStmt" and any(isinstance(obj, _pgast.RangeVar)
-                                       and before_last_drop(obj, index)
-                                       for obj in stmt.objects or ()):
-            if all(isinstance(obj, _pgast.RangeVar) and before_last_drop(obj, index)
-                   for obj in stmt.objects or ()):
-                continue
-            stmt = copy.copy(stmt)
-            stmt.objects = tuple(obj for obj in stmt.objects
-                                 if not (isinstance(obj, _pgast.RangeVar)
-                                         and before_last_drop(obj, index)))
         if kind == "AlterTableStmt":
             _apply_alter_table(stmt, tables, default_schema, non_tables=non_tables,
                                stmt_index=index)
@@ -809,6 +788,37 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             up = tables[up].partition_of
     return Schema(tables=tuple(b.build() for k, b in tables.items()
                                if k not in unseen and k[0] != _NOWHERE))
+
+
+class _Holds:
+    """Which CREATE made the relation each name holds, as the statements
+    run: one made (an IF NOT EXISTS, or a CREATE, of a name held is a
+    no-op or an error), renamed, or dropped (with its schema too)."""
+
+    def __init__(self, default_schema: str) -> None:
+        self.default_schema = default_schema
+        self.holds: dict[tuple[str, str], int] = {}
+        self.ever: set[tuple[str, str]] = set()  # a name anything has held
+
+    def step(self, stmt: Any, index: int) -> None:
+        for rel, creates in _named_relations(stmt):
+            key = _relation_key(rel, self.default_schema) if creates else None
+            if key is not None and key not in self.holds:
+                self.holds[key] = index
+                self.ever.add(key)
+        if (isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None
+                and stmt.renameType in _RELATION_KINDS and stmt.newname
+                and (old := _relation_key(stmt.relation, self.default_schema)) in self.holds):
+            self.holds[(old[0], stmt.newname)] = self.holds.pop(old)
+            self.ever.add((old[0], stmt.newname))
+        elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_TABLE:
+            for n in stmt.objects or ():
+                if _drop_name_parts(n):
+                    self.holds.pop(_drop_table_key(_drop_name_parts(n), self.default_schema), None)
+        elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_SCHEMA:
+            gone = {getattr(item, "sval", None) for item in stmt.objects or ()}
+            for key in [k for k in self.holds if k[0] in gone]:
+                del self.holds[key]
 
 
 class _Stmt:
@@ -1822,6 +1832,9 @@ class _TableBuilder:
         # Index of the statement that created this table, so a `DROP TABLE`
         # appearing EARLIER in the input cannot remove a LATER re-CREATE.
         self.created_at = created_at
+        # The CREATE that made it (and its columns): `created_at` advances
+        # to a CREATE merged into it, this does not.
+        self.columns_from = created_at
         self.rls_enabled = False
         self.force_rls = False
         self.columns: list[Column] = []
@@ -1838,8 +1851,6 @@ class _TableBuilder:
         # Every name the table, or a parent it inherits a NOT NULL from, has
         # had: an unnamed NOT NULL keeps the name it got at the time.
         self.former_names: list[str] = [name]
-        # The CREATE its columns are from (-1: none).
-        self.columns_from = -1
         # Columns NOT NULL only through a `NO INHERIT` constraint: an
         # `INHERITS` child does not get it.
         self.no_inherit_not_null: set[str] = set()
@@ -2189,46 +2200,6 @@ def _drops(stmt: Any, key: tuple[str, str], default_schema: str) -> bool:
     return stmt.removeType == ObjectType.OBJECT_TABLE and any(
         _drop_table_key(_drop_name_parts(n), default_schema) == key
         for n in stmt.objects or () if _drop_name_parts(n))
-
-
-class _Made:
-    """Which CREATE made the relation each name holds, as the statements
-    run (made, an IF NOT EXISTS of a name held a no-op, renamed, dropped),
-    read where a CREATE names its parents."""
-
-    def __init__(self, statements: Any, default_schema: str) -> None:
-        holds: dict[tuple[str, str], tuple[tuple[str, str], int]] = {}
-        self.parents: dict[tuple[int, tuple[str, str]], tuple[tuple[str, str], int]] = {}
-        for index, raw in enumerate(statements):
-            stmt = raw.stmt
-            if isinstance(stmt, _pgast.CreateStmt):
-                for rel in stmt.inhRelations or ():
-                    if (key := _relation_key(rel, default_schema)) in holds:
-                        self.parents[index, key] = holds[key]
-            for rel, creates in _named_relations(stmt):
-                key = _relation_key(rel, default_schema) if creates else None
-                if key is not None and not (getattr(stmt, "if_not_exists", False)
-                                            and key in holds):
-                    holds[key] = (key, index)
-            if (isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None
-                    and stmt.renameType in _RELATION_KINDS and stmt.newname
-                    and (old := _relation_key(stmt.relation, default_schema)) in holds):
-                # (One of a name held by nothing is an IF EXISTS no-op.)
-                holds[(old[0], stmt.newname)] = holds.pop(old)
-            elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_TABLE:
-                for n in stmt.objects or ():
-                    if _drop_name_parts(n):
-                        holds.pop(_drop_table_key(_drop_name_parts(n), default_schema), None)
-            elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_SCHEMA:
-                gone = {getattr(item, "sval", None) for item in stmt.objects or ()}
-                for key in [k for k in holds if k[0] in gone]:
-                    del holds[key]
-
-    def origin(self, key: tuple[str, str], index: int) -> tuple[tuple[str, str], int] | None:
-        """The name the relation `key` names at the CREATE at `index` (a
-        parent it names) was made with, and the CREATE that made it; None
-        when the SQL made none."""
-        return self.parents.get((index, key))
 
 
 def _renamed_between(statements: Any, key: tuple[str, str], after: int, before: int,
