@@ -512,6 +512,13 @@ def test_a_cast_of_a_coalesce_is_no_proof():
     # A member holding a column is compared alone, so the literals meet as
     # text there: still a leak (`'1' = '01'` text is FALSE, `role` decides).
     assert prove_anon_isolation(parse_expr("'admin' IN (role, 'owner')"))[0] == "leak"
+    # ... but in a sub-select the column is the outer query's, which the IN
+    # types with the others (`'1'::int = ANY (ARRAY[n, 1])`).
+    using = f"{t} OR ((SELECT '1' IN (n, '01')) AND n = '7')"
+    assert prove_anon_isolation(parse_expr(using))[0] != "isolated"
+    assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated"
+    assert _classify("s2 = 'a' AND tier = '5'",
+                     "(s2 = 'a' OR (SELECT '1' IN (tier, '01'))) AND tier = '5'") is None
     # A COALESCE of a column and a bare literal still reads exactly.
     assert prove_anon_isolation(parse_expr(f"{t} AND COALESCE(level, 0) < 3"))[0] == "isolated"
     # The session identity's cast keeps its proof.

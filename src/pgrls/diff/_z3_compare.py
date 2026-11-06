@@ -250,6 +250,9 @@ class _Context:
         # Inside a list one of whose members rounds the others (off the diff
         # path), so no comparison in it is read exactly.
         self.kin_rounded = 0
+        # How many scalar sub-selects deep the translation is: a column there
+        # is the outer query's, which Postgres's IN takes for no column.
+        self.subselect_depth = 0
         # Diff path: per column name, how each comparison of it with a
         # string read the string (`bare`, `typed`, `as <type>`); see
         # `_note_string_read`.
@@ -1731,7 +1734,12 @@ def _anon_3vl(
             return _TV(is_true=z3.And(result.is_true, z3.Not(no_row)),
                        is_null=z3.Or(result.is_null, no_row))
         return dataclasses.replace(result, is_null=z3.Or(result.is_null, no_row))
-    node = inner
+    if inner is not node:
+        ctx.subselect_depth += 1
+        try:
+            return _anon_3vl(inner, ctx, auth_funcs, assertions)
+        finally:
+            ctx.subselect_depth -= 1
 
     # --- auth-context leaf: auth.uid()/role()/jwt(), current_setting(...),
     # current_user, session_user. Checked before the generic FuncCall
@@ -2322,9 +2330,11 @@ def _anon_any_array(
         # text may not show) compares as text there, and as itself here.
         return None
     # Postgres types an array's elements together, and an `IN` list's
-    # members that hold no column (two or more of them) with the left side;
-    # a member holding a column it compares with the left side alone.
-    together = elements if isinstance(arr, A_ArrayExpr) else [
+    # members that hold no column of its own query (two or more of them)
+    # with the left side; a member holding one it compares with the left
+    # side alone. In a sub-select (one with no FROM: a column is the outer
+    # query's) every member holds none.
+    together = elements if isinstance(arr, A_ArrayExpr) or ctx.subselect_depth else [
         e for e in elements if not any(isinstance(n, ColumnRef) for n in _ast_nodes(e))]
     if _literal_kind(node.lexpr) == "bare" and len(together) > 1 \
             and any(_literal_kind(e) == "bare" for e in together) \
