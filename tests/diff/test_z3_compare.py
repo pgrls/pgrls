@@ -1900,3 +1900,30 @@ def test_a_list_of_two_or_more_values_decides_nothing_in_a_diff():
     assert compare_predicates("tenant_id = auth.uid()", "tenant_id IN (auth.uid(), user_id)",
                               column_types={"tenant_id": "uuid", "user_id": "uuid"}) == (
         "semantic_loosened")
+
+
+def test_a_json_field_read_or_a_nullif_is_an_opaque_value_in_a_diff():
+    # `auth.jwt() ->> 'org_id'` and `NULLIF(…)` are values the diff cannot
+    # model exactly, but the same one on both sides cancels: a migration that
+    # widens the clause beside it is still a loosening.
+    from pgrls.diff.ast_compare import compare_predicates
+    for value in ("org_id = (auth.jwt() ->> 'org_id')::uuid",
+                  "org_id = ((auth.jwt() ->> 'org_id'::text))::uuid",
+                  "org_id = (auth.jwt() -> 'app_metadata' ->> 'org_id')::uuid",
+                  "org_id = (auth.jwt() #>> '{app_metadata,org_id}')::uuid",
+                  "org_id = (auth.jwt() #> '{app_metadata,org_id}')::text",
+                  "sub = ((current_setting('request.jwt.claims', true))::jsonb ->> 'sub')::uuid",
+                  "t = NULLIF(current_setting('app.t', true), '')::uuid",
+                  "k = COALESCE(auth.jwt() ->> 'k', '')",
+                  "k = auth.jwt() ->> 'k'",
+                  "(meta ->> 'flag')::boolean"):
+        base, head = f"{value} AND role = 'admin'", f"role IN ('admin', 'member') AND {value}"
+        assert compare_predicates(base, head) == "semantic_loosened", value
+        assert compare_predicates(head, base) == "semantic_tightened", value
+        assert compare_predicates(base, f"role = 'admin' AND {value}") == (
+            "semantic_equivalent"), value
+    # Two different reads stay apart.
+    assert compare_predicates("org_id = (auth.jwt() ->> 'org_id')::uuid AND role = 'a'",
+                              "role = 'a' AND org_id = (auth.jwt() ->> 'team_id')::uuid") == (
+        "requires_review")
+

@@ -172,6 +172,9 @@ _ARITHMETIC_OPS: dict[str, Any] = {
     "%": lambda a, b: a % b,
 }
 
+# JSON field and path reads, which the diff path keeps as opaque values.
+_JSON_OPS = frozenset({"->", "->>", "#>", "#>>"})
+
 # Postgres type-name (last segment of `pg_catalog.<type>`-style
 # qualified names) → Z3 sort, for Phase 4 TypeCast resolution.
 # Coarse on purpose: numeric / decimal collapse to Real, the
@@ -1521,6 +1524,14 @@ def _is_builtin_current_setting_call(node: Any) -> bool:
     ) and has_literal_setting_arguments(node)
 
 
+def _operator(node: A_Expr) -> str | None:
+    """The unqualified operator of an `A_Expr`, or None for a qualified one."""
+    names = list(node.name or ())
+    if len(names) != 1 or not isinstance(names[0], String):
+        return None
+    return str(names[0].sval)
+
+
 def _is_jwt_role_extraction(node: Any) -> bool:
     """`<jwt blob> ->> 'role'` where the blob is `auth.jwt()` or the claims GUC
     (through any casts) — the anon-key caller's role claim, i.e. 'anon'."""
@@ -1988,6 +1999,23 @@ def _anon_3vl(
 
     # --- comparison / arithmetic.
     if isinstance(node, A_Expr):
+        if ctx.any_session and (
+            node.kind == A_Expr_Kind.AEXPR_NULLIF
+            or (node.kind == A_Expr_Kind.AEXPR_OP and _operator(node) in _JSON_OPS)
+        ):
+            # The diff path keeps a JSON field read (`auth.jwt() ->> 'org_id'`)
+            # or a NULLIF as an opaque value, as it does a function call: one
+            # free value and null-flag per distinct expression, shared by base
+            # and head, which can only leave an implication unproven.
+            for operand in (node.lexpr, node.rexpr):
+                operand = _unwrap_scalar_sublink(operand)
+                if isinstance(operand, ColumnRef):
+                    if not _column_key(operand, ctx):
+                        return None
+                elif _anon_3vl(operand, ctx, auth_funcs, assertions) is None:
+                    return None
+            key = _canon(node)
+            return _Val(value=ctx.opaque(key, z3.StringSort()), is_null=ctx.opaque_null_flag(key))
         if node.kind == A_Expr_Kind.AEXPR_OP:
             return _anon_binop(node, ctx, auth_funcs, assertions)
         if node.kind in (A_Expr_Kind.AEXPR_OP_ANY, A_Expr_Kind.AEXPR_IN):

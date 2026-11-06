@@ -155,7 +155,8 @@ breaking changes — they will be called out in this file.
   `price`, `COALESCE(e, 'A') = 'a'` for a citext `e` and
   `COALESCE(length(s), '1') = '01'` for any `s`, so beside anything but
   literals and such columns the diff keeps the COALESCE an opaque value, as
-  on `main`; so does a bare string meeting another in an `IN` list or
+  on `main` (and a JSON field read, `(auth.jwt() ->> 'org_id')::uuid`, or a
+  `NULLIF`, which the 3VL encoder had left needing review); so does a bare string meeting another in an `IN` list or
   `ARRAY` a member types, `'1' IN (current_setting('x')::int, '01')`, which
   the offline anon prover had proven isolated (an `IN` member holding a
   column of its own query is compared alone, as Postgres does, so `'admin'
@@ -249,7 +250,8 @@ breaking changes — they will be called out in this file.
   unverified, or needs review in a diff (no change when it did not change),
   not a crash. A `current_setting` whose name or `missing_ok` is read from a
   column (or is NULL) is no longer taken to be never NULL, or the session's
-  identity: it is NULL where the argument is, so `… OR current_setting(cfg)
+  identity (one joined from literals, `'app.' || 'tenant'`, still is): it is
+  NULL where the argument is, so `… OR current_setting(cfg)
   IS NULL` and `tenant_id = current_setting('app.t', flag) OR …` were PROVEN
   (on `main` too) and, in a diff, no change; a literal name with a computed
   `missing_ok` reads the setting or NULL, and the anon-key caller's JWT
