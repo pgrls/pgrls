@@ -3188,6 +3188,14 @@ def diff(
             extensions=extensions,
             verbose=verbose,
         )
+        if any(not c.type_known for t in base_schema.tables for c in t.column_details):
+            # The base was restored from types it does not trust (an offline
+            # snapshot's declared ones), so the head read back from it does
+            # not know them either.
+            head_schema = replace(head_schema, tables=tuple(
+                replace(t, column_details=tuple(
+                    replace(c, type_known=False) for c in t.column_details))
+                for t in head_schema.tables))
     else:
         assert head is not None  # guaranteed by the fallback chain above
         head_schema = _resolve_diff_source(head, schemas=schema_list)

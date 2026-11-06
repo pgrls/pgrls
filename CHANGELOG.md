@@ -200,7 +200,9 @@ breaking changes — they will be called out in this file.
   `"type_known": false` (one an earlier version wrote, with no such key,
   is read the same way by its `"source": "sql"` marker), and the diff reads
   such a column like one of a snapshot with no types (one way only); where
-  the other side is a live snapshot that knows it, by that side's type. An
+  the other side is a live snapshot that knows it, by that side's type
+  (under `diff --apply` the head is read back from a base restored from
+  the untrusted types, so it trusts none either). An
   `IN` list with two or more typed members that hold no column (`code IN
   ('a '::text, 'b'::text)`) is a read of its own: Postgres types the column
   with them, so a `char(n)` one compares as char there, as text in `code =
