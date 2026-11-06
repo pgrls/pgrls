@@ -1303,6 +1303,11 @@ class _Resolver:
                 value = (str(getattr(stmt.args[0].val, "sval", ""))
                          if stmt.kind == VariableSetKind.VAR_SET_VALUE and stmt.args else None)
                 value = None if value is None or value == "none" else _truncated(value)
+                if (name == "role" and self.inherited_role and stmt.kind in (
+                        VariableSetKind.VAR_RESET, VariableSetKind.VAR_SET_DEFAULT)):
+                    # RESET ROLE goes back to the role a database's or role's
+                    # setting gives the session, not to the session user.
+                    value = _SOME_ROLE
                 if name == "session_authorization":
                     # It sets the session user, and the role back to it.
                     self._set("auth", value, local=local)

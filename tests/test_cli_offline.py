@@ -3485,3 +3485,22 @@ def test_create_schema_authorization_current_user_under_a_set_role_setting_is_re
                         "CREATE TABLE public.p (id int) PARTITION BY LIST (id);\n"
                         "CREATE SCHEMA s AUTHORIZATION CURRENT_USER"
                         " CREATE TABLE c PARTITION OF p FOR VALUES IN (1);\n")
+
+
+def test_reset_role_under_a_role_setting_returns_to_a_role_pgrls_cannot_name(tmp_path):
+    # It goes back to the setting's role (bob), not to the session user.
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+    with pytest.raises(SchemaSourceError, match="user"):
+        schema_from_sql("CREATE DATABASE d;\nALTER DATABASE d SET role = 'bob';\n\\connect d\n"
+                        "CREATE SCHEMA alice AUTHORIZATION alice;\n"
+                        "CREATE TABLE alice.docs (id int);\n"
+                        "SET SESSION AUTHORIZATION alice;\nRESET ROLE;\n"
+                        "SET search_path = \"$user\", public;\n"
+                        "ALTER TABLE docs ENABLE ROW LEVEL SECURITY;\n")
+    res, _ = _migrations_snapshot(tmp_path, {
+        "001_a.sql": "CREATE SCHEMA alice AUTHORIZATION alice;\nCREATE TABLE alice.docs (id int);\n"
+                     "ALTER DATABASE postgres SET role bob;\n",
+        "002_b.sql": "SET SESSION AUTHORIZATION alice;\nRESET ROLE;\n"
+                     "SET search_path = \"$user\", public;\n"
+                     "ALTER TABLE docs ENABLE ROW LEVEL SECURITY;\n"})
+    assert res.exit_code != 0
