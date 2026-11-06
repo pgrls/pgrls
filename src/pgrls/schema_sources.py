@@ -27,6 +27,7 @@ that absence-of-finding is NOT proof.
 """
 from __future__ import annotations
 
+import bisect
 import contextlib
 import copy
 import dataclasses
@@ -576,6 +577,8 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     def gone_between(after: int, before: int) -> bool:
         return any(after < r < before for r in removals)
 
+    made = _Made(statements, default_schema)
+
     # Pass 1: CREATE TABLE (plus the two data-derived forms).
     for index, raw in enumerate(statements):
         stmt = raw.stmt
@@ -653,6 +656,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             tables[key].inherits = [p for p in new_inherits if not _is_below(tables, p, key)]
             continue
         builder = _TableBuilder(schema=key[0], name=key[1], created_at=index)
+        builder.columns_from = index
         builder.partitioned = getattr(stmt, "partspec", None) is not None
         tables[key] = builder
         # Declarative partition child (`PARTITION OF parent`) and classic
@@ -679,9 +683,14 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         # has zero columns and every column-keyed rule silently skips it.
         for parent_key in parents:
             # Pass 1 holds a table under the name it was made with: a parent
-            # renamed before this CREATE is found under that one.
-            parent = tables.get(_made_as(statements, parent_key, index, default_schema))
-            if parent is None:
+            # renamed before this CREATE is found under that one, and only
+            # by the CREATE whose columns its builder holds (not one made
+            # again, which the builder merges).
+            origin = made.origin(parent_key, index)
+            if origin is None:
+                continue
+            parent = tables.get(origin[0])
+            if parent is None or parent.columns_from != origin[1]:
                 continue
             for col in parent.columns:
                 if not any(c.name == col.name for c in builder.columns):
@@ -1818,6 +1827,8 @@ class _TableBuilder:
         # Every name the table, or a parent it inherits a NOT NULL from, has
         # had: an unnamed NOT NULL keeps the name it got at the time.
         self.former_names: list[str] = [name]
+        # The CREATE its columns are from (-1: none).
+        self.columns_from = -1
         # Columns NOT NULL only through a `NO INHERIT` constraint: an
         # `INHERITS` child does not get it.
         self.no_inherit_not_null: set[str] = set()
@@ -2169,21 +2180,35 @@ def _drops(stmt: Any, key: tuple[str, str], default_schema: str) -> bool:
         for n in stmt.objects or () if _drop_name_parts(n))
 
 
-def _made_as(statements: Any, key: tuple[str, str], index: int,
-             default_schema: str) -> tuple[str, str]:
-    """The name the relation called `key` at statement `index` was made
-    with: followed back through the renames to it, to its CREATE."""
-    for raw in reversed(statements[:index]):
-        stmt = raw.stmt
-        if any(creates and _relation_key(rel, default_schema) == key
-               for rel, creates in _named_relations(stmt)):
-            break
-        if (isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None
-                and stmt.renameType in _RELATION_KINDS and stmt.newname
-                and (old := _relation_key(stmt.relation, default_schema)) is not None
-                and (old[0], stmt.newname) == key):
-            key = old
-    return key
+class _Made:
+    """Where each relation name is made and renamed to in the input, to
+    follow a name back to the CREATE that made it."""
+
+    def __init__(self, statements: Any, default_schema: str) -> None:
+        self.creates: dict[tuple[str, str], list[int]] = {}
+        self.renames: dict[tuple[str, str], list[tuple[int, tuple[str, str]]]] = {}
+        for index, raw in enumerate(statements):
+            stmt = raw.stmt
+            for rel, creates in _named_relations(stmt):
+                if creates and (key := _relation_key(rel, default_schema)) is not None:
+                    self.creates.setdefault(key, []).append(index)
+            if (isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None
+                    and stmt.renameType in _RELATION_KINDS and stmt.newname
+                    and (old := _relation_key(stmt.relation, default_schema)) is not None):
+                self.renames.setdefault((old[0], stmt.newname), []).append((index, old))
+
+    def origin(self, key: tuple[str, str], index: int) -> tuple[tuple[str, str], int] | None:
+        """The name the relation called `key` at statement `index` was made
+        with, and the CREATE that made it: followed back through the renames
+        to it; None when no CREATE is reached."""
+        creates = self.creates.get(key, [])
+        at = bisect.bisect_left(creates, index)
+        created = creates[at - 1] if at else -1
+        for rename, old in reversed(self.renames.get(key, [])):
+            if created < rename < index and (found := self.origin(old, rename)) is not None:
+                return found
+            # (A rename of a name never made is an IF EXISTS no-op.)
+        return (key, created) if created >= 0 else None
 
 
 def _renamed_between(statements: Any, key: tuple[str, str], after: int, before: int,

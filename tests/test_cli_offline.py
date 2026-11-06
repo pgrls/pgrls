@@ -3184,6 +3184,32 @@ def test_a_child_made_after_its_parents_rename_takes_its_columns(child):
     assert {"id", "tenant_id"} <= set(rc.columns)
 
 
+@pytest.mark.parametrize("sql", [
+    # `a` made again and renamed to `c`: the model merges it with the first
+    # `a`, whose columns it holds.
+    "CREATE TABLE a (x int);\nALTER TABLE a RENAME TO b;\n"
+    "CREATE TABLE a (y int, tenant_id int);\nALTER TABLE a RENAME TO c;\n"
+    "CREATE TABLE ch () INHERITS (c);\n",
+    # Dropped and made again.
+    "CREATE TABLE c (x int);\nDROP TABLE c;\nCREATE TABLE c (y int, tenant_id int);\n"
+    "CREATE TABLE ch () INHERITS (c);\n",
+])
+def test_a_child_takes_no_columns_of_another_incarnation(sql):
+    from pgrls.schema_sources import schema_from_sql
+    ch = next(t for t in schema_from_sql(sql).tables if t.name == "ch")
+    assert "x" not in ch.columns
+
+
+def test_a_rename_of_a_name_never_made_leaves_the_parent_found():
+    # `ALTER TABLE IF EXISTS nothere RENAME TO p` is a no-op.
+    from pgrls.schema_sources import schema_from_sql
+    schema = schema_from_sql("CREATE TABLE p (id int, tenant_id int);\n"
+                             "ALTER TABLE IF EXISTS nothere RENAME TO p;\n"
+                             "CREATE TABLE ch () INHERITS (p);\n")
+    ch = next(t for t in schema.tables if t.name == "ch")
+    assert list(ch.columns) == ["id", "tenant_id"]
+
+
 def test_a_child_takes_the_columns_of_the_table_its_parents_name_holds_then():
     # `a` renamed to `b`, `b` dropped and made again: the child's parent is
     # the new `b`, not the old `a`.
