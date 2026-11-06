@@ -148,7 +148,12 @@ breaking changes — they will be called out in this file.
   but a bare literal or column (a cast, a sub-select, a function's result)
   decides nothing, nor does a comparison of two values holding columns
   where one meets the other through a `COALESCE` / `CASE` (a numeric and a
-  float8 column compare through a double)), or a cast to a text type that changes a value
+  float8 column compare through a double), and one of a column with a bare
+  string literal reads exactly only for a `text` / `varchar` column the
+  diff knows the type of — on a NULL row two literals meet in the
+  column's type, so `COALESCE(price, '0') = '0.00'` holds for a numeric
+  `price` and `COALESCE(e, 'A') = 'a'` for a citext `e`; otherwise the
+  diff keeps the COALESCE an opaque value, as on `main`), or a cast to a text type that changes a value
   (`bpchar`, `"char"`, `name`) beside a bare string literal, which then
   compares as that type (`x = ANY(ARRAY['a'::bpchar, 'b '])` holds for
   `x = 'b'`; `main` proved such a predicate isolated). In a
@@ -171,7 +176,8 @@ breaking changes — they will be called out in this file.
   a time) reads `'A'`, `'A'::text`, `(SELECT 'A')`, `COALESCE('A', '')`
   and a list alike; any other (`citext`, `char(n)`, a user type) compares a
   typed string (a cast, a sub-select, a list's common type), another column
-  or a function's result otherwise than a bare literal, so such a
+  or a function's result (in a `COALESCE` arm beside it too:
+  `COALESCE(email, auth.email())` is text) otherwise than a bare literal, so such a
   comparison of it decides nothing — a literal cast to its own type
   (`role = 'admin'::app_role`, as `pg_get_expr` writes an enum literal)
   reads as a bare one (`main` read `col = 'a'::text` and `col = 'a'` as no

@@ -414,6 +414,25 @@ def test_a_string_compared_with_a_column_reads_by_the_columns_type():
     assert diff("email IS NOT DISTINCT FROM auth.email() AND auth.email() = 'a'",
                 "email IS NOT DISTINCT FROM 'a' AND auth.email() = 'a'",
                 email="citext") == "requires_review"
+    # A bare string beside a column in a COALESCE meets another in the
+    # column's type on a NULL row (`'0' = '0.00'` numeric, `'A' = 'a'`
+    # citext, `'f' = 'false'` bool): only a text one reads it as Z3 does.
+    for base, head, kind in (("price = '0.00'", "COALESCE(price, '0') = '0.00'", "numeric"),
+                             ("e = 'a'", "COALESCE(e, 'A') = 'a'", "citext"),
+                             ("e = 'false'", "COALESCE(e, 'f') = 'false'", "boolean"),
+                             ("e = 'a'", "COALESCE(e, 'A') = 'a'", "unknown")):
+        assert diff(base, head, price=kind, e=kind) == "requires_review", (head, kind)
+        assert compare_predicates(base, head) == "requires_review", head
+    assert diff("status = 'x'", "COALESCE(status, 'active') = 'x'", status="text") == (
+        "semantic_equivalent")
+    # An arm that is no literal (`auth.email()`, text) types the COALESCE.
+    for base, head in (("COALESCE(e, auth.email()) = 'A' AND t = 1",
+                        "(COALESCE(e, auth.email()) = 'A' OR e = 'A') AND t = 1"),
+                       ("COALESCE(e, (SELECT auth.email())) = 'A'", "e = 'A'")):
+        assert diff(base, head, e="citext", t="int") == "requires_review", head
+    assert diff("COALESCE(e, auth.email()) = 'A' AND t = 1",
+                "(COALESCE(e, auth.email()) = 'A' OR e = 'A') AND t = 1",
+                e="text", t="int") == "semantic_equivalent"
     # A literal cast to the column's own type (`pg_get_expr`'s enum literal)
     # reads as a bare one: widening an enum role is still DANGEROUS.
     assert diff("org = 1 AND role = 'admin'::app_role",
@@ -471,6 +490,12 @@ def test_a_cast_of_a_coalesce_is_no_proof():
         assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated", using
     assert _classify("x = 1", "(x = 1 OR n = COALESCE(f, 0)) AND (x = 1 OR (n > 0.5 AND f <= 0.5))"
                      ) is None
+    # A bare string beside a column takes its type: on a NULL row
+    # `COALESCE(discount, '0') = '0.00'` is TRUE (numeric), not as text.
+    using = (f"{t} OR (COALESCE(discount, '0') = '0.00' "
+             f"AND COALESCE(discount, '5') <> '0.00')")
+    assert prove_anon_isolation(parse_expr(using))[0] != "isolated"
+    assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated"
     # A COALESCE of a column and a bare literal still reads exactly.
     assert prove_anon_isolation(parse_expr(f"{t} AND COALESCE(level, 0) < 3"))[0] == "isolated"
     # The session identity's cast keeps its proof.

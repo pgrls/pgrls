@@ -242,6 +242,8 @@ class _Context:
         # Integer literals and numeric columns as integers (see
         # `_const_to_z3`).
         self.integers = False
+        # The diff's column types, where the snapshots give them.
+        self.column_types: Mapping[str, str] | None = None
         # How deep the translation is among values Postgres gives one type
         # (see `_real_integer`).
         self.unified = 0
@@ -542,8 +544,8 @@ def _rounds_its_kin(node: Any, ctx: _Context) -> bool:
 def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any]) -> None:
     """In a diff, note how `left` compared with each of `rights` (one, or an
     `IN` list's members, which take one type) reads each column the operands
-    yield against a string: bare (`email = 'A'`, `COALESCE(x, 'a') = 'A'`),
-    where the literal takes the column's type, or typed (`'A'::text`,
+    yield against a string: bare (`email = 'A'`), where the literal takes
+    the column's type, or typed (`'A'::text`,
     `(SELECT 'A')`, `COALESCE('A', '')`, a typed list member, a function's
     result), where a `citext` or `char(n)` column compares as text. The text
     may not show the column's type, so a column read both ways decides
@@ -612,11 +614,18 @@ def _literal_kind(node: Any) -> str | None:
 
 
 def _has_typed_arm(node: Any) -> bool:
-    """Whether a COALESCE / GREATEST / LEAST / CASE of a value has a typed
-    literal arm, which may decide the type it compares in."""
+    """Whether a COALESCE / GREATEST / LEAST / CASE of a value has an arm
+    that may decide the type it compares in: a typed literal, a value that
+    is no column (`auth.email()`, `(SELECT auth.email())`), or a second
+    value beside the first (`COALESCE(a, b)`)."""
     arms = _arms(_unwrap_scalar_sublink(node))
-    return arms is not None and any(
-        (k := _literal_kind(arm)) is not None and k not in ("bare", "other") or _has_typed_arm(arm)
+    if arms is None:
+        return False
+    values = [arm for arm in arms if _literal_kind(arm) is None]
+    return len(values) > 1 or any(
+        (k := _literal_kind(arm)) is not None and k not in ("bare", "other")
+        or k is None and not isinstance(_unwrap_scalar_sublink(arm), ColumnRef)
+        and (_arms(_unwrap_scalar_sublink(arm)) is None or _has_typed_arm(arm))
         for arm in arms)
 
 
@@ -960,6 +969,7 @@ def _diff_truths(base_node: Any, head_node: Any, *, integers: bool = False,
     ctx = _Context()
     ctx.any_session = True
     ctx.integers = integers
+    ctx.column_types = column_types
     assertions: list[Any] = []
     base = _lift_to_tv(_anon_3vl(base_node, ctx, set(), assertions), assertions)
     head = _lift_to_tv(_anon_3vl(head_node, ctx, set(), assertions), assertions)
@@ -1003,6 +1013,11 @@ def _reads_strings_alike(column: str, kinds: set[str],
         return True
     own = "as " + _type_key(data_type) if data_type is not None else None
     return all(kind in ("bare", own) for kind in kinds)
+
+
+def _is_text(data_type: str | None) -> bool:
+    return data_type is not None and '"' not in data_type and _type_key(
+        data_type) in ("text", "varchar")
 
 
 def _reads_alike(data_type: str | None) -> bool:
@@ -2101,6 +2116,16 @@ def _anon_coalesce(
         # typed arm (`'x'::text`, `(SELECT '')`, `auth.email()`, a cast)
         # gives a citext or char(n) column its own, comparing it otherwise
         # (the diff path reads it by the column's type, `_note_string_read`).
+        return None
+    if any(_literal_kind(a) == "bare" for a in args) and not all(
+            _is_text(None if ctx.column_types is None
+                     else ctx.column_types.get(column.fields[-1].sval))
+            for a in args if isinstance(column := _unwrap_scalar_sublink(a), ColumnRef)
+            and column.fields and isinstance(column.fields[-1], String)):
+        # A bare string takes the column's type, so on a NULL row two
+        # literals meet in it (`COALESCE(price, '0') = '0.00'` is TRUE,
+        # numeric; `'A' = 'a'` citext), which Z3 reads as text: only a text
+        # column's reads exactly (the diff path keeps the rest opaque).
         return None
     # Its arguments take one type, a column's beside a literal.
     with ctx.unifying(not all(_is_constant(a) for a in args)):
