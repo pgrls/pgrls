@@ -3185,8 +3185,7 @@ def test_a_child_made_after_its_parents_rename_takes_its_columns(child):
 
 
 @pytest.mark.parametrize("sql", [
-    # `a` made again and renamed to `c`: the model merges it with the first
-    # `a`, whose columns it holds.
+    # `a` made again and renamed to `c`: `c` is the second `a`.
     "CREATE TABLE a (x int);\nALTER TABLE a RENAME TO b;\n"
     "CREATE TABLE a (y int, tenant_id int);\nALTER TABLE a RENAME TO c;\n"
     "CREATE TABLE ch () INHERITS (c);\n",
@@ -3197,15 +3196,15 @@ def test_a_child_made_after_its_parents_rename_takes_its_columns(child):
 def test_a_child_takes_no_columns_of_another_incarnation(sql):
     from pgrls.schema_sources import schema_from_sql
     ch = next(t for t in schema_from_sql(sql).tables if t.name == "ch")
-    assert "x" not in ch.columns
+    assert list(ch.columns) == ["y", "tenant_id"]
 
 
 @pytest.mark.parametrize("made", [
     # An IF NOT EXISTS of a name held is a no-op (code between too).
     "CREATE TABLE IF NOT EXISTS p (id int, tenant_id int);\n"
-    "CREATE TABLE IF NOT EXISTS p (id int, tenant_id int);\n",
+    "CREATE TABLE IF NOT EXISTS p (zz int);\n",
     "CREATE TABLE IF NOT EXISTS p (id int, tenant_id int);\nDO $$ BEGIN END $$;\n"
-    "CREATE TABLE IF NOT EXISTS p (id int, tenant_id int);\n",
+    "CREATE TABLE IF NOT EXISTS p (zz int);\n",
     # ... one of a name a rename filled too.
     "CREATE TABLE o (id int, tenant_id int);\nALTER TABLE o RENAME TO p;\n"
     "CREATE TABLE IF NOT EXISTS p (zz int);\n",

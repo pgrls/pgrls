@@ -95,7 +95,7 @@ breaking changes — they will be called out in this file.
 ### Fixed
 - **Offline: a child made after its parent's rename takes its columns.** A
   table created `INHERITS (p)` or `PARTITION OF p` after `ALTER TABLE … RENAME TO
-  p` had no columns offline (the parent was looked up under its new name
+  p` had none of its parent's columns offline (the parent was looked up under its new name
   before the rename was applied), so SEC030 missed a nullable tenant column
   and HYG001 / SEC005 fired falsely.
 - **Offline: a table made under a name the SQL used before is a table of
