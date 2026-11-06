@@ -3196,3 +3196,62 @@ def test_a_table_made_again_after_a_drop_has_its_new_columns():
     (p,) = schema_from_sql("CREATE TABLE p (x int);\nDROP TABLE p;\n"
                            "CREATE TABLE p (y int, tenant_id int);\n").tables
     assert list(p.columns) == ["y", "tenant_id"]
+
+
+def _tables_of(sql, schemas=("public",)):
+    from pgrls.schema_sources import schema_from_sql
+    return {t.name: t for t in schema_from_sql(sql, schemas=schemas).tables}
+
+
+def test_a_table_renamed_away_and_back_before_its_drop_is_dropped():
+    tables = _tables_of("CREATE TABLE t (id int);\nALTER TABLE t ENABLE ROW LEVEL SECURITY;\n"
+                        "ALTER TABLE t RENAME TO u;\nALTER TABLE u RENAME TO t;\nDROP TABLE t;\n"
+                        "CREATE TABLE t (id int);\n")
+    assert set(tables) == {"t"} and not tables["t"].rls_enabled
+
+
+def test_a_detach_before_a_rebuild_leaves_the_new_partition_attached():
+    tables = _tables_of(
+        "CREATE TABLE p (id int) PARTITION BY RANGE (id);\n"
+        "CREATE TABLE c PARTITION OF p FOR VALUES FROM (0) TO (10);\n"
+        "ALTER TABLE p DETACH PARTITION c;\nDROP TABLE c;\nDROP TABLE p;\n"
+        "CREATE TABLE p (id int) PARTITION BY RANGE (id);\n"
+        "CREATE TABLE c PARTITION OF p FOR VALUES FROM (0) TO (10);\n")
+    assert tables["c"].partition_of == ("public", "p")
+
+
+@pytest.mark.parametrize("remade", [
+    "CREATE TABLE t AS SELECT 1 AS id, 'x'::text AS tenant_id;\n",
+    "SELECT 1 AS id INTO t;\n",
+])
+def test_a_table_made_again_from_a_query_has_no_old_columns(remade):
+    tables = _tables_of("CREATE TABLE t (id int, owner_id uuid);\nDROP TABLE t;\n" + remade)
+    assert "owner_id" not in tables["t"].columns
+
+
+def test_a_name_renamed_away_and_made_again_is_two_tables():
+    tables = _tables_of(
+        "CREATE TABLE a (id int);\nALTER TABLE a ENABLE ROW LEVEL SECURITY;\n"
+        "ALTER TABLE a RENAME TO b;\nGRANT SELECT ON b TO anon;\n"
+        "CREATE TABLE a (id int);\nDROP TABLE a;\nCREATE TABLE a (y int);\n")
+    assert tables["b"].rls_enabled and tables["b"].grants
+    assert not tables["a"].rls_enabled and list(tables["a"].columns) == ["y"]
+
+
+def test_a_name_renamed_in_dropped_and_made_again_stands():
+    tables = _tables_of("CREATE TABLE t_new (id int);\nALTER TABLE t_new RENAME TO t;\n"
+                        "DROP TABLE t;\nCREATE TABLE t (id int);\n")
+    assert set(tables) == {"t"}
+
+
+def test_an_alter_between_a_drop_and_the_create_does_not_reach_the_new_table():
+    # `ALTER TABLE IF EXISTS` of a name nothing holds is a no-op.
+    tables = _tables_of("CREATE TABLE t (id int);\nDROP TABLE t;\n"
+                        "ALTER TABLE IF EXISTS t ENABLE ROW LEVEL SECURITY;\n"
+                        "CREATE TABLE t (id int);\n")
+    assert not tables["t"].rls_enabled
+
+
+def test_if_not_exists_over_a_views_name_makes_no_table():
+    assert "v" not in _tables_of("CREATE VIEW v AS SELECT 1 AS id;\n"
+                                 "CREATE TABLE IF NOT EXISTS v (id int);\n")
