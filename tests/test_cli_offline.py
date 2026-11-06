@@ -3292,3 +3292,28 @@ def test_if_not_exists_over_a_view_made_after_a_drop_makes_no_table():
     tables = _tables_of("CREATE TABLE t (id int);\nDROP TABLE t;\n"
                         "CREATE VIEW t AS SELECT 1 AS id;\nCREATE TABLE IF NOT EXISTS t (id int);\n")
     assert "t" not in tables
+
+
+@pytest.mark.parametrize("gone", ["DROP TABLE a;\n", "ALTER TABLE a RENAME TO a_old;\n"])
+def test_a_partition_of_a_parent_the_sql_did_not_make_leaves_it_with_its_parent(gone):
+    # `a` was there before; the new `a` is not `d`'s parent.
+    tables = _tables_of("CREATE TABLE d PARTITION OF a FOR VALUES FROM (1) TO (2);\n"
+                        + ("ALTER TABLE a DETACH PARTITION d;\n" if "DROP" in gone else "")
+                        + gone + "CREATE TABLE a (id int) PARTITION BY RANGE (id);\n"
+                        "ALTER TABLE a ENABLE ROW LEVEL SECURITY;\n")
+    assert tables["d"].partition_of != ("public", "a")
+
+
+def test_a_partition_made_again_if_not_exists_follows_its_renamed_parent():
+    tables = _tables_of("CREATE TABLE p (id int) PARTITION BY RANGE (id);\n"
+                        "CREATE TABLE c PARTITION OF p FOR VALUES FROM (0) TO (5);\n"
+                        "ALTER TABLE p RENAME TO q;\n"
+                        "CREATE TABLE IF NOT EXISTS c PARTITION OF p FOR VALUES FROM (0) TO (5);\n"
+                        "CREATE TABLE p (id int) PARTITION BY RANGE (id);\n")
+    assert tables["c"].partition_of == ("public", "q")
+
+
+def test_an_if_not_exists_over_its_own_parents_name_is_no_cycle():
+    # Postgres skips it (the name is a sequence's); pgrls must not crash.
+    _tables_of("CREATE SEQUENCE c;\nALTER SEQUENCE c RENAME TO a;\n"
+               "CREATE TABLE IF NOT EXISTS a PARTITION OF a FOR VALUES IN (3);\n")
