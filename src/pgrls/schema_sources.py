@@ -45,6 +45,8 @@ from pglast.enums.parsenodes import (
     ImportForeignSchemaType,
     ObjectType,
     RoleSpecType,
+    TransactionStmtKind,
+    VariableSetKind,
 )
 from pglast.stream import RawStream
 
@@ -556,23 +558,29 @@ def _column_types_in_order(statements: Any) -> dict[str, dict[str, str]]:
     table), from its own column list and the ALTERs on it in order. A table
     left out, a column it gets from elsewhere (a parent, `LIKE`, `CREATE
     TABLE … AS`), and a type named like a built-in the SQL also defines are
-    `unknown`, which decides nothing; so is every one after code that may
-    alter a table (a `DO` block, a `CALL`), one made `IF NOT EXISTS` (it may
-    be there already, otherwise), and one the SQL names under two schemas
-    (`ALTER TABLE IF EXISTS legacy.users` is no ALTER of `public.users`)."""
+    `unknown`, which decides nothing; so is every one in SQL that may run
+    code altering a table out of the replay's sight (a `DO` block, a `CALL`,
+    an event trigger, a function whose body may run DDL) or rolls work back,
+    one made `IF NOT EXISTS` (it may be there already, otherwise), and one
+    whose CREATE and column changes name it in two schemas (`ALTER TABLE IF
+    EXISTS legacy.users`, or `users` under `SET search_path = legacy`, is no
+    ALTER of `public.users`)."""
     made: dict[str, int] = {}
     first: dict[str, int] = {}
     tainted: set[str] = set()
     shadowed: set[str] = set()
-    qualifiers: dict[str, set[str | None]] = {}
+    qualifiers: dict[str, set[str]] = {}
+    path_first = "public"  # where an unqualified name is taken to be
     elements = [stmt for raw in statements
                 for stmt in (raw.stmt, *(getattr(raw.stmt, "schemaElts", None) or ()))]
     for index, stmt in enumerate(elements):
-        if isinstance(stmt, (_pgast.DoStmt, _pgast.CallStmt)):
+        if _may_change_types_unseen(stmt):
             return {}
-        for rel in (getattr(stmt, "relation", None), getattr(stmt, "view", None)):
-            if isinstance(rel, _pgast.RangeVar):
-                qualifiers.setdefault(rel.relname, set()).add(rel.schemaname or None)
+        path = _search_path_set(stmt)
+        if path is not None:
+            path_first = path
+        for rel in _relations_typed_by(stmt):
+            qualifiers.setdefault(rel.relname, set()).add(rel.schemaname or path_first)
         target = _made_relation(stmt)
         if target is not None:
             made[target] = made.get(target, 0) + 1
@@ -603,7 +611,7 @@ def _column_types_in_order(statements: Any) -> dict[str, dict[str, str]]:
             for parts in map(_drop_name_parts, stmt.objects or ()):
                 if parts:
                     qualifiers.setdefault(parts[-1], set()).add(
-                        parts[-2] if len(parts) > 1 else None)
+                        parts[-2] if len(parts) > 1 else path_first)
         elif isinstance(stmt, _pgast.AlterTableStmt):
             for cmd in stmt.cmds or ():
                 if getattr(cmd, "subtype", None) in (AlterTableType.AT_AttachPartition,
@@ -660,6 +668,67 @@ def _column_types_in_order(statements: Any) -> dict[str, dict[str, str]]:
                 elif subtype == AlterTableType.AT_DropColumn and cmd.name:
                     types[key].pop(cmd.name, None)
     return types
+
+
+def _may_change_types_unseen(stmt: Any) -> bool:
+    """Whether `stmt` may change a column's type where the replay does not
+    see it: code (a `DO` block, a `CALL`, an event trigger, which runs on
+    later DDL, a function whose body may run DDL, which a call, a trigger or
+    a default may run), or a `ROLLBACK`, which undoes what came before."""
+    if isinstance(stmt, (_pgast.DoStmt, _pgast.CallStmt, _pgast.CreateEventTrigStmt)):
+        return True
+    if isinstance(stmt, _pgast.TransactionStmt):
+        return stmt.kind in (TransactionStmtKind.TRANS_STMT_ROLLBACK,
+                             TransactionStmtKind.TRANS_STMT_ROLLBACK_TO,
+                             TransactionStmtKind.TRANS_STMT_ROLLBACK_PREPARED)
+    if not isinstance(stmt, _pgast.CreateFunctionStmt):
+        return False
+    language, body = "sql", ""
+    for option in stmt.options or ():
+        if option.defname == "language":
+            language = str(getattr(option.arg, "sval", "")).lower()
+        elif option.defname == "as":
+            body = " ".join(str(getattr(part, "sval", "")) for part in option.arg or ())
+    return language not in ("sql", "plpgsql") or bool(
+        re.search(r"\b(alter|drop|create|execute|call|do)\b", body, re.IGNORECASE))
+
+
+def _search_path_set(stmt: Any) -> str | None:
+    """The first schema of a search_path `stmt` sets (`?` for one it does
+    not tell; `public` again on RESET), else None."""
+    if isinstance(stmt, _pgast.VariableSetStmt) and (stmt.name or "").lower() == "search_path":
+        if stmt.kind == VariableSetKind.VAR_SET_VALUE and stmt.args:
+            first = str(getattr(stmt.args[0].val, "sval", "") or "?")
+            return "?" if first == "$user" else first
+        return "public"
+    if isinstance(stmt, _pgast.VariableSetStmt) and stmt.kind == VariableSetKind.VAR_RESET_ALL:
+        return "public"
+    calls = ast_utils.find_func_calls(stmt, {"set_config"}) \
+        if isinstance(stmt, _pgast.SelectStmt) else []
+    for node in calls:
+        if (isinstance(node, _pgast.FuncCall) and node.args
+                and isinstance(node.args[0], _pgast.A_Const)
+                and getattr(node.args[0].val, "sval", None) == "search_path"):
+            value = getattr(getattr(node.args[1], "val", None), "sval", None) \
+                if len(node.args) > 1 and isinstance(node.args[1], _pgast.A_Const) else None
+            first = (value or "").split(",")[0].strip().strip('"') if value is not None else "?"
+            return first if first and first != "$user" else "?"
+    return None
+
+
+def _relations_typed_by(stmt: Any) -> list[Any]:
+    """The relations `stmt` makes or changes a column type, name or list of."""
+    if isinstance(stmt, _pgast.CreateStmt):
+        return [stmt.relation]
+    if isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None:
+        return [stmt.relation]
+    if isinstance(stmt, _pgast.AlterTableStmt) and any(
+            getattr(cmd, "subtype", None) in (AlterTableType.AT_AlterColumnType,
+                                              AlterTableType.AT_AddColumn,
+                                              AlterTableType.AT_DropColumn)
+            for cmd in stmt.cmds or ()):
+        return [stmt.relation]
+    return []
 
 
 # Renames of a relation itself (`ALTER INDEX` renames a table too).

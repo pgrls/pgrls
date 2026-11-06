@@ -1711,19 +1711,37 @@ def test_a_column_type_follows_a_re_create_and_reaches_children():
     assert roles("DROP TABLE IF EXISTS t CASCADE; CREATE TABLE t (role text);"
                  " ALTER POLICY p ON t RENAME TO q; ALTER TRIGGER g ON t RENAME TO h;") == {
         "t": {"text"}}
-    # An ALTER naming the table under another qualifier than its CREATE may
-    # be of another table (`ALTER TABLE IF EXISTS legacy.t`, skipped): the
-    # type is not trusted. (The model also keeps a shell for `app.t`.)
-    for alter in ("ALTER TABLE app.t ALTER COLUMN role TYPE citext;",
-                  "ALTER TABLE IF EXISTS legacy.t ALTER COLUMN role TYPE text;"):
-        schema = schema_from_sql("CREATE SCHEMA app; SET search_path = app, public;"
-                                 " CREATE TABLE t (role citext); " + alter)
-        assert {_diff_type(c) for t in schema.tables for c in t.column_details} <= {"unknown"}
-    # Nor after code that may alter a table, or a CREATE … IF NOT EXISTS.
+    # An ALTER reaches the table of its name in the schema an unqualified
+    # name resolves to (the path's first) ...
+    schema = schema_from_sql("CREATE SCHEMA app; SET search_path = app, public;"
+                             " CREATE TABLE t (role text); ALTER TABLE app.t ALTER COLUMN role TYPE citext;")
+    assert {_diff_type(c) for t in schema.tables for c in t.column_details} == {"citext"}
+    # ... and the qualifiers that only name it (ENABLE RLS, an index) do not
+    # count.
+    assert roles("CREATE TABLE public.t (role text); ALTER TABLE t ENABLE ROW LEVEL SECURITY;"
+                 " CREATE INDEX ON t (role);") == {"t": {"text"}}
+    # One naming it in another schema may be of another table (an IF EXISTS
+    # skipped): the type is not trusted.
+    for sql in ("CREATE TABLE t (role citext); ALTER TABLE IF EXISTS legacy.t ALTER COLUMN role TYPE text;",
+                "CREATE TABLE t (role citext); SET search_path = legacy;"
+                " ALTER TABLE IF EXISTS t ALTER COLUMN role TYPE text; RESET search_path;"):
+        assert roles(sql)["t"] <= {"unknown"}, sql
+    # Nor in SQL that may change a type out of the replay's sight: code, a
+    # function whose body runs DDL (a call, trigger or default may run it),
+    # an event trigger, a ROLLBACK; nor one made IF NOT EXISTS.
     for sql in ("CREATE TABLE t (role text); DO $$ BEGIN ALTER TABLE t ALTER COLUMN role TYPE citext;"
                 " END $$;",
+                "CREATE TABLE t (role text); CREATE FUNCTION m() RETURNS void LANGUAGE plpgsql AS"
+                " $f$ BEGIN ALTER TABLE t ALTER COLUMN role TYPE citext; END $f$; SELECT m();",
+                "CREATE TABLE t (role text); CREATE FUNCTION g() RETURNS event_trigger LANGUAGE plpgsql"
+                " AS $f$ BEGIN END $f$; CREATE EVENT TRIGGER e ON ddl_command_end EXECUTE FUNCTION g();",
+                "CREATE TABLE t (role citext); BEGIN; ALTER TABLE t ALTER COLUMN role TYPE text; ROLLBACK;",
                 "CREATE TABLE IF NOT EXISTS t (role text);"):
         assert roles(sql) == {"t": {"unknown"}}, sql
+    # A function that runs no DDL (Supabase's handle_new_user) leaves them.
+    assert roles("CREATE TABLE t (role text); CREATE FUNCTION h() RETURNS trigger LANGUAGE plpgsql"
+                 " AS $f$ BEGIN INSERT INTO t VALUES (NEW.role); RETURN NEW; END $f$;") == {
+        "t": {"text"}}
     for sql, column in (
         ("CREATE TABLE t (role text); DROP TABLE t; CREATE TABLE t (role citext);", "role"),
         ("CREATE TABLE t (role text); CREATE TABLE IF NOT EXISTS t (role citext);", "role"),

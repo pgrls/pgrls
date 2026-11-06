@@ -194,11 +194,13 @@ breaking changes — they will be called out in this file.
   or `CASE` arm (which takes the arms' common type) never matching a direct
   read of it. The offline model gives the diff a column's type only where it is
   sure of it: the table's name is made once in the input and never
-  dropped, renamed, moved or attached, nor made `IF NOT EXISTS` or named
-  under two schema qualifiers (so no search_path, temporary table or
-  rebuild can make the name another table, and an `ALTER` naming it
-  reaches it), with no `DO` block or `CALL` in the input (which may alter
-  it), the type is from its own column list or
+  dropped, renamed, moved or attached, nor made `IF NOT EXISTS`, and its
+  CREATE and column changes name it in one schema (an unqualified name in
+  the search path's first; so no search_path, temporary table or rebuild
+  can make the name another table, and an `ALTER` naming it reaches it),
+  in input with no code that may alter it out of sight (a `DO` block, a
+  `CALL`, an event trigger, a function whose body may run DDL — a call, a
+  trigger or a default may run it) and no `ROLLBACK`, the type is from its own column list or
   a later `ALTER COLUMN … TYPE` / `ADD COLUMN`, and the SQL defines (a domain, enum, range,
   composite, base or shell type, or a rename to one) no type of that name; any other (a parent's or
   `LIKE`'s column, a `CREATE TABLE … AS`, a name an `IMPORT FOREIGN SCHEMA`
