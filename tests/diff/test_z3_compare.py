@@ -1874,3 +1874,23 @@ def test_an_in_list_read_is_tied_to_its_left_side():
     # The same left side both ways still reads alike.
     same = "(SELECT auth.uid() IN (owner_id, editor_id))"
     assert compare_predicates(same, f"{same} AND x = 1") == "tightened_and"
+
+
+def test_a_list_of_two_or_more_values_decides_nothing_in_a_diff():
+    # Postgres picks the type such values meet in from their order and kinds
+    # (the first typed one; a char(n) one makes the rest char).
+    from pgrls.diff.ast_compare import compare_predicates
+    for base, head, types in (
+            ("'a ' IN (app.f(), app.k())", "'a ' IN (app.k(), app.f())", None),
+            ("(SELECT 'a' IN (alt, code))", "(SELECT 'a' IN (code, alt))",
+             {"alt": "unknown", "code": "unknown"}),
+            ("role = ANY (ARRAY['admin '::text, app.k()])",
+             "role = ANY (ARRAY[app.k(), 'admin '::text])", {"role": "text"}),
+            ("role = ANY (ARRAY[app.f(), app.k()])", "role = ANY (ARRAY[app.k(), app.f()])",
+             {"role": "text"})):
+        assert compare_predicates(base, head, column_types=types) not in (
+            "unchanged", "semantic_equivalent", "semantic_tightened"), (head, types)
+    # One member holding no column is compared alone, as `=`: it reads.
+    assert compare_predicates("tenant_id = auth.uid()", "tenant_id IN (auth.uid(), user_id)",
+                              column_types={"tenant_id": "uuid", "user_id": "uuid"}) == (
+        "semantic_loosened")

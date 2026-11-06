@@ -593,25 +593,12 @@ def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any], *,
         if any(_has_typed_arm(v) for v in values):
             # `COALESCE(x, 'a'::citext)` takes a type its arm may decide.
             kind = "arm " + kind
-    left_tag = None
     if in_list and kind.removeprefix("arm ") in ("typed", "as text", "as name"):
         kind = "in-list " + kind
-        if len(values) > 1:
-            # Postgres types the list from its left side, so a member reads
-            # in the left's type: each read is tied to its place (the left,
-            # or a member of a list whose left is that one; a text column's
-            # members read as text).
-            column = _unwrap_scalar_sublink(left)
-            left_tag = "text" if (
-                isinstance(column, ColumnRef) and column.fields
-                and isinstance(column.fields[-1], String) and ctx.column_types is not None
-                and _is_text(ctx.column_types.get(column.fields[-1].sval))) else _canon(left)
     for value in values:
-        value_kind = kind if left_tag is None else (
-            kind + " left" if value is left else f"{kind} member of {left_tag}")
         for n in _ast_nodes(value):
             if isinstance(n, ColumnRef) and n.fields and isinstance(n.fields[-1], String):
-                ctx.string_reads.setdefault(n.fields[-1].sval, set()).add(value_kind)
+                ctx.string_reads.setdefault(n.fields[-1].sval, set()).add(kind)
         # A value that is no column (`app.current_role()`, `email::citext`) is
         # read by its own type: a cast's, else one the text does not show;
         # one in a COALESCE / CASE arm in the arms' common type, never as a
@@ -620,7 +607,7 @@ def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any], *,
             if not isinstance(inner, ColumnRef):
                 hint = _type_key(inner.typeName) if isinstance(inner, TypeCast) else None
                 ctx.value_reads.setdefault((_canon(inner), hint), set()).add(
-                    "arm " * depth + value_kind)
+                    "arm " * depth + kind)
 
 
 def _literal_kind(node: Any) -> str | None:
@@ -1014,13 +1001,7 @@ def _reads_value_alike(hint: str | None, kinds: set[str]) -> bool:
     then every comparison of it must read the string one way."""
     if hint is None:
         return len(kinds) <= 1
-    return hint in _ALIKE_TYPES and _no_member_of_other(kinds) or kinds <= {"bare", "as " + hint}
-
-
-def _no_member_of_other(kinds: set[str]) -> bool:
-    # A value read as a member of a list whose left side is no text column
-    # compares in that side's type (a `char(n)` one's), not its own.
-    return all(" member of " not in kind or kind.endswith(" member of text") for kind in kinds)
+    return hint in _ALIKE_TYPES or kinds <= {"bare", "as " + hint}
 
 
 def _reads_strings_alike(column: str, kinds: set[str],
@@ -1043,7 +1024,7 @@ def _reads_strings_alike(column: str, kinds: set[str],
         # sure of): read the column one way only.
         return len(kinds) <= 1
     if _reads_alike(data_type):
-        return _no_member_of_other(kinds)
+        return True
     own = "as " + _type_key(data_type) if data_type is not None else None
     return all(kind in ("bare", own) for kind in kinds)
 
@@ -1060,6 +1041,17 @@ def _keeps_strings_text(node: Any, ctx: Any) -> bool:
             and isinstance(column.fields[-1], String)
             and _is_text(None if ctx.column_types is None
                          else ctx.column_types.get(column.fields[-1].sval)))
+
+
+def _plain_column_type(node: Any, ctx: Any) -> str | None:
+    """The type of a bare column (through a scalar sub-select) the diff knows
+    and reads alike (`text`, `uuid`, an integer …), else None."""
+    column = _unwrap_scalar_sublink(node)
+    if not (isinstance(column, ColumnRef) and column.fields
+            and isinstance(column.fields[-1], String) and ctx.column_types is not None):
+        return None
+    data_type = ctx.column_types.get(column.fields[-1].sval)
+    return _type_key(data_type) if data_type is not None and _reads_alike(data_type) else None
 
 
 def _is_text(data_type: str | None) -> bool:
@@ -2377,6 +2369,20 @@ def _anon_any_array(
         # type with the left side (int), so the two literals meet in it,
         # which Z3 would read as text (as in `_anon_coalesce`).
         return None
+    if ctx.any_session:
+        # Two or more values a list types together (with its left side) take
+        # a type Postgres picks from them by their order and kinds (the
+        # first typed one; a char(n) one makes the rest char), which the
+        # text does not show: in a diff such a list decides nothing, as on
+        # `main`, unless they are all columns of one known plain type.
+        # (An IN types together only two or more members holding no column
+        # of its own query; any other member it compares alone, as `=`.)
+        group = [node.lexpr, *elements] if node.kind != A_Expr_Kind.AEXPR_IN else (
+            [node.lexpr, *together] if len(together) > 1 else [])
+        group_values = [g for g in group if _literal_kind(g) is None]
+        types = {_plain_column_type(v, ctx) for v in group_values}
+        if len(group_values) > 1 and (None in types or len(types) > 1):
+            return None
     rounded = any(_rounds_its_kin(e, ctx) for e in elements) or (
             node.kind == A_Expr_Kind.AEXPR_IN and _rounds_its_kin(node.lexpr, ctx)) or (
             _blanks_its_kin([node.lexpr, *elements], ctx))

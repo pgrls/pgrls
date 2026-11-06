@@ -205,10 +205,12 @@ breaking changes — they will be called out in this file.
   ('a '::text, 'b'::text)`) is a read of its own: Postgres types the column
   with them, so a `char(n)` one compares as char there, as text in `code =
   'a '::text` (in a sub-select every member is, its columns being the outer
-  query's; a COALESCE of the column reads so too), and from its left side:
-  `alt IN (code, code)` reads `code` as text, `code IN (alt, alt)` reads
-  `alt` as a char(n) `code`, so each such read is tied to the list's left
-  side. A column of no
+  query's; a COALESCE of the column reads so too). A list that types two
+  or more values together (columns, functions; the left side and an `IN`'s
+  members holding no column of its own query, or an array's elements)
+  decides nothing in a diff, as on `main`, unless they are all columns of
+  one known plain type: Postgres picks the type they meet in from their
+  order and kinds (`code IN (alt, alt)` reads `alt` as a char(n) `code`). A column of no
   known type beside a literal cast to a string type (`COALESCE(code, 'a
   '::text) = 'a'`) decides nothing either: a `char(n)` one makes the two
   literals compare as `char`. A column
