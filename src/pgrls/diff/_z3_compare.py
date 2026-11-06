@@ -1043,6 +1043,18 @@ def _keeps_strings_text(node: Any, ctx: Any) -> bool:
                          else ctx.column_types.get(column.fields[-1].sval)))
 
 
+def _entry_type(node: Any, ctx: Any) -> str | None:
+    """The type a list entry brings to the list's common type: a typed
+    literal's (`'b'::varchar`; `(SELECT 'b')` and other typed ones text), a
+    known plain column's, else None."""
+    kind = _literal_kind(node)
+    if kind is None:
+        return _plain_column_type(node, ctx)
+    if kind == "typed":
+        return "text"
+    return _type_key(kind.removeprefix("as ")) if kind.startswith("as ") else None
+
+
 def _plain_column_type(node: Any, ctx: Any) -> str | None:
     """The type of a bare column (through a scalar sub-select) the diff knows
     and reads alike (`text`, `uuid`, an integer …), else None."""
@@ -2382,6 +2394,16 @@ def _anon_any_array(
         group_values = [g for g in group if _literal_kind(g) is None]
         types = {_plain_column_type(v, ctx) for v in group_values}
         if len(group_values) > 1 and (None in types or len(types) > 1):
+            return None
+        # A typed literal takes part in that choice too (`(SELECT 'b')` is
+        # text, `'b'::varchar` varchar): an array's elements, or an IN's
+        # together-typed members beside an untyped left side, typed two ways
+        # (or one way unknown) decide nothing either.
+        typed = [e for e in (elements if node.kind != A_Expr_Kind.AEXPR_IN else (
+            together if len(together) > 1 and _literal_kind(node.lexpr) == "bare" else []))
+            if _literal_kind(e) not in ("bare", "other")]
+        typed_kinds = {_entry_type(e, ctx) for e in typed}
+        if len(typed) > 1 and (None in typed_kinds or len(typed_kinds) > 1):
             return None
     rounded = any(_rounds_its_kin(e, ctx) for e in elements) or (
             node.kind == A_Expr_Kind.AEXPR_IN and _rounds_its_kin(node.lexpr, ctx)) or (

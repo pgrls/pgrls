@@ -210,7 +210,9 @@ breaking changes — they will be called out in this file.
   members holding no column of its own query, or an array's elements)
   decides nothing in a diff, as on `main`, unless they are all columns of
   one known plain type: Postgres picks the type they meet in from their
-  order and kinds (`code IN (alt, alt)` reads `alt` as a char(n) `code`). A column of no
+  order and kinds (`code IN (alt, alt)` reads `alt` as a char(n) `code`);
+  so does one whose entries are typed two ways, typed literals counted
+  (`(SELECT 'b')` is text, `'b'::varchar` varchar). A column of no
   known type beside a literal cast to a string type (`COALESCE(code, 'a
   '::text) = 'a'`) decides nothing either: a `char(n)` one makes the two
   literals compare as `char`. A column

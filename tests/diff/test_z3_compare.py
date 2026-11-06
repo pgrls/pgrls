@@ -1890,6 +1890,12 @@ def test_a_list_of_two_or_more_values_decides_nothing_in_a_diff():
              {"role": "text"})):
         assert compare_predicates(base, head, column_types=types) not in (
             "unchanged", "semantic_equivalent", "semantic_tightened"), (head, types)
+    # A typed literal beside a value takes part in the choice too.
+    for base, head in (("'a ' IN ((SELECT 'b'), app.k())", "'a ' IN (app.k(), (SELECT 'b'))"),
+                       ("code = ANY (ARRAY[(SELECT 'a '), 'b'::varchar])",
+                        "code = ANY (ARRAY['b'::varchar, (SELECT 'a ')])")):
+        assert compare_predicates(base, head) not in (
+            "unchanged", "semantic_equivalent", "semantic_tightened"), head
     # One member holding no column is compared alone, as `=`: it reads.
     assert compare_predicates("tenant_id = auth.uid()", "tenant_id IN (auth.uid(), user_id)",
                               column_types={"tenant_id": "uuid", "user_id": "uuid"}) == (
