@@ -186,7 +186,9 @@ breaking changes — they will be called out in this file.
   skipping a schema not created yet, and against the tables as they stand
   at that statement; a table a policy reads resolves there too, and the
   elements of `CREATE SCHEMA` go in it, in the order Postgres runs them
-  (sequences, tables, views, indexes, triggers, grants). `--schemas app` or `app,public` (and
+  (sequences, tables, views, indexes, triggers, grants), as its owner
+  (`AUTHORIZATION r`: `$user` and a GRANT's grantor are `r`), and a name
+  an earlier one made is the new schema's. `--schemas app` or `app,public` (and
   MCP's `schemas`) moved every one into `app`, so findings named tables that
   did not exist and missed those on `public.*`. What a `ROLLBACK` (or
   `ROLLBACK TO SAVEPOINT`, or the end of the file in an open transaction)

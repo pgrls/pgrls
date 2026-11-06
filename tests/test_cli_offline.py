@@ -3443,3 +3443,34 @@ def test_pg_catalog_on_the_path_needs_no_usage_grant():
     _tables_of("GRANT USAGE, CREATE ON SCHEMA public TO alice;\nSET ROLE alice;\n"
                "SET search_path = public, pg_catalog;\nCREATE TABLE t (id int);\n"
                "DROP TABLE IF EXISTS nothere;\n")
+
+
+def test_create_schema_elements_run_as_its_owner():
+    # A GRANT among them runs as `bob`, who does not own `other`: it may
+    # grant nothing, so alice is not taken to have USAGE on it.
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+    with pytest.raises(SchemaSourceError, match="USAGE"):
+        schema_from_sql("CREATE SCHEMA other;\nCREATE TABLE other.t (id int);\n"
+                        "CREATE SCHEMA s AUTHORIZATION bob GRANT USAGE ON SCHEMA other TO alice;\n"
+                        "SET ROLE alice;\nSET search_path = other, public;\n"
+                        "CREATE TABLE IF NOT EXISTS t (id int);\n")
+
+
+def test_a_create_schema_element_names_the_table_an_earlier_one_made():
+    tables = {(t.schema, t.name): t for t in schema_from_sql_of(
+        "CREATE TABLE public.docs (id int);\n"
+        "CREATE SCHEMA app AUTHORIZATION bob CREATE TABLE docs (id int)"
+        " GRANT SELECT ON docs TO anon;\n")}
+    assert tables[("app", "docs")].grants and not tables[("public", "docs")].grants
+
+
+def schema_from_sql_of(sql):
+    from pgrls.schema_sources import schema_from_sql
+    return schema_from_sql(sql, schemas=("public", "app")).tables
+
+
+def test_a_definitions_body_setting_the_path_is_no_set_local(tmp_path):
+    res, _ = _migrations_snapshot(tmp_path, {
+        "001_a.sql": "CREATE FUNCTION public.f() RETURNS text LANGUAGE sql BEGIN ATOMIC"
+                     " SELECT set_config('search_path', 'public', true); END;\n"})
+    assert res.exit_code == 0, res.output

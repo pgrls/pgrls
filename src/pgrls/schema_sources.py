@@ -968,11 +968,19 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
             resolver.unsure.discard(schema)
             # Postgres runs them by kind, not as written: sequences, tables,
             # views, indexes, triggers, grants (`transformCreateSchemaStmtElements`).
+            # They run as its owner (`AUTHORIZATION r`), and a name an earlier
+            # one made is the new schema's.
+            owner = resolver.role_of(stmt.authrole) if stmt.authrole is not None else None
+            made_here: set[str] = set()
             for element in sorted(stmt.schemaElts or (), key=_schema_element_order):
                 # Its elements go in it, and see it first.
-                with resolver.first(schema):
+                with resolver.first(schema, role=owner):
+                    for rel, creates in _named_relations(element):
+                        if not creates and not rel.schemaname and rel.relname in made_here:
+                            rel.schemaname = schema
                     resolver.track(element)
                     resolver.qualify(element)
+                made_here |= {rel.relname for rel, creates in _named_relations(element) if creates}
                 out.append(_Stmt(element, raw))
             out.append(_Stmt(stmt, raw))
             continue
@@ -1042,8 +1050,8 @@ def sets_local_outside_transaction(sql: str) -> bool:
                                TransactionStmtKind.TRANS_STMT_ROLLBACK):
                 open_ = bool(stmt.chain)
             continue
-        if open_:
-            continue
+        if open_ or _only_defines(stmt):
+            continue  # (a definition's body does not run now)
         if (isinstance(stmt, _pgast.VariableSetStmt) and stmt.is_local
                 and (stmt.name or "").lower() in names):
             return True
@@ -1229,12 +1237,22 @@ class _Resolver:
         return tuple(self.override) + path
 
     @contextlib.contextmanager
-    def first(self, schema: str) -> Any:
+    def first(self, schema: str, role: str | None = None) -> Any:
+        # (`role`: the one the statements run as meanwhile, as a CREATE
+        # SCHEMA … AUTHORIZATION runs its elements as the owner.)
         self.override.insert(0, schema)
+        had, previous = "role" in self.local, self.local.get("role")
+        if role is not None:
+            self.local["role"] = role
         try:
             yield
         finally:
             self.override.pop(0)
+            if role is not None:
+                if had:
+                    self.local["role"] = previous
+                else:
+                    self.local.pop("role", None)
 
     def track(self, stmt: Any) -> None:
         """Follow what `stmt` sets."""
