@@ -3229,6 +3229,16 @@ def test_an_unqualified_policy_call_stays_as_written_where_unsure(sql):
     assert "auth" not in _policy_using(_AUTH_UID + sql)
 
 
+def test_a_drop_before_a_functions_create_leaves_it_followed():
+    # The idempotent migration: DROP … IF EXISTS, then CREATE.
+    sql = ("CREATE SCHEMA auth;\nDROP FUNCTION IF EXISTS auth.uid();\n"
+           "CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ SELECT NULL::uuid $$;\n"
+           "CREATE TABLE public.docs (id int, owner_id uuid);\n"
+           "SET search_path = public, auth;\n"
+           "CREATE POLICY p ON docs USING (owner_id = uid());\n")
+    assert _policy_using(sql) == "owner_id = auth.uid()"
+
+
 def test_a_built_in_run_leaves_the_policy_calls_followed():
     # pg_dump's `SELECT pg_catalog.set_config(…)` runs no user code.
     sql = (_AUTH_UID + "SELECT pg_catalog.set_config('search_path', 'public, auth', false);\n"

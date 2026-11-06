@@ -109,7 +109,10 @@ breaking changes — they will be called out in this file.
   one) or a built-in that runs SQL text (`query_to_xml`, `ts_stat`), a
   `REFRESH MATERIALIZED VIEW`, an event trigger, a range type (its
   constructors) or `DROP OWNED`; a trigger a write fires, a DEFAULT it
-  fills, a view a read runs and a user operator are taken to make none. A call it cannot settle
+  fills, a view a read runs, a domain's CHECK or a cast an `ALTER … TYPE`
+  runs, and a user operator are taken to make none. A drop of a function
+  it has not seen made (`DROP FUNCTION IF EXISTS` before the CREATE) leaves
+  the name followed. A call it cannot settle
   stays as written.
 - **Offline: a table made under a name the SQL used before is a table of
   its own.** A name dropped (with its schema too), or renamed away, and

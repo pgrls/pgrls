@@ -1587,7 +1587,11 @@ class _Resolver:
             for schemas in self.functions.values():
                 schemas -= gone
         elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType in _ROUTINE_KINDS:
-            self.unsure_functions.update(_routine_name(item) for item in stmt.objects or ())
+            # (A drop of one it has not made removes none it follows: the
+            # `DROP FUNCTION IF EXISTS` before a migration's CREATE.)
+            self.unsure_functions.update(
+                name for item in stmt.objects or ()
+                if (name := _routine_name(item)) in self.functions)
         elif isinstance(stmt, _pgast.RenameStmt) and stmt.renameType in _ROUTINE_KINDS:
             self.unsure_functions.update({_routine_name(stmt.object), stmt.newname or ""})
         elif (isinstance(stmt, _pgast.AlterObjectSchemaStmt)
