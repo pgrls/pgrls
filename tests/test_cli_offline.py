@@ -3218,6 +3218,10 @@ def test_an_unqualified_policy_call_names_the_function_the_path_finds(tmp_path):
     "CREATE FUNCTION public.setup() RETURNS void LANGUAGE sql AS $$ SELECT $$;\n"
     "SELECT public.setup();\nSET search_path = public, auth;\n"
     "CREATE POLICY p ON docs USING (owner_id = uid());\n",
+    "SELECT pg_catalog.query_to_xml('SELECT 1', true, false, '');\nSET search_path = public, auth;\n"
+    "CREATE POLICY p ON docs USING (owner_id = uid());\n",
+    "CREATE MATERIALIZED VIEW mv AS SELECT 1 WITH NO DATA;\nREFRESH MATERIALIZED VIEW mv;\n"
+    "SET search_path = public, auth;\nCREATE POLICY p ON docs USING (owner_id = uid());\n",
     "CREATE TYPE public.r AS RANGE (subtype = int, multirange_type_name = public.uid);\n"
     "SET search_path = public, auth;\nCREATE POLICY p ON docs USING (owner_id = uid());\n",
 ])

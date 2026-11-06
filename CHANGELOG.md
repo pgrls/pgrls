@@ -106,8 +106,10 @@ breaking changes — they will be called out in this file.
   is not followed, nor is any after an extension (made, altered, moved or
   dropped), a `DO` block, a `CALL`, an `EXECUTE`, a statement that runs a
   function that may be no built-in (`SELECT setup()`, whose body may make
-  one), an event trigger, a range type (its constructors) or `DROP OWNED`;
-  a trigger a write fires is taken to make none. A call it cannot settle
+  one) or a built-in that runs SQL text (`query_to_xml`, `ts_stat`), a
+  `REFRESH MATERIALIZED VIEW`, an event trigger, a range type (its
+  constructors) or `DROP OWNED`; a trigger a write fires, a DEFAULT it
+  fills, a view a read runs and a user operator are taken to make none. A call it cannot settle
   stays as written.
 - **Offline analysis says that an extension's tables are not seen.** pg_dump
   writes them as `CREATE EXTENSION` alone (PostGIS's `public.spatial_ref_sys`

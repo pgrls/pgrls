@@ -93,6 +93,7 @@ from pgrls.diff._z3_compare import (
     prove_anon_isolation,
     prove_cross_tenant_isolation,
 )
+from pgrls._pg_catalog_functions import SQL_RUNNING_BUILTINS
 from pgrls.model import Policy, Schema
 from pgrls._render_common import make_dispatcher, pluralize, render_text_table
 from pgrls.formatters._common import safe_location
@@ -1997,14 +1998,7 @@ _SAFE_BUILTIN_FUNCS: frozenset[str] = frozenset({
 # public.secrets', …)` in a SECURITY DEFINER function handed every row of a
 # FORCE'd table to its caller, and so did `table_to_xml` and the two-argument
 # `ts_rewrite`, whose second argument is a query.
-_SQL_RUNNING_BUILTINS: frozenset[str] = frozenset({
-    "query_to_xml", "query_to_xmlschema", "query_to_xml_and_xmlschema",
-    "table_to_xml", "table_to_xmlschema", "table_to_xml_and_xmlschema",
-    "cursor_to_xml", "cursor_to_xmlschema",
-    "schema_to_xml", "schema_to_xmlschema", "schema_to_xml_and_xmlschema",
-    "database_to_xml", "database_to_xmlschema", "database_to_xml_and_xmlschema",
-    "ts_stat", "ts_rewrite",
-})
+_SQL_RUNNING_BUILTINS = SQL_RUNNING_BUILTINS
 
 # Operator symbols pg_catalog ships on PG15–18 (the same 74 on each, read from
 # pg_operator), plus the distance operators pgvector adds (`<#>`, `<=>`, `<+>`,

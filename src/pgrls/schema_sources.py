@@ -57,7 +57,7 @@ from pglast.enums.primnodes import OnCommitAction
 from pglast.stream import RawStream
 
 from pgrls import ast_utils
-from pgrls._pg_catalog_functions import PG_CATALOG_FUNCTIONS
+from pgrls._pg_catalog_functions import PG_CATALOG_FUNCTIONS, SQL_RUNNING_BUILTINS
 from pgrls.model import (
     SNAPSHOT_VERSION,
     Column,
@@ -1529,11 +1529,12 @@ class _Resolver:
         if isinstance(stmt, (_pgast.CreateExtensionStmt, _pgast.AlterExtensionStmt,
                              _pgast.AlterExtensionContentsStmt, _pgast.DoStmt,
                              _pgast.CallStmt, _pgast.ExecuteStmt, _pgast.CreateEventTrigStmt,
-                             _pgast.DropOwnedStmt)) or (
+                             _pgast.RefreshMatViewStmt, _pgast.DropOwnedStmt)) or (
                 isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_EXTENSION
                 or isinstance(stmt, _pgast.AlterObjectSchemaStmt)
                 and stmt.objectType == ObjectType.OBJECT_EXTENSION) or _calls_a_user_function(stmt):
-            # (A trigger a write fires is taken to make none: a migration's
+            # (A trigger a write fires, a DEFAULT it fills, a view a read
+            # runs or a user operator is taken to make none: a migration's
             # INSERT would otherwise end the following for good.)
             self.functions = None
         elif isinstance(stmt, _pgast.CreateFunctionStmt) and not stmt.is_procedure:
@@ -1764,7 +1765,8 @@ def _calls_a_user_function(stmt: Any) -> bool:
     for n in _subnodes(stmt):
         if isinstance(n, _pgast.FuncCall):
             names = [getattr(part, "sval", None) for part in n.funcname or ()]
-            if names[:-1] not in ([], ["pg_catalog"]) or names[-1] not in PG_CATALOG_FUNCTIONS:
+            if names[:-1] not in ([], ["pg_catalog"]) or names[-1] not in PG_CATALOG_FUNCTIONS \
+                    or names[-1] in SQL_RUNNING_BUILTINS:
                 return True
     return False
 

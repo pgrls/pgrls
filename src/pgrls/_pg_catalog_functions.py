@@ -618,3 +618,14 @@ xidrecv xidsend xml xml_in xml_is_well_formed xml_is_well_formed_content
 xml_is_well_formed_document xml_out xml_recv xml_send xmlagg xmlcomment
 xmlconcat2 xmlexists xmltext xmlvalidate xpath xpath_exists
 """.split())
+
+# Built-ins that run SQL handed to them as text (`query_to_xml('SELECT
+# f()', …)`), and so may run any function.
+SQL_RUNNING_BUILTINS: frozenset[str] = frozenset({
+    "query_to_xml", "query_to_xmlschema", "query_to_xml_and_xmlschema",
+    "table_to_xml", "table_to_xmlschema", "table_to_xml_and_xmlschema",
+    "cursor_to_xml", "cursor_to_xmlschema",
+    "schema_to_xml", "schema_to_xmlschema", "schema_to_xml_and_xmlschema",
+    "database_to_xml", "database_to_xmlschema", "database_to_xml_and_xmlschema",
+    "ts_stat", "ts_rewrite",
+})
