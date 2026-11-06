@@ -1718,12 +1718,19 @@ def _anon_3vl(
     leaf BEFORE the generic FuncCall / SQLValueFunction branches.
     """
     inner = _unwrap_scalar_sublink(node)
-    if inner is not node and _may_yield_no_row(inner, auth_funcs):
+    if inner is not node:
+        # Its columns are the outer query's (see `subselect_depth`).
+        ctx.subselect_depth += 1
+        try:
+            result = _anon_3vl(inner, ctx, auth_funcs, assertions)
+        finally:
+            ctx.subselect_depth -= 1
+        if not _may_yield_no_row(inner, auth_funcs):
+            return result
         # A call in the target may be set-returning, which a name cannot tell
         # apart, and yield no row: the sub-select is then NULL whatever its
         # target reads (`(SELECT srf() IS NULL)` is NULL, not TRUE). The same
         # sub-select shares the one flag, in base and head alike.
-        result = _anon_3vl(inner, ctx, auth_funcs, assertions)
         if result is None:
             return None
         # Keyed by the target: Postgres renders `(SELECT f() AS f)`.
@@ -1734,12 +1741,6 @@ def _anon_3vl(
             return _TV(is_true=z3.And(result.is_true, z3.Not(no_row)),
                        is_null=z3.Or(result.is_null, no_row))
         return dataclasses.replace(result, is_null=z3.Or(result.is_null, no_row))
-    if inner is not node:
-        ctx.subselect_depth += 1
-        try:
-            return _anon_3vl(inner, ctx, auth_funcs, assertions)
-        finally:
-            ctx.subselect_depth -= 1
 
     # --- auth-context leaf: auth.uid()/role()/jwt(), current_setting(...),
     # current_user, session_user. Checked before the generic FuncCall

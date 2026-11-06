@@ -514,9 +514,14 @@ def test_a_cast_of_a_coalesce_is_no_proof():
     assert prove_anon_isolation(parse_expr("'admin' IN (role, 'owner')"))[0] == "leak"
     # ... but in a sub-select the column is the outer query's, which the IN
     # types with the others (`'1'::int = ANY (ARRAY[n, 1])`).
-    using = f"{t} OR ((SELECT '1' IN (n, '01')) AND n = '7')"
-    assert prove_anon_isolation(parse_expr(using))[0] != "isolated"
-    assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated"
+    for using in (f"{t} OR ((SELECT '1' IN (n, '01')) AND n = '7')",
+                  # ... one whose target may yield no row too.
+                  f"{t} OR ((SELECT '1' IN (n, '01') AND now() IS NOT NULL) AND n = '7')"):
+        assert prove_anon_isolation(parse_expr(using))[0] != "isolated", using
+        assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated", using
+    assert _classify("s2 = 'a' AND tier = '5'",
+                     "(s2 = 'a' OR (SELECT '1' IN (tier, '01') AND now() IS NOT NULL)) "
+                     "AND tier = '5'") is None
     assert _classify("s2 = 'a' AND tier = '5'",
                      "(s2 = 'a' OR (SELECT '1' IN (tier, '01'))) AND tier = '5'") is None
     # A COALESCE of a column and a bare literal still reads exactly.
